@@ -3,205 +3,278 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
+import time
+import uuid
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from runtime import InferenceEngine  # noqa: E402
 
 
-class Handler(SimpleHTTPRequestHandler):
-    root: Path
-    engine = None
-    session = None
-    loading = False
-    args: argparse.Namespace
+class ChatSession:
+    """CPU-owned conversation metadata paired lazily with one native sequence."""
 
-    @staticmethod
-    def load_model():
-        if Handler.engine is not None:
-            return
-        Handler.loading = True
-        print("loading model on native Metal 4 with float16", flush=True)
-        Handler.engine = InferenceEngine(Handler.args.weights, Handler.args.tokenizer)
-        Handler.session = Handler.engine.session()
-        Handler.loading = False
-        print("model loaded on native Metal 4 with float16", flush=True)
+    def __init__(self):
+        self.id, self.title = uuid.uuid4().hex[:12], "New chat"
+        self.runtime, self.messages, self.metrics = None, [], {}
+        self.updated_at = time.time()
+        self.generating, self.cancel = False, threading.Event()
+        self.lock = threading.Lock()
+
+    def summary(self):
+        runtime = self.runtime
+        return {"id": self.id, "title": self.title, "updated_at": self.updated_at,
+                "generating": self.generating, "message_count": len(self.messages), "metrics": self.metrics,
+                "sequence_id": runtime.sequence_id if runtime else None,
+                "mapped_kv_bytes": runtime.mapped_kv_bytes if runtime else 0}
+
+    def detail(self): return {**self.summary(), "messages": self.messages}
+
+
+class Handler(SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    root: Path
+    args: argparse.Namespace
+    engine = None
+    loading, load_error = False, ""
+    model_condition = threading.Condition()
+    sessions, sessions_lock = {}, threading.RLock()
+    max_sessions = 8
+
+    @classmethod
+    def _finish_model_load(cls):
+        try:
+            print("loading model on native Metal 4 with float16", flush=True)
+            engine, error = InferenceEngine(cls.args.weights, cls.args.tokenizer), ""
+            print("model loaded on native Metal 4 with float16", flush=True)
+        except Exception as exc:
+            engine, error = None, f"{type(exc).__name__}: {exc}"
+            print(f"model load failed: {error}", flush=True)
+        with cls.model_condition:
+            cls.engine, cls.loading, cls.load_error = engine, False, error
+            cls.model_condition.notify_all()
+        return engine
+
+    @classmethod
+    def load_model(cls):
+        with cls.model_condition:
+            if cls.engine: return cls.engine
+            if cls.loading:
+                while cls.loading: cls.model_condition.wait()
+                if cls.engine: return cls.engine
+                raise RuntimeError(cls.load_error or "model load failed")
+            cls.loading, cls.load_error = True, ""
+        engine = cls._finish_model_load()
+        if not engine: raise RuntimeError(cls.load_error)
+        return engine
+
+    @classmethod
+    def start_model_load(cls):
+        with cls.model_condition:
+            if cls.engine or cls.loading: return
+            cls.loading, cls.load_error = True, ""
+        threading.Thread(target=cls._finish_model_load, name="infeng-loader", daemon=True).start()
+
+    def _json(self, status, body):
+        payload = json.dumps(body).encode()
+        self.send_response(status); self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+
+    def _body(self):
+        size = int(self.headers.get("content-length", 0))
+        return json.loads(self.rfile.read(size)) if size else {}
+
+    def _event(self, body):
+        try:
+            self.wfile.write(f"data: {json.dumps(body, separators=(',', ':'))}\n\n".encode()); return True
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+
+    @classmethod
+    def _session(cls, session_id):
+        with cls.sessions_lock: return cls.sessions.get(session_id)
 
     def do_GET(self):
-        if self.path == "/":
-            self.path = "/index.html"
-        if self.path == "/api/status":
-            loaded = Handler.engine is not None
-            body = {
-                "loaded": loaded,
-                "loading": Handler.loading,
-                "device": ""
-                if not loaded
-                else "metal4",
-            }
-            payload = json.dumps(body).encode()
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
+        path = urlparse(self.path).path
+        if path == "/": self.path, path = "/index.html", "/index.html"
+        if path == "/api/status":
+            with Handler.sessions_lock:
+                sessions = list(Handler.sessions.values())
+                mapped = max((item.runtime.mapped_kv_bytes for item in sessions if item.runtime), default=0)
+                active = sum(item.generating for item in sessions)
+            return self._json(200, {"loaded": Handler.engine is not None, "loading": Handler.loading,
+                                    "error": Handler.load_error, "device": "metal4" if Handler.engine else "",
+                                    "mtp": Handler.engine.native.has_mtp if Handler.engine else False,
+                                    "sessions": len(sessions), "active_sessions": active,
+                                    "max_sessions": Handler.max_sessions, "mapped_kv_bytes": mapped})
+        if path == "/api/sessions":
+            with Handler.sessions_lock:
+                body = sorted((item.summary() for item in Handler.sessions.values()),
+                              key=lambda item: item["updated_at"], reverse=True)
+            return self._json(200, body)
+        parts = path.strip("/").split("/")
+        if len(parts) == 3 and parts[:2] == ["api", "sessions"]:
+            session = Handler._session(parts[2])
+            return self._json(200, session.detail()) if session else self._json(404, {"error": "session not found"})
         return super().do_GET()
 
-    def end_headers(self):
-        self.send_header("cache-control", "no-store")
-        super().end_headers()
-
     def do_POST(self):
-        if self.path == "/api/load":
-            body = {"ok": True}
-            if Handler.engine is None and not Handler.loading:
-                import threading
+        path = urlparse(self.path).path
+        if path == "/api/load":
+            Handler.start_model_load()
+            return self._json(200, {"ok": True, "loaded": Handler.engine is not None, "loading": Handler.loading})
+        if path == "/api/sessions":
+            with Handler.sessions_lock:
+                if len(Handler.sessions) >= Handler.max_sessions:
+                    return self._json(409, {"error": f"at most {Handler.max_sessions} live sessions are supported"})
+                session = ChatSession(); Handler.sessions[session.id] = session
+            return self._json(201, session.detail())
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[:2] != ["api", "sessions"]:
+            return self._json(404, {"error": "not found"})
+        session = Handler._session(parts[2])
+        if not session: return self._json(404, {"error": "session not found"})
+        if parts[3] == "cancel":
+            session.cancel.set()
+            return self._json(200, {"ok": True})
+        if parts[3] == "chat": return self._chat(session, self._body())
+        return self._json(404, {"error": "not found"})
 
-                threading.Thread(target=Handler.load_model, daemon=True).start()
-                body = {"ok": True, "loading": True}
-            elif Handler.loading:
-                body = {"ok": True, "loading": True}
-            else:
-                body = {"ok": True, "loaded": True}
-            payload = json.dumps(body).encode()
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-        if self.path != "/api/chat":
-            self.send_error(404)
-            return
-        data = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
+    def do_DELETE(self):
+        parts = urlparse(self.path).path.strip("/").split("/")
+        if len(parts) != 3 or parts[:2] != ["api", "sessions"]:
+            return self._json(404, {"error": "not found"})
+        with Handler.sessions_lock:
+            session = Handler.sessions.get(parts[2])
+            if not session: return self._json(404, {"error": "session not found"})
+            if session.generating: return self._json(409, {"error": "stop generation before deleting this session"})
+            del Handler.sessions[parts[2]]
+        if session.runtime: session.runtime.close()
+        return self._json(200, {"ok": True})
+
+    def _chat(self, session, data):
+        message = data.get("message", "")
+        if not isinstance(message, str) or not message.strip(): return self._json(400, {"error": "message is required"})
+        if not session.lock.acquire(blocking=False): return self._json(409, {"error": "this session is already generating"})
+        session.generating, disconnected = True, False
+        session.cancel.clear(); started = time.perf_counter(); generation = None
         try:
-            print("chat request received", flush=True)
+            self.send_response(200); self.send_header("content-type", "text/event-stream")
+            self.send_header("x-accel-buffering", "no"); self.send_header("connection", "close"); self.end_headers()
+            if Handler.engine is None and not self._event({"status": "Loading model…"}): return
+            engine = Handler.load_model()
+            if session.runtime is None: session.runtime = engine.session()
 
-            self.send_response(200)
-            self.send_header("content-type", "text/event-stream")
-            self.send_header("cache-control", "no-cache")
-            self.send_header("connection", "keep-alive")
-            self.end_headers()
+            text = message.strip(); session.messages.append({"role": "user", "content": text})
+            if session.title == "New chat": session.title = text[:48] + ("…" if len(text) > 48 else "")
+            session.updated_at = time.time()
+            thinking = bool(data.get("thinking", Handler.args.thinking))
+            temperature = float(data.get("temperature", Handler.args.temperature))
+            top_p, top_k = float(data.get("top_p", Handler.args.top_p)), int(data.get("top_k", Handler.args.top_k))
+            max_tokens = max(1, min(int(data.get("max_tokens", Handler.args.max_new_tokens)), Handler.args.max_new_tokens))
+            speculative = bool(data.get("speculative", Handler.args.speculative))
+            draft_tokens = max(1, min(int(data.get("draft_tokens", Handler.args.draft_tokens)), 4))
+            stop_ids = [token for token in (engine.tokenizer.eos_token_id,
+                                            engine.tokenizer.convert_tokens_to_ids("<|im_end|>")) if token is not None]
+            before_context = session.runtime.native.length
+            spec_before = session.runtime.native.speculative_counters() if speculative else None
+            generation = session.runtime.generate(text, max_new_tokens=max_tokens, thinking=thinking,
+                                                  stop_token_ids=stop_ids, temperature=temperature,
+                                                  top_p=top_p, top_k=top_k, speculative=speculative,
+                                                  draft_tokens=draft_tokens)
+            if not self._event({"status": "Generating…", "sequence_id": session.runtime.sequence_id}):
+                disconnected = True; session.cancel.set()
 
-            if Handler.engine is None:
-                event = json.dumps({"status": "Loading model..."})
-                self.wfile.write(f"data: {event}\n\n".encode())
-                self.wfile.flush()
-            Handler.load_model()
+            # Stream token deltas; the authoritative response is joined once when generation finishes.
+            thought, response, mode = [], [], "thinking" if thinking else "response"
+            first_at, generated, prompt_tokens = None, 0, 0
+            while not session.cancel.is_set() or session.runtime.native.pending_outputs:
+                try: token_id = next(generation)
+                except StopIteration: break
+                now = time.perf_counter()
+                if first_at is None:
+                    first_at, prompt_tokens = now, session.runtime.native.length - before_context
+                generated += 1; token = engine.tokenizer.decode([token_id], skip_special_tokens=False)
+                if mode == "thinking" and "</think>" in token:
+                    before, after = token.split("</think>", 1); thought.append(before); response.append(after)
+                    delta, mode = {"thinking_delta": before, "response_delta": after}, "response"
+                elif mode == "thinking": thought.append(token); delta = {"thinking_delta": token}
+                else: response.append(token); delta = {"response_delta": token}
+                decode_elapsed = now - first_at
+                metrics = {"prompt_tokens": prompt_tokens, "generated_tokens": generated,
+                           "context_tokens": before_context + prompt_tokens + generated,
+                           "ttft_ms": round((first_at - started) * 1000, 1),
+                           "elapsed_ms": round((now - started) * 1000, 1),
+                           "tps": round((generated - 1) / decode_elapsed, 2) if generated > 1 and decode_elapsed else None,
+                           "speculative": speculative}
+                session.metrics = metrics
+                if not disconnected and not self._event({**delta, "metrics": metrics}):
+                    disconnected = True; session.cancel.set()
 
-            event = json.dumps({"status": "Generating..."})
-            self.wfile.write(f"data: {event}\n\n".encode())
-            self.wfile.flush()
-
-            messages = data.get("messages")
-            if messages is None:
-                messages = [{"role": "user", "content": data["message"]}]
-            stop_ids = [
-                Handler.engine.tokenizer.eos_token_id,
-                Handler.engine.tokenizer.convert_tokens_to_ids("<|im_end|>"),
-            ]
-
-            thinking_enabled = data.get("thinking", Handler.args.thinking)
-            temperature = data.get("temperature", Handler.args.temperature)
-            top_p = data.get("top_p", Handler.args.top_p)
-            top_k = data.get("top_k", Handler.args.top_k)
-            gen = Handler.session.generate(
-                messages[-1]["content"],
-                max_new_tokens=Handler.args.max_new_tokens,
-                thinking=thinking_enabled,
-                stop_token_ids=stop_ids,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            )
-            think_end_str = "</think>"
-            accumulated = ""
-            thinking = ""
-            response_text = ""
-            mode = "thinking" if thinking_enabled else "response"
-
-            for token_id in gen:
-                if not response_text and not thinking:
-                    print("first token generated", flush=True)
-                token_text = Handler.engine.tokenizer.decode(
-                    [token_id], skip_special_tokens=False
-                )
-                accumulated += token_text
-
-                if think_end_str in accumulated and mode == "thinking":
-                    idx = accumulated.index(think_end_str)
-                    thinking = accumulated[:idx]
-                    accumulated = accumulated[idx + len(think_end_str) :]
-                    mode = "response"
-
-                if mode == "thinking":
-                    thinking = accumulated
-                else:
-                    response_text = accumulated
-
-                event = json.dumps(
-                    {
-                        "token": token_text,
-                        "mode": mode,
-                        "thinking": thinking,
-                        "response": response_text,
-                    }
-                )
-                self.wfile.write(f"data: {event}\n\n".encode())
-                self.wfile.flush()
-
-            response_text = accumulated
-            done = json.dumps(
-                {"done": True, "thinking": thinking, "response": response_text}
-            )
-            self.wfile.write(f"data: {done}\n\n".encode())
-            self.wfile.flush()
-            print("chat generation finished", flush=True)
+            now = time.perf_counter()
+            if not prompt_tokens: prompt_tokens = session.runtime.native.length - before_context
+            decode_elapsed = now - first_at if first_at else 0
+            spec = {"speculative": speculative, "drafted_tokens": 0, "accepted_tokens": 0, "acceptance_rate": None}
+            if spec_before:
+                current = session.runtime.native.speculative_counters()
+                spec["drafted_tokens"] = current["drafted_tokens"] - spec_before["drafted_tokens"]
+                spec["accepted_tokens"] = current["accepted_tokens"] - spec_before["accepted_tokens"]
+                spec["acceptance_rate"] = (round(spec["accepted_tokens"] / spec["drafted_tokens"], 3)
+                                           if spec["drafted_tokens"] else None)
+            metrics = {"prompt_tokens": prompt_tokens, "generated_tokens": generated,
+                       "context_tokens": session.runtime.native.length + len(session.runtime.pending),
+                       "ttft_ms": round(((first_at or now) - started) * 1000, 1),
+                       "elapsed_ms": round((now - started) * 1000, 1),
+                       "tps": round((generated - 1) / decode_elapsed, 2) if generated > 1 and decode_elapsed else None,
+                       **spec}
+            cancelled = session.cancel.is_set()
+            thought, response = "".join(thought), "".join(response)
+            session.metrics = metrics
+            session.messages.append({"role": "assistant", "content": response, "thinking": thought,
+                                     "cancelled": cancelled, "metrics": metrics})
+            session.updated_at = time.time()
+            if not disconnected: self._event({"done": True, "cancelled": cancelled, "metrics": metrics})
         except Exception as exc:
-            error = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
-            self.wfile.write(f"data: {error}\n\n".encode())
-            self.wfile.flush()
+            if not disconnected: self._event({"error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            if generation: generation.close()
+            session.generating = False; session.cancel.clear(); session.updated_at = time.time(); session.lock.release()
+            self.close_connection = True
+
+    def end_headers(self):
+        self.send_header("cache-control", "no-store"); super().end_headers()
 
     def translate_path(self, path):
-        return str(Handler.root / path.split("?", 1)[0].lstrip("/"))
+        root = Handler.root.resolve(); target = (root / urlparse(path).path.lstrip("/")).resolve()
+        return str(target if target == root or root in target.parents else root / "__not_found__")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument(
-        "--weights", default="weights/Qwen3.5-9B-UD-Q4_K_XL.gguf"
-    )
+    parser.add_argument("--host", default="127.0.0.1"); parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--weights", default="weights/Qwen3.5-9B-UD-Q4_K_XL-MTP.gguf")
     parser.add_argument("--tokenizer", default="Qwen/Qwen3.5-9B")
-    parser.add_argument("--max-new-tokens", type=int, default=10240)
-    parser.add_argument("--thinking", action="store_true")
-    parser.add_argument("--temperature", type=float)
-    parser.add_argument("--top-p", type=float)
-    parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--preload", action="store_true")
+    parser.add_argument("--max-new-tokens", type=int, default=10240); parser.add_argument("--thinking", action="store_true")
+    parser.add_argument("--speculative", action="store_true")
+    parser.add_argument("--draft-tokens", type=int, choices=range(1, 5), default=2)
+    parser.add_argument("--temperature", type=float); parser.add_argument("--top-p", type=float)
+    parser.add_argument("--top-k", type=int, default=20); parser.add_argument("--preload", action="store_true")
     Handler.args, Handler.root = parser.parse_args(), Path(__file__).parent
-    Handler.args.temperature = (
-        Handler.args.temperature
-        if Handler.args.temperature is not None
-        else 0.6
-        if Handler.args.thinking
-        else 0.7
-    )
-    Handler.args.top_p = (
-        Handler.args.top_p
-        if Handler.args.top_p is not None
-        else 0.95
-        if Handler.args.thinking
-        else 0.8
-    )
+    Handler.args.temperature = Handler.args.temperature if Handler.args.temperature is not None else 0.6 if Handler.args.thinking else 0.7
+    Handler.args.top_p = Handler.args.top_p if Handler.args.top_p is not None else 0.95 if Handler.args.thinking else 0.8
+    server = ThreadingHTTPServer((Handler.args.host, Handler.args.port), Handler); server.daemon_threads = True
     print(f"http://{Handler.args.host}:{Handler.args.port}")
-    if Handler.args.preload:
-        Handler.load_model()
-    ThreadingHTTPServer((Handler.args.host, Handler.args.port), Handler).serve_forever()
+    if Handler.args.preload: Handler.start_model_load()
+    try: server.serve_forever()
+    except KeyboardInterrupt: pass
+    finally:
+        server.server_close()
+        for session in list(Handler.sessions.values()):
+            if session.runtime: session.runtime.close()
+        if Handler.engine: Handler.engine.close()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
