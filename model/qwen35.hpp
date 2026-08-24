@@ -12,10 +12,10 @@ namespace infeng::qwen35 {
 using metal::CommandBuffer;
 using metal::Device;
 using metal::Pipeline;
-using metal::SparseBuffer;
+using metal::SparseKV;
 using metal::Tensor;
 
-inline constexpr uint32_t blockTokens = 128, targetKvPlanes = 16, mtpKvPlanes = 2;
+inline constexpr uint32_t blockTokens = 128, targetKvLayers = 8;
 inline constexpr uint32_t maxDraftTokens = 4, maxBatchSequences = 8, maxBatchTokens = 128;
 inline constexpr uint32_t maxLogitRows = maxBatchSequences * (maxDraftTokens + 1), gdnCheckpointTokens = 512;
 inline constexpr uint32_t unbound = UINT32_MAX;
@@ -23,7 +23,7 @@ inline constexpr uint64_t convStateBytes = 8192 * 4 * 2, recurrentStateBytes = u
 
 enum class QuantType : uint32_t { F32 = 0, F16 = 1, Q8_0 = 8, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ4_XS = 23 };
 struct Linear {
-    Tensor weight; Pipeline *decode = nullptr, *prefill = nullptr;
+    Tensor weight; Pipeline *decode = nullptr, *decodeAdd = nullptr, *prefill = nullptr;
     uint32_t k = 0, n = 0; uint16_t decodeThreads = 0; uint8_t outputsPerGroup = 0; QuantType type{};
 };
 struct MlpWeights {
@@ -39,14 +39,14 @@ struct Layer {
 struct MtpWeights { Linear fusion; Layer layer; Tensor embeddingNorm, hiddenNorm, outputNorm; };
 struct Kernels {
     Pipeline *embed, *rms, *add, *siluMul, *padRows, *initRope, *argmax, *sample, *mtpDraftFuse;
-    Pipeline *attention, *attentionGate, *unpackAttention, *ropeQk, *mtpStore;
-    Pipeline *gdnPrepare, *gdnConv, *gdnConvCandidates, *splitQk, *deltaPrefill, *deltaDecode, *deltaCandidates,
-             *gdnNorm, *mtpFuse, *gatherRows;
+    Pipeline *attentionPrepare, *attentionScan, *attentionReduce, *mtpStore;
+    Pipeline *gdnPrepare, *gdnBaPrepare, *gdnConv, *gdnConvCandidates, *splitQk, *deltaPrefill, *deltaDecode,
+             *deltaCandidates, *gdnNorm, *mtpFuse, *gatherRows;
 };
 struct Scratch {
     bool decodeMode = false; Pipeline* padRows = nullptr;
     Tensor hidden[2], inputNorm, postNorm, padInput, mlpGate, mlpUp, mlpMixed;
-    Tensor attnQG, attnK, attnV, attnQNorm, attnKNorm, attnQRope, attnKRope, attnOut, attnGated;
+    Tensor attnQG, attnK, attnV, attnQRope, attnKRope, attnOut, attnGated, attnPartials;
     Tensor gdnMixed, gdnZ, gdnB, gdnA, gdnG, gdnConvolved, gdnQ, gdnK, gdnV, gdnDelta, gdnNormed;
     Tensor mid, projected, mtpFused, targetHidden, targetLogits;
     void ensure(Device& device, uint32_t rows, bool mtp);
@@ -64,7 +64,7 @@ struct Batch {
     uint32_t size = 0, drafts = 0;
 };
 struct Model {
-    Device device; uint32_t maxContext; std::unique_ptr<SparseBuffer> kv;
+    Device device; uint32_t maxContext; std::unique_ptr<SparseKV> kv;
     Tensor embedding, norm, rope; Linear head; std::array<Layer, 32> layers; MtpWeights mtp;
     std::array<LayerState, 32> states; Kernels kernels{}; Scratch workspace;
     Tensor inputIds, batchKvValid, queryStartLoc, draftPositions, sequenceSlots, stateBanks;

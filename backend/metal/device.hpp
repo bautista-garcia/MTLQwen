@@ -84,7 +84,7 @@ public:
 class Device {
     friend struct Buffer;
     friend class CommandBuffer;
-    friend class SparseBuffer;
+    friend class SparseKV;
     static constexpr uint32_t counterHeapEntries = 4096;
     MTL::Device* metalDevice = nullptr;
     MTL4::CommandQueue* queue = nullptr;
@@ -118,19 +118,18 @@ public:
     const std::vector<KernelCounter>& kernelCounters() const { return kernelStats; }
     Counters stats;
 };
-class SparseBuffer {
+class SparseKV {
     static constexpr uint64_t pageBytes = 256ull << 10, heapBytes = 64ull << 20;
-    Device& device;
-    uint32_t virtualBlocks, maxPhysicalBlocks, planeCount, physicalBlocks = 0, blocksPerHeap;
-    std::vector<Tensor> planes; std::vector<MTL::Heap*> heaps;
-    void addHeap();
-    void update(uint32_t virtualBlock, uint32_t count, uint32_t physicalBlock, bool mapped);
-public:
-    SparseBuffer(Device& device, uint32_t virtualBlocks, uint32_t physicalBlocks, uint32_t planes);
-    SparseBuffer(const SparseBuffer&) = delete; ~SparseBuffer();
+    struct Resource { Tensor buffer; uint32_t regions, heapOffset; }; Device& device;
+    uint32_t virtualBlocks, maxPhysicalBlocks, tilesPerBlock, physicalBlocks = 0, blocksPerHeap; uint64_t regionBytes;
+    Resource resources[3]; std::vector<MTL::Heap*> heaps; Tensor makeBuffer(uint32_t regions); void addHeap();
+    void update(const Resource&, uint32_t virtualBlock, MTL::Heap*, uint32_t heapOffset);
+    Tensor view(uint32_t resource, uint32_t region) const { return {resources[resource].buffer.buffer, uint64_t(region) * regionBytes, regionBytes}; }
+public: SparseKV(Device&, uint32_t virtualBlocks, uint32_t physicalBlocks, uint32_t targetLayers, bool mtp); ~SparseKV();
     void ensure(uint32_t blocks); void map(uint32_t virtualBlock, uint32_t physicalBlock); void unmap(uint32_t virtualBlock);
-    const Tensor& plane(uint32_t index) const { return planes.at(index); }
-    uint64_t mappedBytes() const { return uint64_t(physicalBlocks) * planeCount * pageBytes; }
+    Tensor key(uint32_t layer) const { return layer == resources[0].regions ? view(2, 0) : view(0, layer); }
+    Tensor value(uint32_t layer) const { return layer == resources[1].regions ? view(2, 1) : view(1, layer); }
+    uint64_t mappedBytes() const { return uint64_t(physicalBlocks) * tilesPerBlock * pageBytes; }
 };
 template <class T> void CommandBuffer::scalar(MTL4::ArgumentTable* table, uint32_t index, const T& value) {
     static_assert(std::is_trivially_copyable_v<T>);

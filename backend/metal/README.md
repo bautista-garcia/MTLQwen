@@ -1,22 +1,22 @@
 ## Sparse buffers
 
-KV execution uses one Metal placement-sparse buffer per K/V plane. Each 256 KiB virtual tile contains 128 token
-positions for one plane. A live sequence's reusable slot selects a contiguous virtual range, so attention calculates
-`slot * slot_stride + token`; Metal's MMU resolves the logical block to its physical heap tile.
+KV execution uses two shared Metal placement-sparse buffers for target keys and values, plus one optional MTP buffer.
+The target buffers each contain eight layer regions; the MTP buffer contains one K and one V region. Every region gives
+each reusable sequence slot a `max_context`-sized virtual range. Attention binds the current layer's region view and
+calculates `slot * slot_stride + token`; Metal's MMU resolves the logical block to its physical heap tile.
 
-A CPU-owned physical block is a bundle of 16 target tiles (K/V for eight full-attention layers), or 4 MiB. MTP GGUFs
-add exactly two tiles for their one supported attention layer, making the bundle 4.5 MiB. All tiles in the bundle share
-one physical ID, reference count, prefix hash, allocation, and eviction lifetime. Heaps are added only when the CPU
-allocator issues new physical IDs.
+A CPU-owned physical block is a contiguous heap bundle laid out as `[K0..K7, V0..V7, MTP-K?, MTP-V?]`: 16 target
+tiles (4 MiB), plus exactly two tiles for the single supported MTP layer when present (4.5 MiB total). Mapping one
+logical block submits eight region updates to the target-key buffer, eight to the target-value buffer, and optionally
+two to the MTP buffer. All tiles share one physical ID, reference count, prefix hash, allocation, and eviction lifetime.
 
-Completed prefix blocks can map the same immutable heap tiles into several virtual ranges without copying data. These
-aliases live within each plane's single sparse resource; a compute dispatch binds only the current K/V plane pair, so it
-never binds conflicting sparse resources that alias the same tiles. Partial blocks remain private. Mapping updates are
-ordered by a resource-state-to-dispatch barrier, and the serialized command path completes prior GPU work before
-unmapping or reusing a tile.
+Completed prefix blocks map the same immutable heap tiles into several slot ranges without copying data. Each alias of
+a particular key or value tile remains within its corresponding shared sparse resource. Partial blocks remain private.
+Mapping updates are ordered by a resource-state-to-dispatch barrier, and the serialized command path completes prior
+GPU work before unmapping or reusing a bundle.
 
 MTP proposal KV is tentative until target verification. Verified target hidden states overwrite the persistent MTP
-planes before `kv_valid` advances; hybrid GDN verification separately copies only the selected candidate column into
+regions before `kv_valid` advances; hybrid GDN verification separately copies only the selected candidate column into
 the inactive bank before publishing it with a bank flip.
 
 Run target-only or speculative throughput with the same benchmark:

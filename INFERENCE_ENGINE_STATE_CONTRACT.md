@@ -83,19 +83,25 @@ A physical block ID identifies a bundle of placement-heap tiles:
 
 ```text
 CacheBundle {
-    target_kv_tiles[plane]
-    persistent_drafter_kv_tiles[plane]?  // present when the drafter needs token-addressed persistent state
+    target_key_tiles[layer]
+    target_value_tiles[layer]
+    persistent_drafter_key_tile?  // present when the drafter needs token-addressed persistent state
+    persistent_drafter_value_tile?
 }
 ```
 
-For execution, each KV plane is one placement-sparse virtual buffer and each live logical binding has corresponding hardware mappings:
+Execution uses two target placement-sparse buffers and one optional persistent-drafter buffer. The target buffers have
+one virtual region per attention layer; the drafter buffer has K and V regions. Each live logical binding installs the
+corresponding hardware mappings:
 
 ```text
 virtual_block = slot * max_logical_blocks + logical_block_id
-sparse_mapping[(plane, virtual_block)] = CacheBundle[physical_block_id].tile[plane]
+sparse_mapping[(target_keys, layer, virtual_block)] = CacheBundle[physical_block_id].target_key_tiles[layer]
+sparse_mapping[(target_values, layer, virtual_block)] = CacheBundle[physical_block_id].target_value_tiles[layer]
+sparse_mapping[(drafter_kv, K_or_V, virtual_block)] = CacheBundle[physical_block_id].persistent_drafter_*_tile
 ```
 
-The CPU logical binding is allocation and ownership metadata. The sparse mapping is the execution-time virtual-to-physical translation performed by Metal's MMU; it is not uploaded as a GPU page-table tensor. The target and drafter planes share the same physical block ID, logical binding, reference count, allocation, and eviction lifetime.
+The CPU logical binding is allocation and ownership metadata. The sparse mapping is the execution-time virtual-to-physical translation performed by Metal's MMU; it is not uploaded as a GPU page-table tensor. Every target and drafter tile in the bundle shares the same physical block ID, logical binding, reference count, allocation, and eviction lifetime.
 
 Bindings and sparse mappings describe placement and allocated capacity, not validity. `kv_valid` is the only validity boundary.
 
@@ -474,7 +480,7 @@ The minimal visible drafter input is:
 anchor = request[kv_valid]
 ```
 
-The drafter uses the sequence's slot and sparse KV planes to retrieve its persistent cache from the same physical cache bundle as the target KV. `sequence_id` remains a control-plane identity. Any additional temporary input required by a particular drafter is defined in Section 5.
+The drafter uses the sequence's slot and its K/V region views to retrieve persistent cache from the same physical cache bundle as the target KV. `sequence_id` remains a control-plane identity. Any additional temporary input required by a particular drafter is defined in Section 5.
 
 The number of proposals allowed in the round is:
 
@@ -563,7 +569,7 @@ else:
     ref_cnt[physical_block] += 1
 ```
 
-Allocation, reuse, and eviction apply to the complete cache bundle. The target and persistent drafter planes cannot acquire different logical bindings or lifetimes.
+Allocation, reuse, and eviction apply to the complete cache bundle. The target and persistent drafter tiles cannot acquire different logical bindings or lifetimes.
 
 Hybrid checkpoints are not token-addressed sparse KV blocks. They use the separate publication, restore, and eviction rules in Section 2.3.
 
@@ -608,7 +614,7 @@ The target model receives:
 
 The GDN inputs are passed only for a hybrid model. Every row reads its active committed bank. An ordinary row writes its final state directly to the inactive bank. A speculative row writes `draft_count + 1` logical candidate columns into its assigned slice of the demand-sized candidate arena. Candidate capacity is ensured before the forward starts.
 
-No logical-to-physical table is uploaded. The sparse mappings were established during reservation, and each attention dispatch binds only the current layer's sparse K/V plane pair. A resource-state-to-dispatch barrier orders mapping updates before the compute pass.
+No logical-to-physical table is uploaded. The sparse mappings were established during reservation, and each attention dispatch binds the current layer's views into the shared target-key and target-value buffers (or the MTP buffer's K/V views). A resource-state-to-dispatch barrier orders mapping updates before the compute pass.
 
 For batch row `i`:
 ```text
@@ -623,7 +629,7 @@ Each query token attends to the `kv_valid[i]` cached tokens plus its prefix insi
 virtual_token = slot[i] * (max_logical_blocks * B) + position
 ```
 
-Metal's MMU resolves the containing virtual block to the mapped physical tile. The shader performs no physical-block lookup or cache-plane arithmetic.
+Metal's MMU resolves the containing virtual block to the mapped physical tile. The shader performs no physical-block lookup or layer-resource arithmetic.
 The forward pass computes logits and writes KV for every query token. When speculation is enabled, it also exposes the target hidden states required to update the configured drafter as described in Section 5. It does not modify `request` or `kv_valid`; post-forward processing decides which written cache entries become committed. The committed interval is `[0, kv_valid)` for every token-addressed cache group.
 
 ### 4.7 Post-forward commit
@@ -743,7 +749,7 @@ When hybrid prefix caching is enabled, `mtp_seed` is copied into and restored fr
 
 When a separate MTP cache is used, MTP KV produced beyond `kv_valid` is tentative and is discarded after verification. Persistent MTP KV for newly committed positions is rebuilt from verified target outputs.
 
-An MTP implementation that directly shares compatible target KV may omit the separate MTP planes. The logical-binding, sparse-mapping, and `kv_valid` contract remains unchanged.
+An MTP implementation that directly shares compatible target KV may omit the separate MTP buffer. The logical-binding, sparse-mapping, and `kv_valid` contract remains unchanged.
 
 ## 6. Concurrency contract
 

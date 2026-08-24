@@ -172,44 +172,44 @@ void CommandBuffer::commit() {
     encoder->endEncoding(); encoder = nullptr; submit();
 }
 
-SparseBuffer::SparseBuffer(Device& device, uint32_t virtualCount, uint32_t physicalCount, uint32_t count)
-    : device(device), virtualBlocks(virtualCount), maxPhysicalBlocks(physicalCount), planeCount(count),
-      blocksPerHeap(uint32_t(heapBytes / pageBytes) / count) {
-    if (!blocksPerHeap) throw std::runtime_error("invalid sparse buffer dimensions");
-    uint64_t bytes = uint64_t(virtualBlocks) * pageBytes; planes.reserve(planeCount);
-    for (uint32_t i = 0; i < planeCount; ++i) {
-        MTL::Buffer* buffer = device.metalDevice->newBuffer(bytes, MTL::ResourceStorageModePrivate, MTL::SparsePageSize256);
-        if (!buffer) throw std::runtime_error("sparse KV buffer allocation failed");
-        device.add(buffer); planes.push_back({std::make_shared<Buffer>(&device, buffer, bytes), 0, bytes});
-    }
+Tensor SparseKV::makeBuffer(uint32_t regions) {
+    uint64_t bytes = regionBytes * regions; MTL::Buffer* buffer = device.metalDevice->newBuffer(
+        bytes, MTL::ResourceStorageModePrivate, MTL::SparsePageSize256);
+    if (!buffer) throw std::runtime_error("sparse KV buffer allocation failed");
+    device.add(buffer); return {std::make_shared<Buffer>(&device, buffer, bytes), 0, bytes};
 }
-void SparseBuffer::addHeap() {
+SparseKV::SparseKV(Device& device, uint32_t virtualCount, uint32_t physicalCount, uint32_t layers, bool mtp)
+    : device(device), virtualBlocks(virtualCount), maxPhysicalBlocks(physicalCount),
+      tilesPerBlock(layers * 2 + (mtp ? 2 : 0)), blocksPerHeap(uint32_t(heapBytes / pageBytes) / tilesPerBlock),
+      regionBytes(uint64_t(virtualBlocks) * pageBytes),
+      resources{{makeBuffer(layers), layers, 0}, {makeBuffer(layers), layers, layers},
+                {mtp ? makeBuffer(2) : Tensor{}, mtp ? 2u : 0u, layers * 2}} {}
+void SparseKV::addHeap() {
     auto descriptor = NS::TransferPtr(MTL::HeapDescriptor::alloc()->init());
     descriptor->setType(MTL::HeapTypePlacement); descriptor->setStorageMode(MTL::StorageModePrivate);
     descriptor->setSize(heapBytes); descriptor->setSparsePageSize(MTL::SparsePageSize256);
     descriptor->setMaxCompatiblePlacementSparsePageSize(MTL::SparsePageSize256);
     MTL::Heap* heap = device.metalDevice->newHeap(descriptor.get());
     if (!heap) throw std::runtime_error("KV heap allocation failed");
-    device.add(heap); heaps.push_back(heap);
-    physicalBlocks += std::min(blocksPerHeap, maxPhysicalBlocks - physicalBlocks);
+    device.add(heap); heaps.push_back(heap); physicalBlocks += std::min(blocksPerHeap, maxPhysicalBlocks - physicalBlocks);
 }
-void SparseBuffer::ensure(uint32_t blocks) {
-    if (blocks > maxPhysicalBlocks) throw std::runtime_error("KV block pool exhausted");
-    while (physicalBlocks < blocks) addHeap();
+void SparseKV::ensure(uint32_t blocks) { while (physicalBlocks < blocks) addHeap(); }
+void SparseKV::update(const Resource& resource, uint32_t virtualBlock, MTL::Heap* heap, uint32_t heapOffset) {
+    auto mode = heap ? MTL::SparseTextureMappingModeMap : MTL::SparseTextureMappingModeUnmap;
+    using Operation = MTL4::UpdateSparseBufferMappingOperation; auto operation = [&](uint32_t region) { return Operation{
+        mode, NS::Range::Make(uint64_t(region) * virtualBlocks + virtualBlock, 1), heap ? heapOffset + region : 0}; };
+    Operation operations[]{operation(0), operation(1), operation(2), operation(3), operation(4), operation(5),
+                           operation(6), operation(7)};
+    device.queue->updateBufferMappings(resource.buffer.buffer->metalBuffer, heap, operations, resource.regions);
 }
-void SparseBuffer::update(uint32_t virtualBlock, uint32_t count, uint32_t physicalBlock, bool mapped) {
-    MTL::Heap* heap = mapped ? heaps[physicalBlock / blocksPerHeap] : nullptr;
-    uint32_t offset = mapped ? physicalBlock % blocksPerHeap * planeCount : 0;
-    auto mode = mapped ? MTL::SparseTextureMappingModeMap : MTL::SparseTextureMappingModeUnmap;
-    for (uint32_t i = 0; i < planeCount; ++i) {
-        MTL4::UpdateSparseBufferMappingOperation operation{mode, NS::Range::Make(virtualBlock, count), mapped ? offset + i : 0};
-        device.queue->updateBufferMappings(planes[i].buffer->metalBuffer, heap, &operation, 1);
-    }
+void SparseKV::map(uint32_t virtualBlock, uint32_t physicalBlock) {
+    MTL::Heap* heap = heaps[physicalBlock / blocksPerHeap]; uint32_t offset = physicalBlock % blocksPerHeap * tilesPerBlock;
+    for (const Resource& resource : resources) if (resource.regions) update(resource, virtualBlock, heap,
+                                                                             offset + resource.heapOffset);
 }
-void SparseBuffer::map(uint32_t virtualBlock, uint32_t physicalBlock) { update(virtualBlock, 1, physicalBlock, true); }
-void SparseBuffer::unmap(uint32_t virtualBlock) { update(virtualBlock, 1, 0, false); }
-SparseBuffer::~SparseBuffer() {
-    update(0, virtualBlocks, 0, false); device.wait(); planes.clear();
-    for (auto* heap : heaps) { device.remove(heap); heap->release(); }
-}
+void SparseKV::unmap(uint32_t virtualBlock) { for (const Resource& resource : resources) if (resource.regions)
+    update(resource, virtualBlock, nullptr, 0); }
+SparseKV::~SparseKV() {
+    device.wait(); for (Resource& resource : resources) resource.buffer = {};
+    for (auto* heap : heaps) { device.remove(heap); heap->release(); } }
 }  // namespace infeng::metal
