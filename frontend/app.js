@@ -7,6 +7,7 @@ const ui = {
   sidebar: $("#sidebar"), sidebarScrim: $("#sidebar-scrim"), toast: $("#toast"),
 };
 const sessions = new Map();
+const streamRenderInterval = 80;
 let activeId = null, serverStatus = {}, toastTimer;
 
 if (window.marked) marked.setOptions({ breaks: true, gfm: true });
@@ -153,7 +154,6 @@ function messageNode(message, index) {
   const response = document.createElement("div"); response.className = `response-content${message.error ? " error-text" : ""}`;
   response.dataset.status = message.status || (message.streaming ? "Generating…" : "No response generated.");
   if (message.error) response.textContent = `Error: ${message.error}`;
-  else if (message.streaming) response.textContent = message.content || "";
   else response.innerHTML = renderMarkdown(message.content || "");
   body.append(response); if (!message.streaming) enhance(response);
   if (message.streaming) { const cursor = document.createElement("span"); cursor.className = "cursor"; body.append(cursor); }
@@ -174,13 +174,17 @@ function renderMessages() {
 
 function refreshMessage(session, index) {
   if (session.renderFrame) return;
-  session.renderFrame = requestAnimationFrame(() => {
+  const render = () => {
     session.renderFrame = null;
     if (activeId !== session.id) return;
     const old = ui.messages.querySelector(`[data-index="${index}"]`);
     if (old) old.replaceWith(messageNode(session.messages[index], index)); else renderMessages();
-    ui.messages.scrollTop = ui.messages.scrollHeight; renderTop();
-  });
+    ui.messages.scrollTop = ui.messages.scrollHeight; session.renderedAt = performance.now(); renderTop();
+  };
+  const streaming = session.messages[index]?.streaming;
+  const delay = streaming ? Math.max(0, streamRenderInterval - (performance.now() - (session.renderedAt || 0))) : 0;
+  if (delay) session.renderFrame = setTimeout(() => { session.renderFrame = requestAnimationFrame(render); }, delay);
+  else session.renderFrame = requestAnimationFrame(render);
 }
 
 async function syncSessions() {
