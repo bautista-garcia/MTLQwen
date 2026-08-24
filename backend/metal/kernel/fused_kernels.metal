@@ -45,7 +45,7 @@ static inline __attribute__((always_inline)) void q4k_accumulate(
     }
 }
 
-[[max_total_threads_per_threadgroup(64)]]
+[[max_total_threads_per_threadgroup(128)]]
 kernel void mlp_gate_up_q4_k_decode(
         device half* y [[buffer(0)]], device const half* x [[buffer(1)]],
         device const uchar* wg [[buffer(2)]], device const uchar* wu [[buffer(3)]],
@@ -53,7 +53,7 @@ kernel void mlp_gate_up_q4_k_decode(
         ushort simd_group [[simdgroup_index_in_threadgroup]],
         uint3 group [[threadgroup_position_in_grid]]) {
     ushort ix = lane / 8, it = lane % 8, iq = it / 4, ir = it % 4;
-    uint nb = MLP_K / 256, first_row = (group.x * 2 + simd_group) * 2;
+    uint nb = MLP_K / 256, first_row = (group.x * 4 + simd_group) * 2;
     long s = long(group.y);
     float yl[16], yh[16], gate[2] = {0.0f, 0.0f}, up[2] = {0.0f, 0.0f};
     device const half* src4 = x + s * MLP_K + ix * 256 + 64 * iq + 8 * ir;
@@ -116,14 +116,14 @@ static inline __attribute__((always_inline)) void q5k_accumulate(
             float(dh[1]) * dot(sumy, float4(sc8[2], sc8[3], sc8[6], sc8[7]));
 }
 
-[[max_total_threads_per_threadgroup(64)]]
+[[max_total_threads_per_threadgroup(128)]]
 kernel void mlp_gate_up_q5_k_decode(
         device half* y [[buffer(0)]], device const half* x [[buffer(1)]],
         device const uchar* wg [[buffer(2)]], device const uchar* wu [[buffer(3)]],
         constant long& S [[buffer(4)]], ushort lane [[thread_index_in_simdgroup]],
         ushort simd_group [[simdgroup_index_in_threadgroup]],
         uint3 group [[threadgroup_position_in_grid]]) {
-    uint nb = MLP_K / 256, row = group.x * 2 + simd_group;
+    uint nb = MLP_K / 256, row = group.x * 4 + simd_group;
     ushort tid = lane / 4, ix = lane % 4, iq = tid / 4, ir = tid % 4, l0 = 8 * ir;
     ushort q_offset = 32 * iq + l0, y_offset = 64 * iq + l0;
     uchar hm1 = 1u << (2 * iq), hm2 = hm1 << 1, hm3 = hm1 << 4, hm4 = hm2 << 4;
@@ -175,17 +175,17 @@ static inline __attribute__((always_inline)) void iq4xs_accumulate(
     }
 }
 
-[[max_total_threads_per_threadgroup(64)]]
+[[max_total_threads_per_threadgroup(128)]]
 kernel void mlp_gate_up_iq4_xs_decode(
         device half* y [[buffer(0)]], device const half* x [[buffer(1)]],
         device const uchar* wg [[buffer(2)]], device const uchar* wu [[buffer(3)]],
         constant long& S [[buffer(4)]], ushort lane [[thread_index_in_simdgroup]],
         ushort simd_group [[simdgroup_index_in_threadgroup]],
         uint3 group [[threadgroup_position_in_grid]]) {
-    uint nb = MLP_K / 256, first_row = (group.x * 2 + simd_group) * 2;
+    uint nb = MLP_K / 256, first_row = (group.x * 4 + simd_group) * 2;
     ushort ix = lane / 16, it = lane % 16, part = it / 2, il = it % 2;
     threadgroup float lookup[16];
-    if (lane < 16) lookup[lane] = iq4nl[lane];
+    if (simd_group == 0 && lane < 16) lookup[lane] = iq4nl[lane];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     long s = long(group.y);
     float4 yl[4];

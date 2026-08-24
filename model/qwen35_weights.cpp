@@ -113,17 +113,17 @@ LinearSpec linearSpec(QuantType type, uint32_t k, uint32_t n) {
         if (k == 12288 && n == 4096) return {"q4_k_k12288_n4096_decode", "q4_k_k12288_n4096_prefill", 64, 4};
     }
     if (type == QuantType::Q5_K) {
-        if (k == 4096 && n == 1024) return {"q5_k_k4096_n1024_decode", "q5_k_k4096_n1024_prefill", 64, 2};
-        if (k == 4096 && n == 4096) return {"q5_k_k4096_n4096_decode", "q5_k_k4096_n4096_prefill", 64, 2};
-        if (k == 4096 && n == 8192) return {"q5_k_k4096_n8192_decode", "q5_k_k4096_n8192_prefill", 64, 2};
-        if (k == 4096 && n == 12288) return {"q5_k_k4096_n12288_decode", "q5_k_k4096_n12288_prefill", 64, 2};
-        if (k == 12288 && n == 4096) return {"q5_k_k12288_n4096_decode", "q5_k_k12288_n4096_prefill", 64, 2};
+        if (k == 4096 && n == 1024) return {"q5_k_k4096_n1024_decode", "q5_k_k4096_n1024_prefill", 128, 4};
+        if (k == 4096 && n == 4096) return {"q5_k_k4096_n4096_decode", "q5_k_k4096_n4096_prefill", 128, 4};
+        if (k == 4096 && n == 8192) return {"q5_k_k4096_n8192_decode", "q5_k_k4096_n8192_prefill", 128, 4};
+        if (k == 4096 && n == 12288) return {"q5_k_k4096_n12288_decode", "q5_k_k4096_n12288_prefill", 128, 4};
+        if (k == 12288 && n == 4096) return {"q5_k_k12288_n4096_decode", "q5_k_k12288_n4096_prefill", 128, 4};
     }
     if (type == QuantType::Q6_K) {
-        if (k == 4096 && n == 1024) return {"q6_k_k4096_n1024_decode", "q6_k_k4096_n1024_prefill", 64, 4};
-        if (k == 4096 && n == 8192) return {"q6_k_k4096_n8192_decode", "q6_k_k4096_n8192_prefill", 64, 4};
-        if (k == 12288 && n == 4096) return {"q6_k_k12288_n4096_decode", "q6_k_k12288_n4096_prefill", 64, 4};
-        if (k == 4096 && n == 248320) return {"q6_k_k4096_n248320_decode", "q6_k_k4096_n248320_prefill", 64, 4};
+        if (k == 4096 && n == 1024) return {"q6_k_k4096_n1024_decode", "q6_k_k4096_n1024_prefill", 128, 8};
+        if (k == 4096 && n == 8192) return {"q6_k_k4096_n8192_decode", "q6_k_k4096_n8192_prefill", 128, 8};
+        if (k == 12288 && n == 4096) return {"q6_k_k12288_n4096_decode", "q6_k_k12288_n4096_prefill", 128, 8};
+        if (k == 4096 && n == 248320) return {"q6_k_k4096_n248320_decode", "q6_k_k4096_n248320_prefill", 128, 8};
     }
     if (type == QuantType::Q8_0 && k == 4096 && n == 4096)
         return {"q8_0_k4096_n4096_decode", "q8_0_k4096_n4096_prefill", 128, 2};
@@ -137,7 +137,9 @@ LinearSpec linearSpec(QuantType type, uint32_t k, uint32_t n) {
 Linear makeLinear(Device& device, const Weight& weight) {
     if (weight.shape.size() != 2) throw std::runtime_error("linear weight is not a matrix");
     uint32_t n = weight.shape[0], k = weight.shape[1]; LinearSpec spec = linearSpec(weight.type, k, n);
-    return {weight.data, device.pipeline(spec.decode), device.pipeline(spec.prefill), k, n,
+    Pipeline* decodeAdd = weight.type != QuantType::F16 && n == 4096
+        ? device.pipeline(std::string(spec.decode) + "_add") : nullptr;
+    return {weight.data, device.pipeline(spec.decode), decodeAdd, device.pipeline(spec.prefill), k, n,
             spec.threads, spec.outputs, weight.type};
 }
 MlpWeights makeMlp(Device& device, std::unordered_map<std::string, Weight>& weights, const std::string& prefix) {
@@ -145,9 +147,15 @@ MlpWeights makeMlp(Device& device, std::unordered_map<std::string, Weight>& weig
                       makeLinear(device, require(weights, prefix + "up_proj.weight")),
                       makeLinear(device, require(weights, prefix + "down_proj.weight"))};
     if (result.gate.type != result.up.type) throw std::runtime_error("mixed MLP gate/up quantization unsupported");
-    if (result.gate.type == QuantType::Q4_K) result.fusedDecode = device.pipeline("mlp_gate_up_q4_k_decode"), result.decodeThreads = 64, result.outputsPerGroup = 4;
-    else if (result.gate.type == QuantType::Q5_K) result.fusedDecode = device.pipeline("mlp_gate_up_q5_k_decode"), result.decodeThreads = 64, result.outputsPerGroup = 2;
-    else if (result.gate.type == QuantType::IQ4_XS) result.fusedDecode = device.pipeline("mlp_gate_up_iq4_xs_decode"), result.decodeThreads = 64, result.outputsPerGroup = 4;
+    if (result.gate.type == QuantType::Q4_K)
+        result.fusedDecode = device.pipeline("mlp_gate_up_q4_k_decode"), result.decodeThreads = 128,
+        result.outputsPerGroup = 8;
+    else if (result.gate.type == QuantType::Q5_K)
+        result.fusedDecode = device.pipeline("mlp_gate_up_q5_k_decode"), result.decodeThreads = 128,
+        result.outputsPerGroup = 4;
+    else if (result.gate.type == QuantType::IQ4_XS)
+        result.fusedDecode = device.pipeline("mlp_gate_up_iq4_xs_decode"), result.decodeThreads = 128,
+        result.outputsPerGroup = 8;
     else throw std::runtime_error("unsupported fused MLP quantization");
     return result;
 }
@@ -190,8 +198,6 @@ Model::Model(const std::filesystem::path& path, const std::filesystem::path& ker
         meta("qwen35.ssm.conv_kernel") != 4 || meta("qwen35.ssm.state_size") != 128 ||
         meta("qwen35.ssm.group_count") != 16 || meta("qwen35.ssm.time_step_rank") != 32)
         throw std::runtime_error("unsupported Qwen3.5 architecture");
-    kv = std::make_unique<SparseBuffer>(device, maxBatchSequences * maxLogicalBlocks, blocks.size(),
-                                        targetKvPlanes + (hasMtp ? mtpKvPlanes : 0));
     std::vector<Info> infos; infos.reserve(tensorCount);
     for (uint64_t i = 0; i < tensorCount; ++i) {
         Info info; info.name = reader.string(); uint32_t dims = reader.read<uint32_t>(); info.shape.resize(dims);
@@ -273,10 +279,10 @@ Model::Model(const std::filesystem::path& path, const std::filesystem::path& ker
     kernels = {device.pipeline("q4_k_embed"), device.pipeline("rmsnorm"), device.pipeline("add_half"),
                device.pipeline("silu_mul"), device.pipeline("pad_rows"), device.pipeline("init_rope"),
                device.pipeline("argmax_logits"), device.pipeline("sample_logits"), device.pipeline("mtp_draft_fuse"),
-               device.pipeline("attention"), device.pipeline("attention_gate"),
-               device.pipeline("unpack_attention"), device.pipeline("rope_qk"),
-               device.pipeline("mtp_store_kv"), device.pipeline("gdn_prepare"),
-               device.pipeline("gdn_causal_conv_silu"), device.pipeline("gdn_causal_conv_candidates"),
+               device.pipeline("attention_prepare"), device.pipeline("attention_scan"),
+               device.pipeline("attention_reduce"), device.pipeline("mtp_store_kv"), device.pipeline("gdn_prepare"),
+               device.pipeline("gdn_ba_prepare_4096x32"), device.pipeline("gdn_causal_conv_silu"),
+               device.pipeline("gdn_causal_conv_candidates"),
                device.pipeline("split_repeat_qk"), device.pipeline("delta_rule_prefill"),
                device.pipeline("delta_rule_decode"), device.pipeline("delta_rule_candidates"),
                device.pipeline("rmsnorm_gated_128"), device.pipeline("mtp_fuse"),
@@ -309,6 +315,8 @@ Model::Model(const std::filesystem::path& path, const std::filesystem::path& ker
     }
     cacheNamespace = std::hash<std::string>{}(std::filesystem::absolute(path).string());
     workspace.padRows = kernels.padRows; workspace.ensure(device, 1, hasMtp);
+    this->kv = std::make_unique<SparseKV>(device, maxBatchSequences * maxLogicalBlocks, blocks.size(),
+                                          targetKvLayers, hasMtp);
     std::printf("GGUF weights loaded in %.3fs\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
 }
 }  // namespace infeng::qwen35

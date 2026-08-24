@@ -4,6 +4,7 @@
 namespace infeng::qwen35 {
 namespace {
 constexpr uint64_t halfBytes = 2;
+constexpr uint32_t attentionConcurrency = 8;
 MTL::Size size(uint64_t x, uint64_t y = 1, uint64_t z = 1) { return MTL::Size(x, y, z); }
 uint64_t roundUp(uint64_t value, uint64_t alignment) { return (value + alignment - 1) / alignment * alignment; }
 
@@ -43,8 +44,19 @@ Tensor add(CommandBuffer& commands, Model& model, const Tensor& a, const Tensor&
     commands.dispatch(model.kernels.add, size(roundUp(elements, 256)), size(256), {output, a, b}, uint32_t(elements));
     return output;
 }
-Tensor mlp(CommandBuffer& commands, Model& model, const Tensor& x, const MlpWeights& weights, Tensor output,
-           Scratch& scratch, uint32_t rows) {
+Tensor linearAdd(CommandBuffer& commands, Model& model, const Tensor& x, const Linear& weight,
+                 const Tensor& residual, Tensor output, Scratch& scratch, uint32_t rows) {
+    if (scratch.decodeMode) {
+        MTL::Size threads = size((weight.n + weight.outputsPerGroup - 1) / weight.outputsPerGroup *
+                                 weight.decodeThreads, rows);
+        commands.dispatch(weight.decodeAdd, threads, size(weight.decodeThreads), {output, x, weight.weight, residual});
+        return output;
+    }
+    Tensor projected = linear(commands, x, weight, rows, scratch.projected, scratch);
+    return add(commands, model, residual, projected, output, uint64_t(rows) * weight.n);
+}
+Tensor mlp(CommandBuffer& commands, Model& model, const Tensor& x, const MlpWeights& weights,
+           const Tensor& residual, Tensor output, Scratch& scratch, uint32_t rows) {
     if (scratch.decodeMode)
         commands.dispatch(weights.fusedDecode, size(12288 / weights.outputsPerGroup * weights.decodeThreads, rows),
                           size(weights.decodeThreads), {scratch.mlpMixed, x, weights.gate.weight, weights.up.weight},
@@ -56,32 +68,27 @@ Tensor mlp(CommandBuffer& commands, Model& model, const Tensor& x, const MlpWeig
         commands.dispatch(model.kernels.siluMul, size(roundUp(elements, 256)), size(256),
                           {scratch.mlpMixed, gate, up}, uint32_t(elements));
     }
-    return linear(commands, scratch.mlpMixed, weights.down, rows, output, scratch);
+    return linearAdd(commands, model, scratch.mlpMixed, weights.down, residual, output, scratch, rows);
 }
 
 Tensor attention(CommandBuffer& commands, Model& model, const Layer& layer, const Tensor& x, const Tensor& residual,
-                 Tensor output, Scratch& scratch, uint32_t batch, uint32_t rows, uint32_t kvPlane,
+                 Tensor output, Scratch& scratch, uint32_t batch, uint32_t rows, uint32_t kvLayer,
                  const Tensor& positions) {
     const AttentionWeights& weight = layer.attention;
     Tensor qg = linear(commands, x, weight.q, rows, scratch.attnQG, scratch, false);
     Tensor k = linear(commands, x, weight.k, rows, scratch.attnK, scratch, false);
     Tensor v = linear(commands, x, weight.v, rows, scratch.attnV, scratch);
-    uint64_t elements = uint64_t(rows) * 4096;
-    commands.dispatchConcurrent(model.kernels.unpackAttention, size(roundUp(elements, 256)), size(256),
-                                {scratch.inputNorm, qg}, uint32_t(elements));
-    k = rms(commands, model, k, weight.kNorm, scratch.attnKNorm, rows * 4, 256);
-    Tensor q = rms(commands, model, scratch.inputNorm, weight.qNorm, scratch.attnQNorm, rows * 16, 256);
-    commands.dispatch(model.kernels.ropeQk, size(roundUp(elements, 256)), size(256),
-                      {scratch.attnQRope, scratch.attnKRope, q, k, model.rope, positions, model.queryStartLoc},
-                      batch, rows);
-    commands.dispatch(model.kernels.attention, size(uint64_t(rows) * 16 * 128), size(128),
-                      {scratch.attnOut, scratch.attnQRope, scratch.attnKRope, v, model.kv->plane(kvPlane),
-                       model.kv->plane(kvPlane + 1), model.sequenceSlots, positions, model.queryStartLoc},
-                      batch, rows, model.maxLogicalBlocks * blockTokens);
-    commands.dispatch(model.kernels.attentionGate, size(roundUp(elements, 256)), size(256),
-                      {scratch.attnGated, scratch.attnOut, qg}, uint32_t(elements));
-    Tensor projected = linear(commands, scratch.attnGated, weight.out, rows, scratch.projected, scratch);
-    return add(commands, model, residual, projected, output, elements);
+    commands.dispatch(model.kernels.attentionPrepare, size(256, uint64_t(rows) * 20), size(256),
+                      {scratch.attnQRope, scratch.attnKRope, qg, k, weight.qNorm, weight.kNorm, model.rope,
+                       positions, model.queryStartLoc}, batch);
+    uint32_t splits = std::max(1u, attentionConcurrency / rows);
+    commands.dispatch(model.kernels.attentionScan, size(uint64_t(rows) * 16 * splits * 128), size(128),
+                      {scratch.attnPartials, scratch.attnQRope, scratch.attnKRope, v, model.kv->key(kvLayer),
+                       model.kv->value(kvLayer), model.sequenceSlots, positions, model.queryStartLoc},
+                      batch, rows, model.maxLogicalBlocks * blockTokens, splits);
+    commands.dispatch(model.kernels.attentionReduce, size(uint64_t(rows) * 16 * 128), size(128),
+                      {scratch.attnGated, scratch.attnPartials, qg}, rows, splits);
+    return linearAdd(commands, model, scratch.attnGated, weight.out, residual, output, scratch, rows);
 }
 
 Tensor gdn(CommandBuffer& commands, Model& model, const Layer& layer, const Tensor& x, const Tensor& residual,
@@ -89,10 +96,8 @@ Tensor gdn(CommandBuffer& commands, Model& model, const Layer& layer, const Tens
     const GdnWeights& weight = layer.gdn;
     Tensor mixed = linear(commands, x, weight.qkv, rows, scratch.gdnMixed, scratch, false);
     Tensor z = linear(commands, x, weight.z, rows, scratch.gdnZ, scratch, false);
-    Tensor b = linear(commands, x, weight.b, rows, scratch.gdnB, scratch, false);
-    Tensor a = linear(commands, x, weight.a, rows, scratch.gdnA, scratch);
-    commands.dispatchConcurrent(model.kernels.gdnPrepare, size(roundUp(uint64_t(rows) * 32, 256)), size(256),
-                                {scratch.gdnB, scratch.gdnG, b, a, weight.A, weight.dt}, rows * 32);
+    commands.dispatch(model.kernels.gdnBaPrepare, size(32 * 64, rows), size(64),
+                      {scratch.gdnB, scratch.gdnG, x, weight.b.weight, weight.a.weight, weight.A, weight.dt}, rows);
     for (uint32_t row = 0; row < layout.size; ++row) {
         uint32_t start = layout.starts[row], length = layout.starts[row + 1] - start;
         uint64_t offset = uint64_t(start) * 8192 * 2;
@@ -142,20 +147,18 @@ Tensor gdn(CommandBuffer& commands, Model& model, const Layer& layer, const Tens
     }
     commands.dispatch(model.kernels.gdnNorm, size(128, uint64_t(rows) * 32), size(128),
                       {scratch.gdnNormed, scratch.gdnDelta, z, weight.norm}, 1e-6f);
-    Tensor projected = linear(commands, scratch.gdnNormed, weight.out, rows, scratch.projected, scratch);
-    return add(commands, model, residual, projected, output, elements);
+    return linearAdd(commands, model, scratch.gdnNormed, weight.out, residual, output, scratch, rows);
 }
 
 Tensor decoderLayer(CommandBuffer& commands, Model& model, const Layer& layer, LayerState& state, const Tensor& hidden,
-                    Tensor output, Scratch& scratch, uint32_t rows, uint32_t kvPlane, const Tensor& positions,
+                    Tensor output, Scratch& scratch, uint32_t rows, uint32_t kvLayer, const Tensor& positions,
                     const Batch& layout) {
     Tensor x = rms(commands, model, hidden, layer.inputNorm, scratch.inputNorm, rows, 4096);
     Tensor mid = layer.fullAttention
-        ? attention(commands, model, layer, x, hidden, scratch.mid, scratch, layout.size, rows, kvPlane, positions)
+        ? attention(commands, model, layer, x, hidden, scratch.mid, scratch, layout.size, rows, kvLayer, positions)
         : gdn(commands, model, layer, x, hidden, scratch.mid, scratch, state, rows, layout);
     x = rms(commands, model, mid, layer.postNorm, scratch.postNorm, rows, 4096);
-    Tensor projected = mlp(commands, model, x, layer.mlp, scratch.projected, scratch, rows);
-    return add(commands, model, mid, projected, output, uint64_t(rows) * 4096);
+    return mlp(commands, model, x, layer.mlp, mid, output, scratch, rows);
 }
 
 void sample(CommandBuffer& commands, Model& model, const Session& session, const Tensor& logits, const Tensor& token,
@@ -201,7 +204,7 @@ void encodeMtp(CommandBuffer& commands, Model& model, const Batch& batch, uint32
     Tensor k = linear(commands, normalized, model.mtp.layer.attention.k, rows, scratch.attnK, scratch, false);
     Tensor v = linear(commands, normalized, model.mtp.layer.attention.v, rows, scratch.attnV, scratch);
     commands.dispatch(model.kernels.mtpStore, size(uint64_t(rows) * 4 * 256), size(256),
-                      {model.kv->plane(targetKvPlanes), model.kv->plane(targetKvPlanes + 1), k, v,
+                      {model.kv->key(targetKvLayers), model.kv->value(targetKvLayers), k, v,
                        model.sequenceSlots, model.batchKvValid, model.queryStartLoc,
                        model.mtp.layer.attention.kNorm, model.rope}, batch.size, rows,
                       model.maxLogicalBlocks * blockTokens);
@@ -221,9 +224,10 @@ void Scratch::ensure(Device& device, uint32_t requested, bool mtp) {
         {&shared, padBytes + 2 * mlpBytes},
         {&hidden[0], hiddenBytes}, {&hidden[1], hiddenBytes}, {&inputNorm, hiddenBytes}, {&postNorm, hiddenBytes},
         {&mlpMixed, mlpBytes}, {&attnQG, rows * 8192 * 2}, {&attnK, rows * 1024 * 2},
-        {&attnV, rows * 1024 * 2}, {&attnQNorm, hiddenBytes},
-        {&attnKNorm, rows * 1024 * 2}, {&attnQRope, hiddenBytes}, {&attnKRope, rows * 1024 * 2},
-        {&attnOut, hiddenBytes}, {&attnGated, hiddenBytes}, {&gdnMixed, rows * 8192 * 2}, {&gdnZ, hiddenBytes},
+        {&attnV, rows * 1024 * 2}, {&attnQRope, hiddenBytes}, {&attnKRope, rows * 1024 * 2},
+        {&attnOut, hiddenBytes}, {&attnGated, hiddenBytes},
+        {&attnPartials, std::max<uint64_t>(rows, attentionConcurrency) * 16 * 258 * 4},
+        {&gdnMixed, rows * 8192 * 2}, {&gdnZ, hiddenBytes},
         {&gdnB, rows * 32 * 2}, {&gdnA, rows * 32 * 2}, {&gdnG, rows * 32 * 4},
         {&gdnConvolved, rows * 8192 * 2}, {&gdnQ, hiddenBytes}, {&gdnK, hiddenBytes}, {&gdnV, hiddenBytes},
         {&gdnDelta, hiddenBytes}, {&gdnNormed, hiddenBytes}, {&mid, hiddenBytes}, {&projected, hiddenBytes},
@@ -265,7 +269,7 @@ void draft(Model& model, Batch& batch) {
                            model.mtp.hiddenNorm}, rows, uint32_t(1), step ? uint32_t(0) : uint32_t(2));
         Tensor hidden = linear(commands, scratch.mtpFused, model.mtp.fusion, rows, scratch.hidden[0], scratch);
         hidden = decoderLayer(commands, model, model.mtp.layer, model.states[0], hidden, scratch.hidden[1], scratch,
-                              rows, targetKvPlanes, stepPositions, layout);
+                              rows, targetKvLayers, stepPositions, layout);
         Tensor normalized = rms(commands, model, hidden, model.mtp.outputNorm, scratch.inputNorm, rows, 4096);
         Tensor logits = linear(commands, normalized, model.head, rows, scratch.targetLogits, scratch);
         for (uint32_t row = 0; row < rows; ++row)
@@ -303,7 +307,7 @@ void forward(Model& model, Batch& batch, float temperature, float topP, int32_t 
     Tensor hidden = scratch.hidden[0];
     for (uint32_t i = 0; i < model.layers.size(); ++i)
         hidden = decoderLayer(commands, model, model.layers[i], model.states[i], hidden, scratch.hidden[(i + 1) & 1],
-                              scratch, rows, model.layers[i].kvIndex * 2, model.batchKvValid, batch);
+                              scratch, rows, model.layers[i].kvIndex, model.batchKvValid, batch);
     if (model.hasMtp) commands.copy(hidden, scratch.targetHidden.view(0, uint64_t(rows) * 4096 * 2),
                                     uint64_t(rows) * 4096 * 2);
     if (logitCount) {

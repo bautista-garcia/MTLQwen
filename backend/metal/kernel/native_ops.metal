@@ -130,6 +130,24 @@ kernel void dense_4096x32(device half* y [[buffer(0)]], device const half* x [[b
     if (lane == 0) y[row * 32 + out] = half(sum);
 }
 
+[[max_total_threads_per_threadgroup(64)]]
+kernel void gdn_ba_prepare_4096x32(
+        device half* beta [[buffer(0)]], device float* g [[buffer(1)]], device const half* x [[buffer(2)]],
+        device const half* wb [[buffer(3)]], device const half* wa [[buffer(4)]],
+        device const float* A [[buffer(5)]], device const float* dt [[buffer(6)]],
+        constant uint& rows [[buffer(7)]], ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group [[simdgroup_index_in_threadgroup]], uint2 pos [[threadgroup_position_in_grid]]) {
+    uint row = pos.y, out = pos.x; if (row >= rows) return;
+    device const half* w = simd_group ? wa : wb; float sum = 0.0f;
+    for (uint k = lane; k < 4096; k += 32) sum += float(x[row * 4096 + k]) * float(w[out * 4096 + k]);
+    threadgroup float ba[2]; sum = simd_sum(sum); if (lane == 0) ba[simd_group] = float(half(sum));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0 && lane == 0) {
+        uint i = row * 32 + out; float av = ba[1] + dt[out];
+        beta[i] = half(1.0f / (1.0f + exp(-ba[0]))); g[i] = -exp(A[out]) * log(1.0f + exp(av));
+    }
+}
+
 kernel void gdn_prepare(device half* beta [[buffer(0)]], device float* g [[buffer(1)]],
                         device const half* b [[buffer(2)]], device const half* a [[buffer(3)]],
                         device const float* A [[buffer(4)]], device const float* dt [[buffer(5)]],
