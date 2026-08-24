@@ -70,9 +70,11 @@ static inline void invert32_unipotent(threadgroup half* p, threadgroup half* p_n
     }
 }
 
-static inline void run_delta_rule_token(device half* output, device float* state, device const half* query,
+static inline void run_delta_rule_token(device half* output, device float* state, device const float* previous_state,
+                                        device const half* query,
                                         device const half* key, device const half* value, device const float* g,
-                                        device const half* beta, long b, long t, long h, long seq_len, long num_heads,
+                                        device const half* beta, long b, long state_row, long previous_row, long t, long h,
+                                        long seq_len, long num_heads,
                                         long vs0, long vs1, long vs2, long vs3, uint lane, uint simd_lane,
                                         uint simd_group, threadgroup half* q, threadgroup half* k, threadgroup float* scratch) {
     float qv = 0.0f, kv = 0.0f;
@@ -108,21 +110,26 @@ static inline void run_delta_rule_token(device half* output, device float* state
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Decay + Prediction (v = kt @ St-1 * decay)
     uint vv = lane & 127, part = lane >> 7;
-    long base_offset = state_offset(b, h, 0, vv, num_heads);
-    long row_stride  = state_offset(b, h, 1, vv, num_heads) - base_offset;
+    long base_offset = state_offset(state_row, h, 0, vv, num_heads);
+    long previous_offset = state_offset(previous_row, h, 0, vv, num_heads);
+    long row_stride  = state_offset(state_row, h, 1, vv, num_heads) - base_offset;
+    long previous_stride = state_offset(previous_row, h, 1, vv, num_heads) - previous_offset;
     long loop_stride = DECODE_PARTS * row_stride;
+    long previous_loop_stride = DECODE_PARTS * previous_stride;
 
     long off = base_offset + (part * row_stride);
+    long previous_off = previous_offset + (part * previous_stride);
     float prediction = 0.0f, q_state = 0.0f;
     float decay = exp(g[(b * seq_len + t) * num_heads + h]);
 
     for (uint kk = part; kk < D; kk += DECODE_PARTS * 4) {
-        float s0 = state[off] * decay, s1 = state[off + loop_stride] * decay;
-        float s2 = state[off + loop_stride * 2] * decay, s3 = state[off + loop_stride * 3] * decay;
+        float s0 = previous_state[previous_off] * decay, s1 = previous_state[previous_off + previous_loop_stride] * decay;
+        float s2 = previous_state[previous_off + previous_loop_stride * 2] * decay;
+        float s3 = previous_state[previous_off + previous_loop_stride * 3] * decay;
         state[off] = s0; state[off + loop_stride] = s1; state[off + loop_stride * 2] = s2; state[off + loop_stride * 3] = s3;
         prediction += s0 * float(k[kk]) + s1 * float(k[kk + DECODE_PARTS]) + s2 * float(k[kk + DECODE_PARTS * 2]) + s3 * float(k[kk + DECODE_PARTS * 3]);
         q_state += s0 * float(q[kk]) + s1 * float(q[kk + DECODE_PARTS]) + s2 * float(q[kk + DECODE_PARTS * 2]) + s3 * float(q[kk + DECODE_PARTS * 3]);
-        off += loop_stride * 4;
+        off += loop_stride * 4; previous_off += previous_loop_stride * 4;
     }
     scratch[lane] = prediction;
     scratch[512 + lane] = q_state;
@@ -153,19 +160,24 @@ static inline void run_delta_rule_token(device half* output, device float* state
 
 [[max_total_threads_per_threadgroup(128)]]
 kernel void delta_rule_prefill(device half* output [[buffer(0)]],
-                               device float* state [[buffer(1)]], device const half* query [[buffer(2)]],
-                               device const half* key [[buffer(3)]], device const half* value [[buffer(4)]],
-                               device const float* g [[buffer(5)]], device const half* beta [[buffer(6)]],
-                               constant long& batch_size [[buffer(7)]], constant long& seq_len [[buffer(8)]],
-                               constant long& num_heads [[buffer(9)]], constant long& vs0 [[buffer(10)]],
-                               constant long& vs1 [[buffer(11)]], constant long& vs2 [[buffer(12)]],
-                               constant long& vs3 [[buffer(13)]], constant bool& has_initial_state [[buffer(14)]],
+                               device float* state0 [[buffer(1)]], device float* state1 [[buffer(2)]],
+                               device const uint* slots [[buffer(3)]], device const uint* banks [[buffer(4)]],
+                               device const uint* valid [[buffer(5)]], device const half* query [[buffer(6)]],
+                               device const half* key [[buffer(7)]], device const half* value [[buffer(8)]],
+                               device const float* g [[buffer(9)]], device const half* beta [[buffer(10)]],
+                               constant long& batch_size [[buffer(11)]], constant long& seq_len [[buffer(12)]],
+                               constant long& num_heads [[buffer(13)]], constant long& vs0 [[buffer(14)]],
+                               constant long& vs1 [[buffer(15)]], constant long& vs2 [[buffer(16)]],
+                               constant long& vs3 [[buffer(17)]],
                                uint3 gid [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
                                uint simd_group [[simdgroup_index_in_threadgroup]],
                                uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
     uint lane = lane3.x;
     long h = group3.y % num_heads, b = group3.y / num_heads;
     if (b >= batch_size || h >= num_heads || group3.x || lane >= 128) return;
+    long slot = slots[b]; bool has_initial_state = valid[b];
+    device float* state = banks[b] ? state0 : state1;
+    device const float* previous_state = banks[b] ? state1 : state0;
     threadgroup half k_tile[C_PREFILL * D_PREFILL_TILE], w_tile[C_PREFILL * D_PREFILL_TILE], u_tile[C_PREFILL * D_PREFILL_TILE];
     threadgroup half k_full[C_PREFILL * D];
     threadgroup half l_tile[C_PREFILL * C_PREFILL], qk_tile[C_PREFILL * C_PREFILL], m_tile[32 * 32];
@@ -174,6 +186,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
     for (long chunk = 0; chunk < seq_len; chunk += C_PREFILL) {
         long C = min(long(C_PREFILL), seq_len - chunk);
         bool initial = has_initial_state || chunk > 0;
+        device const float* current_state = chunk ? state : previous_state;
 
         // Phase 1: gamma_i = prod_{m<=i} alpha_m and L2 norm factors (k & q)
         if (lane < C_PREFILL) { // Only first SIMD works (4 SIMD available)
@@ -244,7 +257,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                     }
                     for (uint idx = lane; idx < D_PREFILL_TILE * D_PREFILL_TILE; idx += 128) {
                         uint kd = idx / D_PREFILL_TILE, vd = idx % D_PREFILL_TILE;
-                        m_tile[idx] = half(state[state_offset(b, h, k0 + kd, v0 + vd, num_heads)]);
+                        m_tile[idx] = half(current_state[state_offset(slot, h, k0 + kd, v0 + vd, num_heads)]);
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     // Phase 3: W = P_W @ (diag(beta) * K)
@@ -283,7 +296,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                     }
                     for (uint idx = lane; idx < D_PREFILL_TILE * D_PREFILL_TILE; idx += 128) {
                         uint kd = idx / D_PREFILL_TILE, vd = idx % D_PREFILL_TILE;
-                        m_tile[idx] = half(state[state_offset(b, h, k0 + kd, v0 + vd, num_heads)]);
+                        m_tile[idx] = half(current_state[state_offset(slot, h, k0 + kd, v0 + vd, num_heads)]);
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     mma32x32(w_tile, l_tile, m_tile, scratch, simd_lane, simd_group, true, false, true);
@@ -305,14 +318,14 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                     uint kb = (block / (D_PREFILL_TILE / 8)) << 3, vb = (block % (D_PREFILL_TILE / 8)) << 3;
                     simdgroup_matrix<half, 8, 8> kt, dv;
                     simdgroup_matrix<float, 8, 8> c;
-                    simdgroup_load(c, state + state_offset(b, h, 0, 0, num_heads), D, ulong2(v0 + vb, k0 + kb));
+                    simdgroup_load(c, current_state + state_offset(slot, h, 0, 0, num_heads), D, ulong2(v0 + vb, k0 + kb));
                     c.thread_elements() *= gamma_c;
                     for (uint ko = 0; ko < C_PREFILL; ko += 8) {
                         simdgroup_load(kt, k_full, C_PREFILL, ulong2(ko, k0 + kb));
                         simdgroup_load(dv, u_tile, D_PREFILL_TILE, ulong2(vb, ko));
                         simdgroup_multiply_accumulate(c, kt, dv, c);
                     }
-                    simdgroup_store(c, state + state_offset(b, h, 0, 0, num_heads), D, ulong2(v0 + vb, k0 + kb));
+                    simdgroup_store(c, state + state_offset(slot, h, 0, 0, num_heads), D, ulong2(v0 + vb, k0 + kb));
                 }
             } else {
                 for (uint k0 = 0; k0 < D; k0 += D_PREFILL_TILE) for (uint block = simd_group; block < (D_PREFILL_TILE / 8) * (D_PREFILL_TILE / 8); block += 4) {
@@ -324,7 +337,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                         simdgroup_load(dv, u_tile, D_PREFILL_TILE, ulong2(vb, ko));
                         simdgroup_multiply_accumulate(c, kt, dv, c);
                     }
-                    simdgroup_store(c, state + state_offset(b, h, 0, 0, num_heads), D, ulong2(v0 + vb, k0 + kb));
+                    simdgroup_store(c, state + state_offset(slot, h, 0, 0, num_heads), D, ulong2(v0 + vb, k0 + kb));
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -335,13 +348,15 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
 // One threadgroup per (B, n_heads)
 [[max_total_threads_per_threadgroup(512)]]
 kernel void delta_rule_decode(device half* output [[buffer(0)]],
-                              device float* state [[buffer(1)]], device const half* query [[buffer(2)]],
-                              device const half* key [[buffer(3)]], device const half* value [[buffer(4)]],
-                              device const float* g [[buffer(5)]], device const half* beta [[buffer(6)]],
-                              constant long& batch_size [[buffer(7)]], constant long& seq_len [[buffer(8)]],
-                              constant long& num_heads [[buffer(9)]], constant long& vs0 [[buffer(10)]],
-                              constant long& vs1 [[buffer(11)]], constant long& vs2 [[buffer(12)]],
-                              constant long& vs3 [[buffer(13)]], constant bool& has_initial_state [[buffer(14)]],
+                              device float* state0 [[buffer(1)]], device float* state1 [[buffer(2)]],
+                              device const uint* slots [[buffer(3)]], device const uint* banks [[buffer(4)]],
+                              device const uint* valid [[buffer(5)]], device const half* query [[buffer(6)]],
+                              device const half* key [[buffer(7)]], device const half* value [[buffer(8)]],
+                              device const float* g [[buffer(9)]], device const half* beta [[buffer(10)]],
+                              constant long& batch_size [[buffer(11)]], constant long& seq_len [[buffer(12)]],
+                              constant long& num_heads [[buffer(13)]], constant long& vs0 [[buffer(14)]],
+                              constant long& vs1 [[buffer(15)]], constant long& vs2 [[buffer(16)]],
+                              constant long& vs3 [[buffer(17)]],
                               uint3 gid [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
                               uint simd_group [[simdgroup_index_in_threadgroup]],
                               uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
@@ -349,13 +364,52 @@ kernel void delta_rule_decode(device half* output [[buffer(0)]],
     long group = group3.x;
     if (group >= batch_size * num_heads) return;
     long b = group / num_heads, h = group - b * num_heads;
+    long slot = slots[b]; bool has_initial_state = valid[b];
+    device float* state = banks[b] ? state0 : state1;
+    device const float* previous_state = banks[b] ? state1 : state0;
     threadgroup half q[D], k[D];
     threadgroup float scratch[1025];
     // No divergence: all threads evaluate to same (no risk in barrier inside if)
     if (!has_initial_state) {
         for (uint i = lane; i < D * D; i += 512)
-            state[state_offset(b, h, i / D, i % D, num_heads)] = 0.0f;
+            state[state_offset(slot, h, i / D, i % D, num_heads)] = 0.0f;
         threadgroup_barrier(mem_flags::mem_device);
     }
-    run_delta_rule_token(output, state, query, key, value, g, beta, b, 0, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, simd_lane, simd_group, q, k, scratch);
+    device const float* input_state = has_initial_state ? previous_state : state;
+    run_delta_rule_token(output, state, input_state, query, key, value, g, beta, b, slot, slot, 0, h, seq_len, num_heads,
+                         vs0, vs1, vs2, vs3, lane, simd_lane, simd_group, q, k, scratch);
+}
+
+// Each target query token produces a selectable recurrent-state column; only the accepted column is committed.
+[[max_total_threads_per_threadgroup(512)]]
+kernel void delta_rule_candidates(
+        device half* output [[buffer(0)]], device const float* state0 [[buffer(1)]],
+        device const float* state1 [[buffer(2)]], device float* candidates [[buffer(3)]],
+        device const uint* slots [[buffer(4)]], device const uint* banks [[buffer(5)]],
+        device const uint* valid [[buffer(6)]], device const half* query [[buffer(7)]],
+        device const half* key [[buffer(8)]], device const half* value [[buffer(9)]],
+        device const float* g [[buffer(10)]], device const half* beta [[buffer(11)]],
+        constant long& batch_size [[buffer(12)]], constant long& seq_len [[buffer(13)]],
+        constant long& num_heads [[buffer(14)]], constant long& vs0 [[buffer(15)]],
+        constant long& vs1 [[buffer(16)]], constant long& vs2 [[buffer(17)]],
+        constant long& vs3 [[buffer(18)]], uint3 gid [[thread_position_in_grid]],
+        uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
+        uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
+    uint lane = lane3.x; long group = group3.x;
+    if (group >= batch_size * num_heads) return;
+    long b = group / num_heads, h = group - b * num_heads, slot = slots[b];
+    device const float* committed = banks[b] ? state1 : state0;
+    threadgroup half q[D], k[D]; threadgroup float scratch[1025];
+    for (long t = 0; t < seq_len; ++t) {
+        long row = b * seq_len + t, previous_row = t ? row - 1 : valid[b] ? slot : row;
+        device const float* previous = t || !valid[b] ? candidates : committed;
+        if (!valid[b] && t == 0)
+            for (uint i = lane; i < D * D; i += 512)
+                candidates[state_offset(row, h, i / D, i % D, num_heads)] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_device);
+        run_delta_rule_token(output, candidates, previous, query, key, value, g, beta, b, row, previous_row,
+                             t, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, simd_lane, simd_group,
+                             q, k, scratch);
+        threadgroup_barrier(mem_flags::mem_device);
+    }
 }

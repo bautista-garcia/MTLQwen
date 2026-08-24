@@ -86,7 +86,10 @@ std::pair<std::string, std::string> target(const std::string& name) {
         {"ssm_beta.weight", "linear_attn.in_proj_b.weight"}, {"ssm_alpha.weight", "linear_attn.in_proj_a.weight"},
         {"ssm_conv1d.weight", "linear_attn.conv1d_weight"}, {"ssm_out.weight", "linear_attn.out_proj.weight"},
         {"ssm_norm.weight", "linear_attn.norm.weight"}, {"ssm_dt.bias", "linear_attn.dt_bias"},
-        {"ssm_a", "linear_attn.A_log"}};
+        {"ssm_a", "linear_attn.A_log"}, {"nextn.eh_proj.weight", "nextn.fusion.weight"},
+        {"nextn.enorm.weight", "nextn.embedding_norm.weight"},
+        {"nextn.hnorm.weight", "nextn.hidden_norm.weight"},
+        {"nextn.shared_head_norm.weight", "nextn.output_norm.weight"}};
     auto found = blocks.find(suffix); if (found == blocks.end()) return {};
     std::string transform = found->second == "linear_attn.conv1d_weight" ? "conv1d" :
                             found->second == "linear_attn.A_log" ? "neg_log" : "";
@@ -118,14 +121,18 @@ LinearSpec linearSpec(QuantType type, uint32_t k, uint32_t n) {
     }
     if (type == QuantType::Q6_K) {
         if (k == 4096 && n == 1024) return {"q6_k_k4096_n1024_decode", "q6_k_k4096_n1024_prefill", 64, 4};
+        if (k == 4096 && n == 8192) return {"q6_k_k4096_n8192_decode", "q6_k_k4096_n8192_prefill", 64, 4};
         if (k == 12288 && n == 4096) return {"q6_k_k12288_n4096_decode", "q6_k_k12288_n4096_prefill", 64, 4};
         if (k == 4096 && n == 248320) return {"q6_k_k4096_n248320_decode", "q6_k_k4096_n248320_prefill", 64, 4};
     }
     if (type == QuantType::Q8_0 && k == 4096 && n == 4096)
         return {"q8_0_k4096_n4096_decode", "q8_0_k4096_n4096_prefill", 128, 2};
+    if (type == QuantType::Q8_0 && k == 8192 && n == 4096)
+        return {"q8_0_k8192_n4096_decode", "q8_0_k8192_n4096_prefill", 128, 2};
     if (type == QuantType::IQ4_XS && k == 4096 && n == 12288)
         return {"iq4_xs_k4096_n12288_decode", "iq4_xs_k4096_n12288_prefill", 64, 4};
-    throw std::runtime_error("unsupported linear type/shape");
+    throw std::runtime_error("unsupported linear type/shape " + std::to_string(static_cast<uint32_t>(type)) + " " +
+                             std::to_string(k) + "x" + std::to_string(n));
 }
 Linear makeLinear(Device& device, const Weight& weight) {
     if (weight.shape.size() != 2) throw std::runtime_error("linear weight is not a matrix");
@@ -146,7 +153,9 @@ MlpWeights makeMlp(Device& device, std::unordered_map<std::string, Weight>& weig
 }
 }  // namespace
 Model::Model(const std::filesystem::path& path, const std::filesystem::path& kernelPath,
-             uint32_t context, bool profile) : device(kernelPath, profile), maxContext(context) {
+             uint32_t context, bool profile)
+    : device(kernelPath, profile), maxContext(context), blocks((context + blockTokens - 1) / blockTokens),
+      maxLogicalBlocks(blocks.size()) {
     auto started = std::chrono::steady_clock::now();
     if (path.extension() != ".gguf") throw std::runtime_error("Qwen3.5 only accepts GGUF weights");
     if (!context || context > 65536) throw std::runtime_error("max_context must be between 1 and 65536");
@@ -157,11 +166,11 @@ Model::Model(const std::filesystem::path& path, const std::filesystem::path& ker
     std::unordered_map<std::string, double> metadata;
     for (uint64_t i = 0; i < metadataCount; ++i) {
         std::string key = reader.string(); uint32_t type = reader.read<uint32_t>();
-        static const std::array<const char*, 13> wanted = {"general.alignment", "qwen35.block_count",
+        static const std::array<const char*, 14> wanted = {"general.alignment", "qwen35.block_count",
             "qwen35.embedding_length", "qwen35.feed_forward_length", "qwen35.context_length",
             "qwen35.attention.head_count", "qwen35.attention.head_count_kv", "qwen35.attention.key_length",
             "qwen35.full_attention_interval", "qwen35.ssm.conv_kernel", "qwen35.ssm.state_size",
-            "qwen35.ssm.group_count", "qwen35.ssm.time_step_rank"};
+            "qwen35.ssm.group_count", "qwen35.ssm.time_step_rank", "qwen35.nextn_predict_layers"};
         bool keep = std::find_if(wanted.begin(), wanted.end(), [&](const char* value) { return key == value; }) != wanted.end();
         if (keep) metadata[key] = number(reader, type); else skipValue(reader, type);
         if (key == "general.alignment") alignment = metadata[key];
@@ -170,13 +179,19 @@ Model::Model(const std::filesystem::path& path, const std::filesystem::path& ker
         auto found = metadata.find(key); if (found == metadata.end()) throw std::runtime_error(std::string("missing metadata ") + key);
         return found->second;
     };
-    if (meta("qwen35.block_count") != 32 || meta("qwen35.embedding_length") != 4096 ||
+    auto nextn = metadata.find("qwen35.nextn_predict_layers");
+    uint64_t nextnLayers = nextn == metadata.end() ? 0 : nextn->second;
+    if (nextnLayers > 1) throw std::runtime_error("only one Qwen3.5 MTP layer is supported");
+    hasMtp = nextnLayers == 1;
+    if (meta("qwen35.block_count") != layers.size() + nextnLayers || meta("qwen35.embedding_length") != 4096 ||
         meta("qwen35.feed_forward_length") != 12288 || meta("qwen35.context_length") < context ||
         meta("qwen35.attention.head_count") != 16 || meta("qwen35.attention.head_count_kv") != 4 ||
         meta("qwen35.attention.key_length") != 256 || meta("qwen35.full_attention_interval") != 4 ||
         meta("qwen35.ssm.conv_kernel") != 4 || meta("qwen35.ssm.state_size") != 128 ||
         meta("qwen35.ssm.group_count") != 16 || meta("qwen35.ssm.time_step_rank") != 32)
         throw std::runtime_error("unsupported Qwen3.5 architecture");
+    kv = std::make_unique<SparseBuffer>(device, maxBatchSequences * maxLogicalBlocks, blocks.size(),
+                                        targetKvPlanes + (hasMtp ? mtpKvPlanes : 0));
     std::vector<Info> infos; infos.reserve(tensorCount);
     for (uint64_t i = 0; i < tensorCount; ++i) {
         Info info; info.name = reader.string(); uint32_t dims = reader.read<uint32_t>(); info.shape.resize(dims);
@@ -187,26 +202,29 @@ Model::Model(const std::filesystem::path& path, const std::filesystem::path& ker
     std::vector<Selected> selected; selected.reserve(infos.size()); std::unordered_set<std::string> targets;
     for (const Info& info : infos) {
         auto [name, transform] = target(info.name); if (name.empty() || !targets.insert(name).second) continue;
+        if (info.type == QuantType::F32 && info.shape == std::vector<uint64_t>{32, 4096}) transform = "f16";
         uint64_t numel = product(info.shape), bytes;
         if (info.type == QuantType::F32 || info.type == QuantType::F16)
-            bytes = numel * (transform == "conv1d" || info.type == QuantType::F16 ? 2 : 4);
+            bytes = numel * (transform == "conv1d" || transform == "f16" || info.type == QuantType::F16 ? 2 : 4);
         else { auto [blockSize, blockBytes] = block(info.type); bytes = numel / blockSize * blockBytes; }
         arenaBytes = (arenaBytes + 255) & ~255ull; selected.push_back({&info, name, transform, bytes, arenaBytes});
         arenaBytes += bytes; parameterCount += numel; modelBytes += bytes;
     }
-    weightArena = device.empty(arenaBytes); std::unordered_map<std::string, Weight> weights; weights.reserve(selected.size());
+    Tensor weightArena = device.empty(arenaBytes); std::unordered_map<std::string, Weight> weights;
+    weights.reserve(selected.size());
     for (const Selected& item : selected) {
         const Info& info = *item.info; uint64_t source = dataStart + info.offset;
         if (source >= mapping.bytes) throw std::runtime_error("GGUF tensor offset outside file");
         if (item.transform == "neg_log") {
             std::vector<float> values(product(info.shape)); std::memcpy(values.data(), mapping.data + source, values.size() * 4);
             for (float& value : values) value = std::log(-value); device.write(weightArena.view(item.arenaOffset, item.bytes), values.data(), item.bytes);
-        } else if (item.transform == "conv1d") {
+        } else if (item.transform == "conv1d" || item.transform == "f16") {
             uint64_t count = product(info.shape); std::vector<_Float16> values(count); auto* sourceValues = reinterpret_cast<const float*>(mapping.data + source);
             for (uint64_t i = 0; i < count; ++i) values[i] = sourceValues[i];
             device.write(weightArena.view(item.arenaOffset, item.bytes), values.data(), item.bytes);
         } else device.write(weightArena.view(item.arenaOffset, item.bytes), mapping.data + source, item.bytes);
-        weights.emplace(item.target, Weight{weightArena.view(item.arenaOffset, item.bytes), info.shape, info.type});
+        QuantType type = item.transform == "f16" ? QuantType::F16 : info.type;
+        weights.emplace(item.target, Weight{weightArena.view(item.arenaOffset, item.bytes), info.shape, type});
     }
     Weight& embed = require(weights, "model.embed_tokens.weight"); shape(embed, {248320, 4096}, "embedding"); embedding = embed.data;
     Weight& finalNorm = require(weights, "model.norm.weight"); shape(finalNorm, {4096}, "model norm"); norm = finalNorm.data;
@@ -236,17 +254,61 @@ Model::Model(const std::filesystem::path& path, const std::filesystem::path& ker
                          require(weights, prefix + "dt_bias").data, require(weights, prefix + "A_log").data};
         }
     }
+    if (hasMtp) {
+        std::string root = "model.layers.32.", attention = root + "self_attn.";
+        mtp.embeddingNorm = require(weights, root + "nextn.embedding_norm.weight").data;
+        mtp.hiddenNorm = require(weights, root + "nextn.hidden_norm.weight").data;
+        mtp.outputNorm = require(weights, root + "nextn.output_norm.weight").data;
+        mtp.fusion = makeLinear(device, require(weights, root + "nextn.fusion.weight"));
+        mtp.layer.inputNorm = require(weights, root + "input_layernorm.weight").data;
+        mtp.layer.postNorm = require(weights, root + "post_attention_layernorm.weight").data;
+        mtp.layer.mlp = makeMlp(device, weights, root + "mlp."); mtp.layer.fullAttention = true;
+        mtp.layer.attention = {makeLinear(device, require(weights, attention + "q_proj.weight")),
+                               makeLinear(device, require(weights, attention + "k_proj.weight")),
+                               makeLinear(device, require(weights, attention + "v_proj.weight")),
+                               makeLinear(device, require(weights, attention + "o_proj.weight")),
+                               require(weights, attention + "q_norm.weight").data,
+                               require(weights, attention + "k_norm.weight").data};
+    }
     kernels = {device.pipeline("q4_k_embed"), device.pipeline("rmsnorm"), device.pipeline("add_half"),
                device.pipeline("silu_mul"), device.pipeline("pad_rows"), device.pipeline("init_rope"),
-               device.pipeline("argmax_logits"), device.pipeline("sample_logits"), device.pipeline("attention_prefill"),
-               device.pipeline("attention_decode_scan"), device.pipeline("attention_decode_reduce"),
-               device.pipeline("attention_gate"), device.pipeline("unpack_attention"), device.pipeline("rope_qk"),
-               device.pipeline("gdn_prepare"), device.pipeline("gdn_causal_conv_silu"), device.pipeline("split_repeat_qk"),
-               device.pipeline("delta_rule_prefill"), device.pipeline("delta_rule_decode"), device.pipeline("rmsnorm_gated_128")};
+               device.pipeline("argmax_logits"), device.pipeline("sample_logits"), device.pipeline("mtp_draft_fuse"),
+               device.pipeline("attention"), device.pipeline("attention_gate"),
+               device.pipeline("unpack_attention"), device.pipeline("rope_qk"),
+               device.pipeline("mtp_store_kv"), device.pipeline("gdn_prepare"),
+               device.pipeline("gdn_causal_conv_silu"), device.pipeline("gdn_causal_conv_candidates"),
+               device.pipeline("split_repeat_qk"), device.pipeline("delta_rule_prefill"),
+               device.pipeline("delta_rule_decode"), device.pipeline("delta_rule_candidates"),
+               device.pipeline("rmsnorm_gated_128"), device.pipeline("mtp_fuse"),
+               device.pipeline("gather_rows")};
     rope = device.empty(uint64_t(context) * 32 * 2 * 2);
     { CommandBuffer commands(device, 64); commands.dispatch(kernels.initRope, MTL::Size(((uint64_t(context) * 32 + 255) / 256) * 256, 1, 1),
                                       MTL::Size(256, 1, 1), {rope}, context, 10000000.0f); commands.commit(); }
-    decode.ensure(device, 1);
+    inputIds = device.empty(uint64_t(maxBatchTokens) * sizeof(int32_t), true);
+    batchKvValid = device.empty(maxBatchSequences * sizeof(uint32_t), true);
+    queryStartLoc = device.empty((maxBatchSequences + 1) * sizeof(uint32_t), true);
+    sequenceSlots = device.empty(maxBatchSequences * sizeof(uint32_t), true);
+    stateBanks = device.empty(maxBatchSequences * sizeof(uint32_t), true);
+    outputTokens = device.empty(maxLogitRows * sizeof(int32_t), true);
+    logitRows = device.empty(maxLogitRows * sizeof(uint32_t), true);
+    std::array<uint64_t, maxBatchSequences> seeds{}; uint64_t seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    for (uint64_t& value : seeds) value = ++seed; rng = device.empty(sizeof(seeds), true);
+    std::memcpy(rng.buffer->metalBuffer->contents(), seeds.data(), sizeof(seeds));
+    if (hasMtp) {
+        draftPositions = device.empty(uint64_t(maxDraftTokens) * maxBatchSequences * sizeof(uint32_t), true);
+        draftTokens = device.empty(uint64_t(maxDraftTokens + 1) * maxBatchSequences * sizeof(int32_t), true);
+        std::array<_Float16, 2 * maxBatchSequences * 4096> zeroSeeds{};
+        mtpSeeds = device.upload(zeroSeeds.data(), sizeof(zeroSeeds));
+    }
+    for (uint32_t i = 0; i < layers.size(); ++i) if (!layers[i].fullAttention) {
+        gdnOffsets[i] = gdnBytes; gdnBytes += recurrentStateBytes + convStateBytes;
+        for (uint32_t bank = 0; bank < 2; ++bank) {
+            states[i].conv[bank] = device.empty(convStateBytes * maxBatchSequences);
+            states[i].recurrent[bank] = device.empty(recurrentStateBytes * maxBatchSequences);
+        }
+    }
+    cacheNamespace = std::hash<std::string>{}(std::filesystem::absolute(path).string());
+    workspace.padRows = kernels.padRows; workspace.ensure(device, 1, hasMtp);
     std::printf("GGUF weights loaded in %.3fs\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
 }
 }  // namespace infeng::qwen35

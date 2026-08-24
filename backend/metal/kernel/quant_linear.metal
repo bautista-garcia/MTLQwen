@@ -121,6 +121,30 @@ kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buff
     long n0 = long(group.x) * 32, m0 = long(group.y) * 128;
     bool active = m0 + rb < M;
     threadgroup half b_tile[256 * 33];
+    if (M <= 8) {
+        simdgroup_matrix<float, 8, 8> c = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (long k0 = 0, kb = 0; k0 < K; k0 += 256, ++kb) {
+            dequant_tile<K>(Q(), b_tile, w, n0, kb, simd_lane, simd_group);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group < 4) {
+                simdgroup_matrix<half, 8, 8> a, b;
+                for (uint ko = 0; ko < 256; ko += 8) {
+                    simdgroup_load(a, x + k0, K, ulong2(ko, 0));
+                    simdgroup_load(b, b_tile, 33, ulong2(simd_group * 8, ko));
+                    simdgroup_multiply_accumulate(c, a, b, c);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_none);
+        }
+        threadgroup float* scratch = reinterpret_cast<threadgroup float*>(b_tile);
+        if (simd_group < 4) simdgroup_store(c, scratch + simd_group * 64, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = lane; idx < uint(M) * 32; idx += 512) {
+            uint r = idx >> 5, n = idx & 31, tile = n >> 3;
+            y[r * N + n0 + n] = half(scratch[tile * 64 + r * 8 + (n & 7)]);
+        }
+        return;
+    }
     simdgroup_matrix<float, 8, 8> c0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     simdgroup_matrix<float, 8, 8> c1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     simdgroup_matrix<float, 8, 8> c2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -160,29 +184,14 @@ kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buff
 
 // DECODE KERNELS
 
-// decode gemv can: 1) write to kv cache, 2) fuse a residual add before store, 3) store
-static inline __attribute__((always_inline)) void decode_store(
-        device half* dst, device const half* aux, float value, uint row,
-        uint mode, uint context, uint capacity) {
-    if (mode == 1) {
-        uint head = row >> 8, dim = row & 255;
-        dst[(((context >> 7) * 4 + head) * 128 + (context & 127)) * 256 + dim] = half(value);
-    } else if (mode == 2) {
-        dst[row] = half(value) + aux[row];
-    } else {
-        dst[row] = half(value);
-    }
-}
-
 template<uint K, uint N, ushort ROWS = 2>
 [[max_total_threads_per_threadgroup(64)]]
 kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
-                             device const uchar* weights [[buffer(2)]], device const half* aux [[buffer(3)]],
-                             constant uint& mode [[buffer(4)]], constant uint& context [[buffer(5)]],
-                             constant uint& capacity [[buffer(6)]],
+                             device const uchar* weights [[buffer(2)]],
                              ushort lane [[thread_index_in_simdgroup]],
                              ushort simd_group [[simdgroup_index_in_threadgroup]],
                              uint3 group [[threadgroup_position_in_grid]]) {
+    dst += group.y * N; src += group.y * K;
     constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
     ushort ix = lane / 8, it = lane % 8, iq = it / 4, ir = it % 4;
     uint nb = K / 256, first_row = (group.x * 2 + simd_group) * ROWS;
@@ -236,19 +245,17 @@ kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[
     }
     for (ushort row = 0; row < ROWS; ++row) {
         float sum = simd_sum(sumf[row]);
-        if (lane == 0 && first_row + row < N)
-            decode_store(dst, aux, sum, first_row + row, mode, context, capacity);
+        if (lane == 0 && first_row + row < N) dst[first_row + row] = half(sum);
     }
 }
 
 template<uint K, uint N>
 kernel void decode_q5k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
-                             device const uchar* weights [[buffer(2)]], device const half* aux [[buffer(3)]],
-                             constant uint& mode [[buffer(4)]], constant uint& context [[buffer(5)]],
-                             constant uint& capacity [[buffer(6)]],
+                             device const uchar* weights [[buffer(2)]],
                              ushort lane [[thread_index_in_simdgroup]],
                              ushort simd_group [[simdgroup_index_in_threadgroup]],
                              uint3 group [[threadgroup_position_in_grid]]) {
+    dst += group.y * N; src += group.y * K;
     constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
     uint nb = K / 256, row = group.x * 2 + simd_group;
     ushort tid = lane / 4, ix = lane % 4, iq = tid / 4, ir = tid % 4, l0 = 8 * ir;
@@ -330,17 +337,16 @@ kernel void decode_q5k(device half* dst [[buffer(0)]], device const half* src [[
         src1 += 4 * 256;
     }
     float sum = simd_sum(sumf);
-    if (lane == 0 && row < N) decode_store(dst, aux, sum, row, mode, context, capacity);
+    if (lane == 0 && row < N) dst[row] = half(sum);
 }
 
 template<uint K, uint N>
 kernel void decode_q6k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
-                             device const uchar* weights [[buffer(2)]], device const half* aux [[buffer(3)]],
-                             constant uint& mode [[buffer(4)]], constant uint& context [[buffer(5)]],
-                             constant uint& capacity [[buffer(6)]],
+                             device const uchar* weights [[buffer(2)]],
                              ushort lane [[thread_index_in_simdgroup]],
                              ushort simd_group [[simdgroup_index_in_threadgroup]],
                              uint3 group [[threadgroup_position_in_grid]]) {
+    dst += group.y * N; src += group.y * K;
     constexpr uint nb = K / 256;
     constexpr ulong row_stride = ulong(nb) * 210;
     const uint first_row = (group.x * 2 + simd_group) * 2;
@@ -392,20 +398,18 @@ kernel void decode_q6k(device half* dst [[buffer(0)]], device const half* src [[
 #pragma clang loop unroll(full)
     for (ushort row = 0; row < 2; ++row) {
         const float sum = simd_sum(sumf[row]);
-        if (lane == 0 && first_row + row < N)
-            decode_store(dst, aux, sum, first_row + row, mode, context, capacity);
+        if (lane == 0 && first_row + row < N) dst[first_row + row] = half(sum);
     }
 }
 
 template<uint K, uint N>
 [[max_total_threads_per_threadgroup(128)]]
 kernel void decode_q8_0(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
-                              device const uchar* weights [[buffer(2)]], device const half* aux [[buffer(3)]],
-                              constant uint& mode [[buffer(4)]], constant uint& context [[buffer(5)]],
-                              constant uint& capacity [[buffer(6)]],
+                              device const uchar* weights [[buffer(2)]],
                               ushort lane [[thread_index_in_simdgroup]],
                               ushort simd_group [[simdgroup_index_in_threadgroup]],
                               uint3 group [[threadgroup_position_in_grid]]) {
+    dst += group.y * N; src += group.y * K;
     uint nb = K / 32, first_row = group.x * 2;
     ushort ix = lane / 4, il = lane % 4;
     uint ib0 = simd_group * 8 + ix;
@@ -431,7 +435,7 @@ kernel void decode_q8_0(device half* dst [[buffer(0)]], device const half* src [
     if (simd_group == 0 && lane == 0) {
         for (ushort row = 0; row < 2; ++row) {
             float sum = partial[row] + partial[2 + row] + partial[4 + row] + partial[6 + row];
-            if (first_row + row < N) decode_store(dst, aux, sum, first_row + row, mode, context, capacity);
+            if (first_row + row < N) dst[first_row + row] = half(sum);
         }
     }
 }
@@ -439,12 +443,11 @@ kernel void decode_q8_0(device half* dst [[buffer(0)]], device const half* src [
 template<uint K, uint N>
 [[max_total_threads_per_threadgroup(64)]]
 kernel void decode_iq4xs(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
-                               device const uchar* weights [[buffer(2)]], device const half* aux [[buffer(3)]],
-                               constant uint& mode [[buffer(4)]], constant uint& context [[buffer(5)]],
-                               constant uint& capacity [[buffer(6)]],
+                               device const uchar* weights [[buffer(2)]],
                                ushort lane [[thread_index_in_simdgroup]],
                                ushort simd_group [[simdgroup_index_in_threadgroup]],
                                uint3 group [[threadgroup_position_in_grid]]) {
+    dst += group.y * N; src += group.y * K;
     uint nb = K / 256, first_row = (group.x * 2 + simd_group) * 2;
     ushort ix = lane / 16, it = lane % 16, part = it / 2, il = it % 2;
     threadgroup float lookup[16];
@@ -481,8 +484,7 @@ kernel void decode_iq4xs(device half* dst [[buffer(0)]], device const half* src 
     }
     for (ushort row = 0; row < 2; ++row) {
         float sum = simd_sum(sumf[row]);
-        if (lane == 0 && first_row + row < N)
-            decode_store(dst, aux, sum, first_row + row, mode, context, capacity);
+        if (lane == 0 && first_row + row < N) dst[first_row + row] = half(sum);
     }
 }
 
@@ -506,8 +508,7 @@ template [[host_name("q4_k_k4096_n4096_prefill")]] kernel void prefill_qk<q4k_ta
 template [[host_name("q4_k_k12288_n4096_prefill")]] kernel void prefill_qk<q4k_tag, 12288, 4096>(PREFILL_ARGS);
 template [[host_name("q4_k_k4096_n8192_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 8192>(PREFILL_ARGS);
 template [[host_name("q4_k_k4096_n12288_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 12288>(PREFILL_ARGS);
-#define DECODE_ARGS device half*, device const half*, device const uchar*, device const half*, \
-                    constant uint&, constant uint&, constant uint&, ushort, ushort, uint3
+#define DECODE_ARGS device half*, device const half*, device const uchar*, ushort, ushort, uint3
 
 template [[host_name("q4_k_k4096_n1024_decode")]] kernel void decode_q4k<4096, 1024>(DECODE_ARGS);
 template [[host_name("q4_k_k4096_n4096_decode")]] kernel void decode_q4k<4096, 4096, 1>(DECODE_ARGS);
@@ -527,14 +528,18 @@ template [[host_name("q5_k_k4096_n8192_decode")]] kernel void decode_q5k<4096, 8
 template [[host_name("q5_k_k4096_n12288_decode")]] kernel void decode_q5k<4096, 12288>(DECODE_ARGS);
 
 template [[host_name("q6_k_k4096_n1024_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 1024>(PREFILL_ARGS);
+template [[host_name("q6_k_k4096_n8192_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 8192>(PREFILL_ARGS);
 template [[host_name("q6_k_k12288_n4096_prefill")]] kernel void prefill_qk<q6k_tag, 12288, 4096>(PREFILL_ARGS);
 template [[host_name("q6_k_k4096_n248320_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 248320>(PREFILL_ARGS);
 template [[host_name("q6_k_k4096_n1024_decode")]] kernel void decode_q6k<4096, 1024>(DECODE_ARGS);
+template [[host_name("q6_k_k4096_n8192_decode")]] kernel void decode_q6k<4096, 8192>(DECODE_ARGS);
 template [[host_name("q6_k_k12288_n4096_decode")]] kernel void decode_q6k<12288, 4096>(DECODE_ARGS);
 template [[host_name("q6_k_k4096_n248320_decode")]] kernel void decode_q6k<4096, 248320>(DECODE_ARGS);
 
 template [[host_name("q8_0_k4096_n4096_prefill")]] kernel void prefill_qk<q8_0_tag, 4096, 4096>(PREFILL_ARGS);
 template [[host_name("q8_0_k4096_n4096_decode")]] kernel void decode_q8_0<4096, 4096>(DECODE_ARGS);
+template [[host_name("q8_0_k8192_n4096_prefill")]] kernel void prefill_qk<q8_0_tag, 8192, 4096>(PREFILL_ARGS);
+template [[host_name("q8_0_k8192_n4096_decode")]] kernel void decode_q8_0<8192, 4096>(DECODE_ARGS);
 
 template [[host_name("iq4_xs_k4096_n12288_prefill")]] kernel void prefill_qk<iq4xs_tag, 4096, 12288>(PREFILL_ARGS);
 template [[host_name("iq4_xs_k4096_n12288_decode")]] kernel void decode_iq4xs<4096, 12288>(DECODE_ARGS);
