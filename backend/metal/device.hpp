@@ -1,6 +1,5 @@
 #pragma once
 #include <Metal/Metal.hpp>
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -32,9 +31,14 @@ struct Tensor {
     std::shared_ptr<Buffer> buffer;
     uint64_t offset = 0, bytes = 0;
     Tensor view(uint64_t byteOffset, uint64_t byteCount) const {
+        if (!buffer || byteOffset > bytes || byteCount > bytes - byteOffset)
+            throw std::runtime_error("tensor view exceeds buffer bounds");
         return {buffer, offset + byteOffset, byteCount};
     }
-    MTL::GPUAddress address() const { return buffer->metalBuffer->gpuAddress() + offset; }
+    MTL::GPUAddress address() const {
+        if (!buffer) throw std::runtime_error("cannot bind an empty tensor");
+        return buffer->metalBuffer->gpuAddress() + offset;
+    }
 };
 using Pipeline = MTL::ComputePipelineState;
 class CommandBuffer {
@@ -70,12 +74,17 @@ public:
     template <class... Scalars>
     void dispatchConcurrent(Pipeline* pipeline, MTL::Size threads, MTL::Size group,
                             std::initializer_list<Tensor> tensors, const Scalars&... scalars);
+    void copy(const Tensor& source, const Tensor& destination, uint64_t bytes) {
+        if (bytes > source.bytes || bytes > destination.bytes)
+            throw std::runtime_error("buffer copy exceeds tensor bounds");
+        copy(source.buffer->metalBuffer, source.offset, destination.buffer->metalBuffer, destination.offset, bytes);
+    }
     void commit();
 };
 class Device {
     friend struct Buffer;
     friend class CommandBuffer;
-    friend class SparseBuffers;
+    friend class SparseBuffer;
     static constexpr uint32_t counterHeapEntries = 4096;
     MTL::Device* metalDevice = nullptr;
     MTL4::CommandQueue* queue = nullptr;
@@ -91,6 +100,7 @@ class Device {
     uint64_t timestampFrequency = 0;
     void add(MTL::Allocation* allocation);
     void remove(MTL::Allocation* allocation);
+    bool wait();
     void recordKernel(const std::string& phase, const std::string& name, uint64_t gpuTimeNs);
     uint64_t timestampNanoseconds(uint64_t ticks) const {
         return static_cast<uint64_t>(static_cast<long double>(ticks) * 1.0e9L / timestampFrequency);
@@ -108,23 +118,19 @@ public:
     const std::vector<KernelCounter>& kernelCounters() const { return kernelStats; }
     Counters stats;
 };
-class SparseBuffers {
-    static constexpr uint32_t count = 16, pageTokens = 128;
+class SparseBuffer {
     static constexpr uint64_t pageBytes = 256ull << 10, heapBytes = 64ull << 20;
-    static constexpr uint32_t pagesPerHeap = heapBytes / (pageBytes * count);
     Device& device;
-    uint32_t maxPages, mappedPages = 0;
-    std::vector<Tensor> buffers;
-    std::vector<MTL::Heap*> heaps;
+    uint32_t virtualBlocks, maxPhysicalBlocks, planeCount, physicalBlocks = 0, blocksPerHeap;
+    std::vector<Tensor> planes; std::vector<MTL::Heap*> heaps;
     void addHeap();
+    void update(uint32_t virtualBlock, uint32_t count, uint32_t physicalBlock, bool mapped);
 public:
-    SparseBuffers(Device& device, uint32_t maxContext);
-    SparseBuffers(const SparseBuffers&) = delete;
-    ~SparseBuffers();
-    void ensure(uint32_t tokens);
-    Tensor key(uint32_t attentionLayer) const { return buffers[2 * attentionLayer]; }
-    Tensor value(uint32_t attentionLayer) const { return buffers[2 * attentionLayer + 1]; }
-    uint64_t mappedBytes() const { return uint64_t(mappedPages) * count * pageBytes; }
+    SparseBuffer(Device& device, uint32_t virtualBlocks, uint32_t physicalBlocks, uint32_t planes);
+    SparseBuffer(const SparseBuffer&) = delete; ~SparseBuffer();
+    void ensure(uint32_t blocks); void map(uint32_t virtualBlock, uint32_t physicalBlock); void unmap(uint32_t virtualBlock);
+    const Tensor& plane(uint32_t index) const { return planes.at(index); }
+    uint64_t mappedBytes() const { return uint64_t(physicalBlocks) * planeCount * pageBytes; }
 };
 template <class T> void CommandBuffer::scalar(MTL4::ArgumentTable* table, uint32_t index, const T& value) {
     static_assert(std::is_trivially_copyable_v<T>);

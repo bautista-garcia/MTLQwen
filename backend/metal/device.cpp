@@ -1,6 +1,7 @@
 #define NS_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 #include "device.hpp"
+#include <algorithm>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -60,6 +61,10 @@ Device::~Device() {
 }
 void Device::add(MTL::Allocation* allocation) { residency->addAllocation(allocation); residency->commit(); }
 void Device::remove(MTL::Allocation* allocation) { residency->removeAllocation(allocation); residency->commit(); }
+bool Device::wait() {
+    uint64_t signal = ++eventValue; queue->signalEvent(event, signal);
+    return event->waitUntilSignaledValue(signal, std::numeric_limits<uint64_t>::max());
+}
 void Device::recordKernel(const std::string& phase, const std::string& name, uint64_t gpuTimeNs) {
     auto found = std::find_if(kernelStats.begin(), kernelStats.end(), [&](const KernelCounter& counter) {
         return counter.phase == phase && counter.name == name;
@@ -131,7 +136,7 @@ CommandBuffer::CommandBuffer(Device& device, uint64_t constantBytes, bool profil
 MTL4::ArgumentTable* CommandBuffer::table(uint32_t index) {
     if (index < tables.size()) return tables[index];
     auto descriptor = NS::TransferPtr(MTL4::ArgumentTableDescriptor::alloc()->init());
-    descriptor->setMaxBufferBindCount(16); descriptor->setInitializeBindings(true);
+    descriptor->setMaxBufferBindCount(24); descriptor->setInitializeBindings(true);
     NS::Error* error = nullptr;
     auto* argumentTable = device.metalDevice->newArgumentTable(descriptor.get(), &error);
     if (!argumentTable) throw std::runtime_error(message(error));
@@ -147,10 +152,7 @@ void CommandBuffer::submit() {
     metalCommandBuffer->endCommandBuffer();
     const MTL4::CommandBuffer* commands[] = {metalCommandBuffer};
     device.queue->commit(commands, 1);
-    uint64_t signal = ++device.eventValue;
-    device.queue->signalEvent(device.event, signal);
-    if (!device.event->waitUntilSignaledValue(signal, std::numeric_limits<uint64_t>::max()))
-        throw std::runtime_error("Metal event wait timed out");
+    if (!device.wait()) throw std::runtime_error("Metal event wait timed out");
     if (profiling) {
         NS::Data* data = counterHeap->resolveCounterRange(NS::Range::Make(0, counterIndex));
         auto* timestamps = static_cast<const MTL4::TimestampHeapEntry*>(data->bytes());
@@ -170,48 +172,44 @@ void CommandBuffer::commit() {
     encoder->endEncoding(); encoder = nullptr; submit();
 }
 
-SparseBuffers::SparseBuffers(Device& device, uint32_t maxContext)
-    : device(device), maxPages(uint32_t((uint64_t(maxContext) + pageTokens - 1) / pageTokens)) {
-    uint64_t bytes = uint64_t(maxContext) * 4 * 256 * 2; buffers.reserve(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        MTL::Buffer* buffer = device.metalDevice->newBuffer(bytes, MTL::ResourceStorageModePrivate,
-                                                            MTL::SparsePageSize256);
+SparseBuffer::SparseBuffer(Device& device, uint32_t virtualCount, uint32_t physicalCount, uint32_t count)
+    : device(device), virtualBlocks(virtualCount), maxPhysicalBlocks(physicalCount), planeCount(count),
+      blocksPerHeap(uint32_t(heapBytes / pageBytes) / count) {
+    if (!blocksPerHeap) throw std::runtime_error("invalid sparse buffer dimensions");
+    uint64_t bytes = uint64_t(virtualBlocks) * pageBytes; planes.reserve(planeCount);
+    for (uint32_t i = 0; i < planeCount; ++i) {
+        MTL::Buffer* buffer = device.metalDevice->newBuffer(bytes, MTL::ResourceStorageModePrivate, MTL::SparsePageSize256);
         if (!buffer) throw std::runtime_error("sparse KV buffer allocation failed");
-        device.add(buffer);
-        buffers.push_back({std::make_shared<Buffer>(&device, buffer, bytes), 0, bytes});
+        device.add(buffer); planes.push_back({std::make_shared<Buffer>(&device, buffer, bytes), 0, bytes});
     }
 }
-void SparseBuffers::addHeap() {
+void SparseBuffer::addHeap() {
     auto descriptor = NS::TransferPtr(MTL::HeapDescriptor::alloc()->init());
     descriptor->setType(MTL::HeapTypePlacement); descriptor->setStorageMode(MTL::StorageModePrivate);
     descriptor->setSize(heapBytes); descriptor->setSparsePageSize(MTL::SparsePageSize256);
     descriptor->setMaxCompatiblePlacementSparsePageSize(MTL::SparsePageSize256);
     MTL::Heap* heap = device.metalDevice->newHeap(descriptor.get());
     if (!heap) throw std::runtime_error("KV heap allocation failed");
-    device.add(heap);
-    heaps.push_back(heap);
-    // allocate one placement heap and map its pages across all KV buffers
-    uint32_t pages = std::min(pagesPerHeap, maxPages - mappedPages);
-    MTL::Heap* mappingHeap = heaps.back();
-    for (uint32_t page = 0; page < pages; ++page) for (uint32_t i = 0; i < count; ++i) {
-        MTL4::UpdateSparseBufferMappingOperation operation{MTL::SparseTextureMappingModeMap,
-                                                           NS::Range::Make(mappedPages + page, 1), page * count + i};
-        device.queue->updateBufferMappings(buffers[i].buffer->metalBuffer, mappingHeap, &operation, 1);
-    }
-    mappedPages += pages;
+    device.add(heap); heaps.push_back(heap);
+    physicalBlocks += std::min(blocksPerHeap, maxPhysicalBlocks - physicalBlocks);
 }
-void SparseBuffers::ensure(uint32_t tokens) {
-    uint32_t target = (uint64_t(tokens) + pageTokens - 1) / pageTokens;
-    while (mappedPages < target) addHeap();
+void SparseBuffer::ensure(uint32_t blocks) {
+    if (blocks > maxPhysicalBlocks) throw std::runtime_error("KV block pool exhausted");
+    while (physicalBlocks < blocks) addHeap();
 }
-SparseBuffers::~SparseBuffers() {
-    // unmap virtual KV pages before releasing their buffers and backing heaps
-    for (uint32_t page = 0; page < mappedPages; ++page) for (uint32_t i = 0; i < count; ++i) {
-        MTL4::UpdateSparseBufferMappingOperation operation{
-            MTL::SparseTextureMappingModeUnmap, NS::Range::Make(page, 1), 0};
-        device.queue->updateBufferMappings(buffers[i].buffer->metalBuffer, nullptr, &operation, 1);
+void SparseBuffer::update(uint32_t virtualBlock, uint32_t count, uint32_t physicalBlock, bool mapped) {
+    MTL::Heap* heap = mapped ? heaps[physicalBlock / blocksPerHeap] : nullptr;
+    uint32_t offset = mapped ? physicalBlock % blocksPerHeap * planeCount : 0;
+    auto mode = mapped ? MTL::SparseTextureMappingModeMap : MTL::SparseTextureMappingModeUnmap;
+    for (uint32_t i = 0; i < planeCount; ++i) {
+        MTL4::UpdateSparseBufferMappingOperation operation{mode, NS::Range::Make(virtualBlock, count), mapped ? offset + i : 0};
+        device.queue->updateBufferMappings(planes[i].buffer->metalBuffer, heap, &operation, 1);
     }
-    buffers.clear();
+}
+void SparseBuffer::map(uint32_t virtualBlock, uint32_t physicalBlock) { update(virtualBlock, 1, physicalBlock, true); }
+void SparseBuffer::unmap(uint32_t virtualBlock) { update(virtualBlock, 1, 0, false); }
+SparseBuffer::~SparseBuffer() {
+    update(0, virtualBlocks, 0, false); device.wait(); planes.clear();
     for (auto* heap : heaps) { device.remove(heap); heap->release(); }
 }
 }  // namespace infeng::metal
