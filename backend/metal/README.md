@@ -42,3 +42,27 @@ python benchmarks/profile_qwen35.py --prefill 128 --decode 32
 ```
 
 Metal timestamps are GPU clock ticks, converted with the device timestamp frequency before reporting milliseconds. Precise timestamp markers add a small measurement overhead, so use the normal wall-clock benchmark for final latency numbers.
+
+
+### Memory lifecycle
+*Following is a mermaid diagram of the complete memory lifecycle*
+```mermaid
+flowchart TD
+    A["New request"] --> B["Hash complete 128-token prefix blocks"]
+    B --> C{"Matching prefix and hybrid checkpoint?"}
+    C -- "Yes" --> D["Restore GDN/MTP checkpoint"]
+    D --> E["Bind cached physical blocks into new slot"]
+    C -- "No" --> F["Reserve new physical blocks"]
+    E --> G["Run kernels using slot and token addresses"]
+    F --> G
+    G --> H["Commit kvValid"]
+    H --> I["Publish newly completed blocks"]
+    I --> J["Session remains live"]
+    J --> K["Release session"]
+    K --> L["Unmap virtual pages and decrement refs"]
+    L --> M{"refs == 0"}
+    M -- "Yes" --> N["Keep as soft prefix cache"]
+    N --> O{"Allocator needs capacity"}
+    O -- "Yes" --> P["Evict least-recently-used zero-ref block"]
+    P --> F
+```
