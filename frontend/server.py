@@ -36,19 +36,31 @@ class ChatSession:
 
 class Handler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm, wbufsize = True, 0
     root: Path
     args: argparse.Namespace
     engine = None
     loading, load_error = False, ""
+    load_config = None
     model_condition = threading.Condition()
     sessions, sessions_lock = {}, threading.RLock()
     max_sessions = 8
 
     @classmethod
-    def _finish_model_load(cls):
+    def _model_config(cls, drafter=None):
+        drafter = drafter or cls.args.drafter
+        if drafter not in ("none", "mtp", "dflash"): raise ValueError("drafter must be none, mtp, or dflash")
+        weights = cls.args.mtp_weights if drafter == "mtp" else cls.args.weights
+        return {"drafter": drafter, "weights": weights,
+                "draft_weights": cls.args.draft_weights if drafter == "dflash" else None}
+
+    @classmethod
+    def _finish_model_load(cls, config):
         try:
-            print("loading model on native Metal 4 with float16", flush=True)
-            engine, error = InferenceEngine(cls.args.weights, cls.args.tokenizer), ""
+            print(f"loading {config['drafter']} model on native Metal 4 with float16", flush=True)
+            engine = InferenceEngine(config["weights"], cls.args.tokenizer, drafter=config["drafter"],
+                                     draft_weights=config["draft_weights"], max_context=cls.args.max_context)
+            error = ""
             print("model loaded on native Metal 4 with float16", flush=True)
         except Exception as exc:
             engine, error = None, f"{type(exc).__name__}: {exc}"
@@ -67,16 +79,21 @@ class Handler(SimpleHTTPRequestHandler):
                 if cls.engine: return cls.engine
                 raise RuntimeError(cls.load_error or "model load failed")
             cls.loading, cls.load_error = True, ""
-        engine = cls._finish_model_load()
+            config = cls.load_config or cls._model_config()
+            cls.load_config = config
+        engine = cls._finish_model_load(config)
         if not engine: raise RuntimeError(cls.load_error)
         return engine
 
     @classmethod
-    def start_model_load(cls):
+    def start_model_load(cls, drafter=None):
+        config = cls._model_config(drafter)
         with cls.model_condition:
-            if cls.engine or cls.loading: return
+            if cls.engine or cls.loading: return False
             cls.loading, cls.load_error = True, ""
-        threading.Thread(target=cls._finish_model_load, name="infeng-loader", daemon=True).start()
+            cls.load_config = config
+        threading.Thread(target=cls._finish_model_load, args=(config,), name="infeng-loader", daemon=True).start()
+        return True
 
     def _json(self, status, body):
         payload = json.dumps(body).encode()
@@ -89,7 +106,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _event(self, body):
         try:
-            self.wfile.write(f"data: {json.dumps(body, separators=(',', ':'))}\n\n".encode()); return True
+            self.wfile.write(f"data: {json.dumps(body, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
+            self.wfile.flush(); return True
         except (BrokenPipeError, ConnectionResetError):
             return False
 
@@ -105,9 +123,13 @@ class Handler(SimpleHTTPRequestHandler):
                 sessions = list(Handler.sessions.values())
                 mapped = max((item.runtime.mapped_kv_bytes for item in sessions if item.runtime), default=0)
                 active = sum(item.generating for item in sessions)
+            drafter = Handler.engine.drafter if Handler.engine else (Handler.load_config or Handler._model_config())["drafter"]
+            default_drafts = Handler.engine.default_draft_tokens if Handler.engine else {"none": 0, "mtp": 2, "dflash": 7}[drafter]
+            max_drafts = Handler.engine.max_draft_tokens if Handler.engine else {"none": 0, "mtp": 4, "dflash": 15}[drafter]
             return self._json(200, {"loaded": Handler.engine is not None, "loading": Handler.loading,
                                     "error": Handler.load_error, "device": "metal4" if Handler.engine else "",
-                                    "mtp": Handler.engine.native.has_mtp if Handler.engine else False,
+                                    "drafter": drafter, "mtp": drafter == "mtp", "dflash": drafter == "dflash",
+                                    "default_draft_tokens": default_drafts, "max_draft_tokens": max_drafts,
                                     "sessions": len(sessions), "active_sessions": active,
                                     "max_sessions": Handler.max_sessions, "mapped_kv_bytes": mapped})
         if path == "/api/sessions":
@@ -124,7 +146,9 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         if path == "/api/load":
-            Handler.start_model_load()
+            data = self._body(); drafter = data.get("drafter", Handler.args.drafter)
+            try: Handler.start_model_load(drafter)
+            except ValueError as exc: return self._json(400, {"error": str(exc)})
             return self._json(200, {"ok": True, "loaded": Handler.engine is not None, "loading": Handler.loading})
         if path == "/api/sessions":
             with Handler.sessions_lock:
@@ -162,7 +186,7 @@ class Handler(SimpleHTTPRequestHandler):
         session.generating, disconnected = True, False
         session.cancel.clear(); started = time.perf_counter(); generation = None
         try:
-            self.send_response(200); self.send_header("content-type", "text/event-stream")
+            self.send_response(200); self.send_header("content-type", "text/event-stream; charset=utf-8")
             self.send_header("x-accel-buffering", "no"); self.send_header("connection", "close"); self.end_headers()
             if Handler.engine is None and not self._event({"status": "Loading model…"}): return
             engine = Handler.load_model()
@@ -176,7 +200,11 @@ class Handler(SimpleHTTPRequestHandler):
             top_p, top_k = float(data.get("top_p", Handler.args.top_p)), int(data.get("top_k", Handler.args.top_k))
             max_tokens = max(1, min(int(data.get("max_tokens", Handler.args.max_new_tokens)), Handler.args.max_new_tokens))
             speculative = bool(data.get("speculative", Handler.args.speculative))
-            draft_tokens = max(1, min(int(data.get("draft_tokens", Handler.args.draft_tokens)), 4))
+            if speculative and engine.drafter == "none":
+                raise ValueError("speculative generation requires --drafter mtp or dflash")
+            requested_drafts = data.get("draft_tokens", Handler.args.draft_tokens)
+            draft_tokens = engine.default_draft_tokens if requested_drafts is None else int(requested_drafts)
+            if engine.max_draft_tokens: draft_tokens = max(1, min(draft_tokens, engine.max_draft_tokens))
             stop_ids = [token for token in (engine.tokenizer.eos_token_id,
                                             engine.tokenizer.convert_tokens_to_ids("<|im_end|>")) if token is not None]
             before_context = session.runtime.native.length
@@ -255,11 +283,15 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1"); parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--weights", default="weights/Qwen3.5-9B-UD-Q4_K_XL-MTP.gguf")
+    parser.add_argument("--weights", default="weights/Qwen3.5-9B-UD-Q4_K_XL.gguf")
+    parser.add_argument("--mtp-weights", default="weights/Qwen3.5-9B-UD-Q4_K_XL-MTP.gguf")
     parser.add_argument("--tokenizer", default="Qwen/Qwen3.5-9B")
+    parser.add_argument("--drafter", choices=("none", "mtp", "dflash"), default="none")
+    parser.add_argument("--draft-weights", default="weights/qwen35-9b-dflash-Q4_K_M.gguf")
+    parser.add_argument("--max-context", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=10240); parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--speculative", action="store_true")
-    parser.add_argument("--draft-tokens", type=int, choices=range(1, 5), default=2)
+    parser.add_argument("--draft-tokens", type=int)
     parser.add_argument("--temperature", type=float); parser.add_argument("--top-p", type=float)
     parser.add_argument("--top-k", type=int, default=20); parser.add_argument("--preload", action="store_true")
     Handler.args, Handler.root = parser.parse_args(), Path(__file__).parent
@@ -267,7 +299,7 @@ def main():
     Handler.args.top_p = Handler.args.top_p if Handler.args.top_p is not None else 0.95 if Handler.args.thinking else 0.8
     server = ThreadingHTTPServer((Handler.args.host, Handler.args.port), Handler); server.daemon_threads = True
     print(f"http://{Handler.args.host}:{Handler.args.port}")
-    if Handler.args.preload: Handler.start_model_load()
+    if Handler.args.preload: Handler.start_model_load(Handler.args.drafter)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally:

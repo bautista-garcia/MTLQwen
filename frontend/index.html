@@ -4,9 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <title>Infeng</title>
+    <meta name="theme-color" content="#0c0c0d" />
+    <title>MTLQwen</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css" />
-    <link rel="stylesheet" href="/style.css?v=10" />
+    <link rel="stylesheet" href="/style.css?v=14" />
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js"></script>
@@ -15,7 +16,7 @@
     <div id="app">
       <aside id="sidebar" aria-label="Chat sessions">
         <div class="sidebar-head">
-          <a class="brand" href="/" aria-label="Infeng home"><span class="brand-mark">I</span><span>Infeng</span></a>
+          <a class="brand" href="/" aria-label="MTLQwen home"><span class="brand-mark">MQ</span><span class="brand-copy"><strong>MTLQwen</strong><small>Metal inference</small></span></a>
           <button id="sidebar-close" class="icon-btn mobile-only" aria-label="Close sidebar">&times;</button>
         </div>
         <button id="new-chat-btn" class="new-chat-btn">
@@ -30,6 +31,9 @@
             <div><strong id="model-status">Model offline</strong><span id="server-detail">Metal runtime ready</span></div>
             <button id="load-btn" class="load-btn">Load</button>
           </div>
+          <label class="model-choice"><span>Drafter</span><select id="model-drafter">
+            <option value="none">None</option><option value="mtp">MTP</option><option value="dflash">DFlash</option>
+          </select></label>
           <div class="memory-row"><span>KV residency</span><span id="memory-value">0 MB</span></div>
         </div>
       </aside>
@@ -59,17 +63,18 @@
           <section id="messages" aria-live="polite"></section>
           <form id="form">
             <div class="composer">
-              <textarea id="message" rows="1" placeholder="Message Infeng" aria-label="Message"></textarea>
+              <textarea id="message" rows="1" placeholder="Message MTLQwen…" aria-label="Message"></textarea>
               <div class="composer-foot">
+                <button type="button" id="composer-new" class="composer-new" aria-label="New session">+</button>
                 <span id="generation-status">Ready</span>
-                <span class="shortcut">Enter to send · Shift Enter for newline</span>
+                <div class="model-chips" aria-label="Active model"><span class="model-chip model-name">Qwen3.5</span><span class="model-chip">9B</span><span class="model-chip">UD</span><span class="model-chip">Q4_K_XL</span><span id="composer-drafter" class="model-chip">TARGET</span></div>
                 <button type="submit" id="send-btn" aria-label="Send message">
                   <svg class="send-icon" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7" /></svg>
                   <svg class="stop-icon" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1" /></svg>
                 </button>
               </div>
             </div>
-            <p class="disclaimer">Local output can be inaccurate. Verify important information.</p>
+            <p class="disclaimer">On-device output can be inaccurate. Verify important information.</p>
           </form>
         </main>
       </section>
@@ -78,16 +83,27 @@
       <aside id="settings-panel" aria-label="Generation settings">
         <div class="settings-head"><div><strong>Generation</strong><span>Applied to new responses</span></div><button id="settings-close" class="icon-btn" aria-label="Close settings">&times;</button></div>
         <label class="toggle-row"><span><strong>Thinking mode</strong><small>Expose the model reasoning stream</small></span><input type="checkbox" id="thinking" /><i></i></label>
-        <label class="toggle-row"><span><strong>MTP speculative decoding</strong><small>Verify up to four draft tokens per target pass</small></span><input type="checkbox" id="speculative" /><i></i></label>
+        <label class="toggle-row"><span><strong>Speculative decoding</strong><small>Use the drafter selected when the model was loaded</small></span><input type="checkbox" id="speculative" /><i></i></label>
         <label class="control-row"><span><strong>Draft tokens</strong><output id="draft_tokens-val">2</output></span><input type="range" id="draft_tokens" min="1" max="4" step="1" value="2" /></label>
         <label class="control-row"><span><strong>Temperature</strong><output id="temperature-val">0.70</output></span><input type="range" id="temperature" min="0" max="2" step="0.05" value="0.7" /></label>
         <label class="control-row"><span><strong>Top P</strong><output id="top_p-val">0.80</output></span><input type="range" id="top_p" min="0" max="1" step="0.05" value="0.8" /></label>
         <label class="control-row"><span><strong>Top K</strong><output id="top_k-val">20</output></span><input type="range" id="top_k" min="1" max="64" step="1" value="20" /></label>
         <label class="control-row"><span><strong>Maximum output</strong><output id="max_tokens-val">1024</output></span><input type="range" id="max_tokens" min="64" max="4096" step="64" value="1024" /></label>
-        <div class="settings-note"><strong>Continuous batching + MTP</strong><p>Ready sessions share packed target verification while retaining independent paged KV and recurrent candidates.</p></div>
+        <div class="settings-note"><strong>Continuous batching + drafting</strong><p>Ready sessions share packed target verification while retaining independent paged KV and recurrent candidates.</p></div>
       </aside>
+      <dialog id="model-dialog" aria-labelledby="model-dialog-title">
+        <form method="dialog" class="model-dialog-form">
+          <div class="model-dialog-head"><span>Model startup</span><h2 id="model-dialog-title">Choose a drafter</h2><p>The model will load with this configuration, then your prompt will be sent.</p></div>
+          <div class="drafter-options">
+            <button value="dflash" class="drafter-option"><strong>DFlash</strong><span>Dedicated recurrent drafter</span><small>7 draft tokens</small></button>
+            <button value="mtp" class="drafter-option"><strong>MTP</strong><span>Built-in multi-token prediction</span><small>2 draft tokens</small></button>
+            <button value="none" class="drafter-option"><strong>None</strong><span>Run the target model directly</span><small>No drafting</small></button>
+          </div>
+          <button value="" class="model-dialog-cancel">Cancel</button>
+        </form>
+      </dialog>
       <div id="toast" role="status"></div>
     </div>
-    <script src="/app.js?v=10"></script>
+    <script src="/app.js?v=16"></script>
   </body>
 </html>

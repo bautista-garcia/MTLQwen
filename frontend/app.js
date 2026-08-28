@@ -4,10 +4,9 @@ const ui = {
   list: $("#session-list"), title: $("#session-title"), meta: $("#session-meta"),
   tps: $("#tps-value"), ttft: $("#ttft-value"), tokens: $("#token-value"), context: $("#context-value"),
   generation: $("#generation-status"), settings: $("#settings-panel"), settingsScrim: $("#settings-scrim"),
-  sidebar: $("#sidebar"), sidebarScrim: $("#sidebar-scrim"), toast: $("#toast"),
+  sidebar: $("#sidebar"), sidebarScrim: $("#sidebar-scrim"), modelDialog: $("#model-dialog"), toast: $("#toast"),
 };
 const sessions = new Map();
-const streamRenderInterval = 80;
 let activeId = null, serverStatus = {}, toastTimer;
 
 if (window.marked) marked.setOptions({ breaks: true, gfm: true });
@@ -74,10 +73,11 @@ function mergeSession(value) {
 
 function renderServer() {
   const dot = $("#model-dot"), label = $("#model-status"), detail = $("#server-detail"), load = $("#load-btn");
+  const chooser = $("#model-drafter");
   dot.className = "status-dot";
   if (serverStatus.loaded) {
-    dot.classList.add("loaded"); label.textContent = "Qwen 3.5 · online";
-    detail.textContent = `${serverStatus.active_sessions || 0} active · ${serverStatus.mtp ? "MTP ready" : "target only"}`;
+    dot.classList.add("loaded"); label.textContent = "MTLQwen · online";
+    detail.textContent = `${serverStatus.active_sessions || 0} active · ${serverStatus.drafter === "none" ? "target only" : `${serverStatus.drafter.toUpperCase()} ready`}`;
     load.textContent = "Ready"; load.disabled = true;
   } else if (serverStatus.loading) {
     dot.classList.add("loading"); label.textContent = "Loading model"; detail.textContent = "One shared instance";
@@ -88,12 +88,25 @@ function renderServer() {
   } else {
     label.textContent = "Model offline"; detail.textContent = "Metal runtime ready"; load.textContent = "Load"; load.disabled = false;
   }
+  $("#composer-drafter").textContent = serverStatus.drafter === "none" ? "TARGET" : (serverStatus.drafter || "TARGET").toUpperCase();
   $("#memory-value").textContent = formatBytes(serverStatus.mapped_kv_bytes || 0);
+  if (!chooser.dataset.ready || serverStatus.loaded || serverStatus.loading) {
+    chooser.value = serverStatus.drafter || "none"; chooser.dataset.ready = "1";
+  }
+  chooser.disabled = serverStatus.loaded || serverStatus.loading;
   $("#session-count").textContent = `${sessions.size} / ${serverStatus.max_sessions || 8}`;
-  $("#new-chat-btn").disabled = sessions.size >= (serverStatus.max_sessions || 8);
+  const full = sessions.size >= (serverStatus.max_sessions || 8);
+  $("#new-chat-btn").disabled = $("#composer-new").disabled = full;
   const speculative = $("#speculative");
-  speculative.disabled = serverStatus.loaded && !serverStatus.mtp;
+  speculative.disabled = !serverStatus.loaded || serverStatus.drafter === "none";
   if (speculative.disabled) speculative.checked = false;
+  const drafts = $("#draft_tokens");
+  drafts.disabled = speculative.disabled;
+  const draftConfig = `${serverStatus.drafter}:${serverStatus.default_draft_tokens}:${serverStatus.max_draft_tokens}`;
+  if (serverStatus.loaded && drafts.dataset.config !== draftConfig) {
+    drafts.dataset.config = draftConfig; drafts.max = serverStatus.max_draft_tokens;
+    drafts.value = serverStatus.default_draft_tokens || 1; $("#draft_tokens-val").textContent = drafts.value;
+  }
 }
 
 function renderSidebar() {
@@ -136,7 +149,7 @@ function messageStats(metrics, cancelled) {
   const stats = document.createElement("div"); stats.className = "message-stats";
   if (metrics.tps) stats.innerHTML += `<span>${metrics.tps} tok/s</span>`;
   stats.innerHTML += `<span>${metrics.generated_tokens} tokens</span><span>TTFT ${formatMetric(metrics.ttft_ms)} ms</span>`;
-  if (metrics.speculative && metrics.drafted_tokens) stats.innerHTML += `<span>MTP ${Math.round(metrics.acceptance_rate * 100)}% accepted</span>`;
+  if (metrics.speculative && metrics.drafted_tokens) stats.innerHTML += `<span>Draft ${Math.round(metrics.acceptance_rate * 100)}% accepted</span>`;
   if (cancelled) stats.innerHTML += '<span class="cancelled">stopped</span>';
   return stats;
 }
@@ -145,27 +158,50 @@ function messageNode(message, index) {
   const root = document.createElement("article"); root.className = `message ${message.role}`; root.dataset.index = index;
   const body = document.createElement("div"); body.className = "message-body";
   if (message.role === "user") { body.textContent = message.content; root.append(body); return root; }
-  const avatar = document.createElement("div"); avatar.className = "avatar"; avatar.textContent = "I";
+  const avatar = document.createElement("div"); avatar.className = "avatar"; avatar.textContent = "M";
   if (message.thinking) {
     const thought = document.createElement("details"); thought.className = "thought"; thought.open = Boolean(message.streaming);
     const summary = document.createElement("summary"); summary.textContent = message.streaming ? "Thinking" : "Reasoning";
-    const content = document.createElement("div"); content.textContent = message.thinking; thought.append(summary, content); body.append(thought);
+    const content = document.createElement("div"); content.textContent = message.thinking;
+    if (message.streaming) content.dataset.rendered = message.thinking.length;
+    thought.append(summary, content); body.append(thought);
   }
-  const response = document.createElement("div"); response.className = `response-content${message.error ? " error-text" : ""}`;
+  const response = document.createElement("div"); response.className = `response-content${message.streaming ? " streaming" : ""}${message.error ? " error-text" : ""}`;
   response.dataset.status = message.status || (message.streaming ? "Generating…" : "No response generated.");
   if (message.error) response.textContent = `Error: ${message.error}`;
-  else response.innerHTML = renderMarkdown(message.content || "");
+  else {
+    response.innerHTML = renderMarkdown(message.content || "");
+    if (message.streaming) response.dataset.rendered = message.content.length;
+  }
   body.append(response); if (!message.streaming) enhance(response);
   if (message.streaming) { const cursor = document.createElement("span"); cursor.className = "cursor"; body.append(cursor); }
   const stats = messageStats(message.metrics, message.cancelled); if (stats) body.append(stats);
   root.append(avatar, body); return root;
 }
 
+function appendStreamText(element, text) {
+  const rendered = Number(element.dataset.rendered || 0);
+  element.firstChild.appendData(text.slice(rendered)); element.dataset.rendered = text.length;
+}
+
+function patchStreamingMessage(root, message) {
+  const response = root.querySelector(".response-content");
+  if (!response) return false;
+  response.dataset.status = message.status || "Generating…";
+  if (Number(response.dataset.rendered || 0) !== message.content.length) {
+    response.innerHTML = renderMarkdown(message.content); response.dataset.rendered = message.content.length;
+  }
+  const thought = root.querySelector(".thought");
+  if (message.thinking && !thought) return false;
+  if (thought) appendStreamText(thought.querySelector("div"), message.thinking || "");
+  return true;
+}
+
 function renderMessages() {
   const session = sessions.get(activeId); ui.messages.replaceChildren();
   if (!session?.messages?.length) {
     const welcome = document.createElement("div"); welcome.className = "welcome";
-    welcome.innerHTML = '<div class="welcome-mark">I</div><h1>Fast local inference, independent contexts.</h1><p>Run up to eight conversations on one Metal model. Active sessions are continuously batched without mixing their state.</p><div class="welcome-tags"><span>Private paged KV</span><span>Live tok/s</span><span>Cancelable streams</span></div>';
+    welcome.innerHTML = '<div class="welcome-mark">MQ</div><h1>How can MTLQwen help?</h1><p>Metal-native Qwen 3.5 inference with fast, private, independent contexts.</p><div class="welcome-tags"><span>On device</span><span>Live tok/s</span><span>Speculative decoding</span></div>';
     ui.messages.append(welcome); return;
   }
   session.messages.forEach((message, index) => ui.messages.append(messageNode(message, index)));
@@ -174,17 +210,14 @@ function renderMessages() {
 
 function refreshMessage(session, index) {
   if (session.renderFrame) return;
-  const render = () => {
+  session.renderFrame = requestAnimationFrame(() => {
     session.renderFrame = null;
     if (activeId !== session.id) return;
-    const old = ui.messages.querySelector(`[data-index="${index}"]`);
-    if (old) old.replaceWith(messageNode(session.messages[index], index)); else renderMessages();
-    ui.messages.scrollTop = ui.messages.scrollHeight; session.renderedAt = performance.now(); renderTop();
-  };
-  const streaming = session.messages[index]?.streaming;
-  const delay = streaming ? Math.max(0, streamRenderInterval - (performance.now() - (session.renderedAt || 0))) : 0;
-  if (delay) session.renderFrame = setTimeout(() => { session.renderFrame = requestAnimationFrame(render); }, delay);
-  else session.renderFrame = requestAnimationFrame(render);
+    const message = session.messages[index], old = ui.messages.querySelector(`[data-index="${index}"]`);
+    if (!old) renderMessages();
+    else if (!message.streaming || !patchStreamingMessage(old, message)) old.replaceWith(messageNode(message, index));
+    ui.messages.scrollTop = ui.messages.scrollHeight; renderTop();
+  });
 }
 
 async function syncSessions() {
@@ -243,7 +276,44 @@ function applyStreamEvent(session, message, data) {
   if (data.done) { message.streaming = false; message.cancelled = Boolean(data.cancelled); }
 }
 
+function createStreamPainter(session, message, index) {
+  const queue = []; let timer = null, readyAt = 0, latestTps = 0, closing = false, resolveDone;
+  const done = new Promise((resolve) => { resolveDone = resolve; });
+  const schedule = (delay) => { if (timer === null) timer = setTimeout(drain, delay); };
+  const drain = () => {
+    timer = null;
+    const wait = closing ? 0 : readyAt - performance.now();
+    if (wait > 1) return schedule(wait);
+    const data = queue.shift(); if (!data) return;
+    applyStreamEvent(session, message, data); refreshMessage(session, index);
+    const interval = closing ? 1000 / 60 : latestTps ? Math.max(1000 / 60, 1000 / latestTps) : 0;
+    readyAt = performance.now() + interval;
+    if (data.done) resolveDone();
+    else if (queue.length) schedule(queue[0].done ? 0 : interval);
+  };
+  return {
+    done,
+    push(data) {
+      if (data.metrics?.tps) latestTps = data.metrics.tps;
+      if (data.response_delta === undefined && data.thinking_delta === undefined && !data.done) {
+        applyStreamEvent(session, message, data); refreshMessage(session, index); return;
+      }
+      queue.push(data);
+      if (data.done) {
+        closing = true;
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+      }
+      schedule(data.done ? 0 : 4);
+    },
+    cancel() {
+      if (timer !== null) clearTimeout(timer);
+      timer = null; queue.length = 0; resolveDone();
+    },
+  };
+}
+
 async function streamChat(session, text, message, index) {
+  const painter = createStreamPainter(session, message, index);
   try {
     const response = await fetch(`/api/sessions/${session.id}/chat`, {
       method: "POST", headers: { "content-type": "application/json" },
@@ -263,13 +333,14 @@ async function streamChat(session, text, message, index) {
         const payload = block.split("\n").filter((line) => line.startsWith("data:"))
           .map((line) => line.slice(5).trimStart()).join("\n");
         if (!payload) continue;
-        const data = JSON.parse(payload); applyStreamEvent(session, message, data); refreshMessage(session, index);
+        const data = JSON.parse(payload); if (data.error) throw new Error(data.error); painter.push(data);
         if (data.done) { finished = true; break; }
       }
     }
     if (!finished) throw new Error("Generation stream ended unexpectedly");
-    await reader.cancel();
+    await painter.done; await reader.cancel();
   } catch (error) {
+    painter.cancel();
     message.error = error.message;
     message.streaming = false;
   } finally {
@@ -300,10 +371,25 @@ function closeSettings() { ui.settings.classList.remove("open"); ui.settingsScri
 function openSidebar() { ui.sidebar.classList.add("open"); ui.sidebarScrim.classList.add("open"); }
 function closeSidebar() { ui.sidebar.classList.remove("open"); ui.sidebarScrim.classList.remove("open"); }
 
-ui.form.addEventListener("submit", (event) => {
+function chooseDrafter() {
+  ui.modelDialog.returnValue = ""; ui.modelDialog.showModal();
+  return new Promise((resolve) => ui.modelDialog.addEventListener("close", () => resolve(ui.modelDialog.returnValue || null), { once: true }));
+}
+
+async function startModelLoad(drafter) {
+  await api("/api/load", { method: "POST", body: { drafter } });
+  serverStatus.loading = true; serverStatus.drafter = drafter; renderServer(); pollStatus();
+}
+
+ui.form.addEventListener("submit", async (event) => {
   event.preventDefault(); const session = sessions.get(activeId);
   if (session?.generating) return stopSession(session);
   const text = ui.input.value.trim(); if (!session || !text) return;
+  if (!serverStatus.loaded && !serverStatus.loading) {
+    const drafter = await chooseDrafter(); if (!drafter) return;
+    try { await startModelLoad(drafter); }
+    catch (error) { notify(error.message); return; }
+  }
   ui.input.value = ""; resizeInput(); session.draft = "";
   session.messages ||= []; session.messages.push({ role: "user", content: text });
   const assistant = { role: "assistant", content: "", thinking: "", status: "Queued…", streaming: true, metrics: {} };
@@ -317,7 +403,11 @@ ui.input.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); ui.form.requestSubmit(); }
 });
 $("#new-chat-btn").onclick = createSession;
-$("#load-btn").onclick = async () => { try { await api("/api/load", { method: "POST" }); pollStatus(); } catch (error) { notify(error.message); } };
+$("#composer-new").onclick = createSession;
+$("#load-btn").onclick = async () => {
+  try { await startModelLoad($("#model-drafter").value); }
+  catch (error) { notify(error.message); }
+};
 $("#settings-btn").onclick = openSettings; $("#settings-close").onclick = closeSettings; ui.settingsScrim.onclick = closeSettings;
 $("#sidebar-open").onclick = openSidebar; $("#sidebar-close").onclick = closeSidebar; ui.sidebarScrim.onclick = closeSidebar;
 document.addEventListener("keydown", (event) => {
@@ -327,7 +417,7 @@ document.addEventListener("keydown", (event) => {
 
 const settingIds = ["thinking", "speculative", "draft_tokens", "temperature", "top_p", "top_k", "max_tokens"];
 try {
-  const saved = JSON.parse(localStorage.getItem("infeng-settings") || "{}");
+  const saved = JSON.parse(localStorage.getItem("mtlqwen-settings") || localStorage.getItem("infeng-settings") || "{}");
   settingIds.forEach((id) => { if (saved[id] !== undefined) $(`#${id}`)[$(`#${id}`).type === "checkbox" ? "checked" : "value"] = saved[id]; });
 } catch { /* Ignore corrupt local preferences. */ }
 settingIds.forEach((id) => {
@@ -335,7 +425,7 @@ settingIds.forEach((id) => {
   const update = () => {
     if (output) output.textContent = id === "temperature" || id === "top_p" ? Number(input.value).toFixed(2) : input.value;
     const saved = Object.fromEntries(settingIds.map((key) => [key, $(`#${key}`).type === "checkbox" ? $(`#${key}`).checked : $(`#${key}`).value]));
-    localStorage.setItem("infeng-settings", JSON.stringify(saved));
+    localStorage.setItem("mtlqwen-settings", JSON.stringify(saved));
   };
   input.addEventListener("input", update); update();
 });
