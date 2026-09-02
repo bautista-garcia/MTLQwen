@@ -16,7 +16,9 @@
     <div id="app">
       <aside id="sidebar" aria-label="Chat sessions">
         <div class="sidebar-head">
-          <a class="brand" href="/" aria-label="MTLQwen home"><span class="brand-mark">MQ</span><span class="brand-copy"><strong>MTLQwen</strong><small>Metal inference</small></span></a>
+          <a class="brand" href="/" aria-label="MTLQwen home"
+            ><span class="brand-mark">MQ</span><span class="brand-copy"><strong>MTLQwen</strong><small>Metal inference</small></span></a
+          >
           <button id="sidebar-close" class="icon-btn mobile-only" aria-label="Close sidebar">&times;</button>
         </div>
         <button id="new-chat-btn" class="new-chat-btn">
@@ -31,9 +33,14 @@
             <div><strong id="model-status">Model offline</strong><span id="server-detail">Metal runtime ready</span></div>
             <button id="load-btn" class="load-btn">Load</button>
           </div>
-          <label class="model-choice"><span>Drafter</span><select id="model-drafter">
-            <option value="none">None</option><option value="mtp">MTP</option><option value="dflash">DFlash</option>
-          </select></label>
+          <label class="model-choice"
+            ><span>Drafter</span
+            ><select id="model-drafter">
+              <option value="none">None</option>
+              <option value="mtp">MTP</option>
+              <option value="dflash">DFlash</option>
+            </select></label
+          >
           <div class="memory-row"><span>KV residency</span><span id="memory-value">0 MB</span></div>
         </div>
       </aside>
@@ -55,7 +62,18 @@
             <div class="metric metric-context"><span>Context</span><strong id="context-value">0</strong><small>tok</small></div>
           </div>
           <button id="settings-btn" class="icon-btn" aria-label="Generation settings">
-            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1A2 2 0 0 1 4.4 17l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1A2 2 0 0 1 7 4.4l.1.1a1.7 1.7 0 0 0 1.8.3 1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1A2 2 0 0 1 19.6 7l-.1.1a1.7 1.7 0 0 0-.3 1.8 1.7 1.7 0 0 0 1.5 1h.3a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1.1Z" /></svg>
+            <svg viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="3" />
+              <path
+                d="
+                  M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1
+                  a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1A2 2 0 0 1 4.4 17l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1
+                  a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1A2 2 0 0 1 7 4.4l.1.1a1.7 1.7 0 0 0 1.8.3 1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1
+                  a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1A2 2 0 0 1 19.6 7l-.1.1a1.7 1.7 0 0 0-.3 1.8
+                  a1.7 1.7 0 0 0 1.5 1h.3a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1.1Z
+                "
+              />
+            </svg>
           </button>
         </header>
 
@@ -67,7 +85,10 @@
               <div class="composer-foot">
                 <button type="button" id="composer-new" class="composer-new" aria-label="New session">+</button>
                 <span id="generation-status">Ready</span>
-                <div class="model-chips" aria-label="Active model"><span class="model-chip model-name">Qwen3.5</span><span class="model-chip">9B</span><span class="model-chip">UD</span><span class="model-chip">Q4_K_XL</span><span id="composer-drafter" class="model-chip">TARGET</span></div>
+                <div class="model-chips" aria-label="Active model">
+                  <span class="model-chip model-name">Qwen3.5</span><span class="model-chip">9B</span><span class="model-chip">UD</span
+                  ><span class="model-chip">Q4_K_XL</span><span id="composer-drafter" class="model-chip">TARGET</span>
+                </div>
                 <button type="submit" id="send-btn" aria-label="Send message">
                   <svg class="send-icon" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7" /></svg>
                   <svg class="stop-icon" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1" /></svg>
@@ -81,23 +102,60 @@
 
       <button id="settings-scrim" aria-label="Close settings"></button>
       <aside id="settings-panel" aria-label="Generation settings">
-        <div class="settings-head"><div><strong>Generation</strong><span>Applied to new responses</span></div><button id="settings-close" class="icon-btn" aria-label="Close settings">&times;</button></div>
-        <label class="toggle-row"><span><strong>Thinking mode</strong><small>Expose the model reasoning stream</small></span><input type="checkbox" id="thinking" /><i></i></label>
-        <label class="toggle-row"><span><strong>Speculative decoding</strong><small>Use the drafter selected when the model was loaded</small></span><input type="checkbox" id="speculative" /><i></i></label>
-        <label class="control-row"><span><strong>Draft tokens</strong><output id="draft_tokens-val">2</output></span><input type="range" id="draft_tokens" min="1" max="4" step="1" value="2" /></label>
-        <label class="control-row"><span><strong>Temperature</strong><output id="temperature-val">0.70</output></span><input type="range" id="temperature" min="0" max="2" step="0.05" value="0.7" /></label>
-        <label class="control-row"><span><strong>Top P</strong><output id="top_p-val">0.80</output></span><input type="range" id="top_p" min="0" max="1" step="0.05" value="0.8" /></label>
-        <label class="control-row"><span><strong>Top K</strong><output id="top_k-val">20</output></span><input type="range" id="top_k" min="1" max="64" step="1" value="20" /></label>
-        <label class="control-row"><span><strong>Maximum output</strong><output id="max_tokens-val">1024</output></span><input type="range" id="max_tokens" min="64" max="4096" step="64" value="1024" /></label>
-        <div class="settings-note"><strong>Continuous batching + drafting</strong><p>Ready sessions share packed target verification while retaining independent paged KV and recurrent candidates.</p></div>
+        <div class="settings-head">
+          <div><strong>Generation</strong><span>Applied to new responses</span></div>
+          <button id="settings-close" class="icon-btn" aria-label="Close settings">&times;</button>
+        </div>
+        <label class="toggle-row"
+          ><span><strong>Thinking mode</strong><small>Expose the model reasoning stream</small></span
+          ><input type="checkbox" id="thinking" /><i></i
+        ></label>
+        <label class="toggle-row"
+          ><span><strong>Speculative decoding</strong><small>Use the drafter selected when the model was loaded</small></span
+          ><input type="checkbox" id="speculative" /><i></i
+        ></label>
+        <label class="control-row"
+          ><span><strong>Draft tokens</strong><output id="draft_tokens-val">2</output></span
+          ><input type="range" id="draft_tokens" min="1" max="4" step="1" value="2"
+        /></label>
+        <label class="control-row"
+          ><span><strong>Temperature</strong><output id="temperature-val">0.70</output></span
+          ><input type="range" id="temperature" min="0" max="2" step="0.05" value="0.7"
+        /></label>
+        <label class="control-row"
+          ><span><strong>Top P</strong><output id="top_p-val">0.80</output></span
+          ><input type="range" id="top_p" min="0" max="1" step="0.05" value="0.8"
+        /></label>
+        <label class="control-row"
+          ><span><strong>Top K</strong><output id="top_k-val">20</output></span
+          ><input type="range" id="top_k" min="1" max="64" step="1" value="20"
+        /></label>
+        <label class="control-row"
+          ><span><strong>Maximum output</strong><output id="max_tokens-val">1024</output></span
+          ><input type="range" id="max_tokens" min="64" max="4096" step="64" value="1024"
+        /></label>
+        <div class="settings-note">
+          <strong>Continuous batching + drafting</strong>
+          <p>Ready sessions share packed target verification while retaining independent paged KV and recurrent candidates.</p>
+        </div>
       </aside>
       <dialog id="model-dialog" aria-labelledby="model-dialog-title">
         <form method="dialog" class="model-dialog-form">
-          <div class="model-dialog-head"><span>Model startup</span><h2 id="model-dialog-title">Choose a drafter</h2><p>The model will load with this configuration, then your prompt will be sent.</p></div>
+          <div class="model-dialog-head">
+            <span>Model startup</span>
+            <h2 id="model-dialog-title">Choose a drafter</h2>
+            <p>The model will load with this configuration, then your prompt will be sent.</p>
+          </div>
           <div class="drafter-options">
-            <button value="dflash" class="drafter-option"><strong>DFlash</strong><span>Dedicated recurrent drafter</span><small>7 draft tokens</small></button>
-            <button value="mtp" class="drafter-option"><strong>MTP</strong><span>Built-in multi-token prediction</span><small>2 draft tokens</small></button>
-            <button value="none" class="drafter-option"><strong>None</strong><span>Run the target model directly</span><small>No drafting</small></button>
+            <button value="dflash" class="drafter-option">
+              <strong>DFlash</strong><span>Dedicated recurrent drafter</span><small>7 draft tokens</small>
+            </button>
+            <button value="mtp" class="drafter-option">
+              <strong>MTP</strong><span>Built-in multi-token prediction</span><small>2 draft tokens</small>
+            </button>
+            <button value="none" class="drafter-option">
+              <strong>None</strong><span>Run the target model directly</span><small>No drafting</small>
+            </button>
           </div>
           <button value="" class="model-dialog-cancel">Cancel</button>
         </form>

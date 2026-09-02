@@ -79,3 +79,36 @@ All target layers contain norms and MLP weights. `fullAttention` determines whet
 1. Target and optional DFlash RoPE tables are generated once for the complete context.
 2. One shared control allocation holds batch metadata, tokens, and RNG state; private arenas hold MTP seeds and the two banks of GDN state.
 3. `SparseKV` creates the virtual KV address space for every slot. Physical pages are allocated and mapped only when sessions require them.
+
+# Batched forward pass
+
+Python selects the active sequences, prompt chunk sizes, and speculative work. `qwen.cpp` represents those decisions as one temporary native batch:
+
+```cpp
+struct Query {
+  Sequence* sequence;
+  const int32_t* tokens;
+  uint32_t valid, count, logit;
+  bool draft, sample;
+};
+
+struct Batch {
+  std::array<Query, maxBatchSequences> queries{};
+  std::array<uint32_t, maxBatchSequences + 1> query_start_loc{}; // First packed token row for each query.
+  std::array<uint32_t, maxBatchSequences + 1> state_start_loc{}; // First temporary GDN-state snapshot for each query.
+  uint32_t size = 0, drafts = 0;
+};
+```
+
+Each `Query` describes one sequence's work for this pass: its native sequence, input tokens, committed `kv_valid`, execution row count, output-logit
+position, and whether it performs speculative verification or produces a sampled token.
+
+`query_start_loc` is the prefix sum of query row counts. Query `i` occupies packed activation rows
+`[query_start_loc[i], query_start_loc[i + 1])`, and `query_start_loc[size]` is the total row count. Kernels use these offsets to recover the sequence
+that owns each packed row.
+
+`state_start_loc` is the equivalent prefix sum for temporary GDN-state snapshots. A speculative query stores one snapshot after the anchor and one
+after each proposed token; ordinary queries contribute no state rows. After verification, the accepted count selects the snapshot copied into the
+sequence's inactive GDN bank. The snapshots themselves live in each layer's `candidateConv` and `candidateRecurrent` buffers.
+
+`size` is the number of active queries, while `drafts` is the common number of proposals used by speculative queries in the batch.

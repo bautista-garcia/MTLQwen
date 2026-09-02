@@ -64,13 +64,21 @@ The engine fixes:
 
 ```text
 B = token-addressed KV block size
-K_max = maximum draft proposals per target query
-max_sequences_in_batch = maximum execution batch rows
+K_max(drafter) = maximum configured draft proposals for one target query
+max_sequences_in_batch = 8
+max_draft_tokens = 7
+max_candidate_rows = max_sequences_in_batch * (max_draft_tokens + 1) = 64
+max_gdn_checkpoints = 8
 
 B >= 1
-K_max >= 0
-max_sequences_in_batch >= 1
+K_max(none) = 0
+K_max(mtp) = 4
+K_max(dflash) = max_draft_tokens
 ```
+
+`max_draft_tokens` is the single engine-wide proposal bound. A drafter may support less, but no configured proposal count
+may exceed it. Deriving the candidate-row capacity from the same bound makes every eight-sequence batch admissible.
+`max_gdn_checkpoints` is a separate memory budget for cached hybrid prefix snapshots; it is not derived from slot count.
 
 The CPU allocator owns:
 
@@ -85,20 +93,22 @@ A physical block ID identifies a bundle of placement-heap tiles:
 CacheBundle {
     target_key_tiles[layer]
     target_value_tiles[layer]
-    persistent_drafter_key_tile?  // present when the drafter needs token-addressed persistent state
-    persistent_drafter_value_tile?
+    persistent_drafter_key_tiles[layer]?  // present when the drafter needs token-addressed persistent state
+    persistent_drafter_value_tiles[layer]?
 }
 ```
 
-Execution uses two target placement-sparse buffers and one optional persistent-drafter buffer. The target buffers have
-one virtual region per attention layer; the drafter buffer has K and V regions. Each live logical binding installs the
-corresponding hardware mappings:
+Execution uses separate target K/V placement-sparse buffers. MTP combines its single persistent K/V layer in one sparse
+buffer, while DFlash uses separate K/V buffers containing all six layers. This minimizes resource count without exceeding
+the per-buffer virtual-size limit at the maximum context. Resource boundaries do not give caches or layers independent
+allocation or validity. Each live logical binding installs the corresponding hardware mappings:
 
 ```text
 virtual_block = slot * max_logical_blocks + logical_block_id
 sparse_mapping[(target_keys, layer, virtual_block)] = CacheBundle[physical_block_id].target_key_tiles[layer]
 sparse_mapping[(target_values, layer, virtual_block)] = CacheBundle[physical_block_id].target_value_tiles[layer]
-sparse_mapping[(drafter_kv, K_or_V, virtual_block)] = CacheBundle[physical_block_id].persistent_drafter_*_tile
+sparse_mapping[(drafter_keys, layer, virtual_block)] = CacheBundle[physical_block_id].persistent_drafter_key_tiles[layer]
+sparse_mapping[(drafter_values, layer, virtual_block)] = CacheBundle[physical_block_id].persistent_drafter_value_tiles[layer]
 ```
 
 The CPU logical binding is allocation and ownership metadata. The sparse mapping is the execution-time virtual-to-physical translation performed by Metal's MMU; it is not uploaded as a GPU page-table tensor. Every target and drafter tile in the bundle shares the same physical block ID, logical binding, reference count, allocation, and eviction lifetime.
@@ -138,14 +148,26 @@ candidate_start_loc[row + 1] = candidate_start_loc[row] + candidate_width[row]
 required_candidate_rows = candidate_start_loc[batch_size]
 
 gdn_candidate_capacity >= required_candidate_rows
-gdn_candidate_capacity <= max_sequences_in_batch * (K_max + 1)
+required_candidate_rows <= max_candidate_rows
+gdn_candidate_capacity <= max_candidate_rows
 ```
 
-The arena grows on demand to the largest verification batch observed and need not shrink. It is not permanently allocated at the maximum size. Logical candidate column `i` contains the state after the anchor and `i` accepted draft tokens:
+For proposal counts `K[row]` across speculative rows:
+
+```text
+required_candidate_rows = sum(K[row] + 1)
+K[row] <= max_draft_tokens
+N_speculative <= max_sequences_in_batch
+required_candidate_rows <= max_sequences_in_batch * (max_draft_tokens + 1) = max_candidate_rows
+```
+
+The 64-row bound limits the hybrid GDN snapshots retained across all target layers. The arena grows on demand to the
+largest admitted verification batch and need not shrink; it never grows beyond `max_candidate_rows`. Logical candidate
+column `i` contains the state after the anchor and `i` accepted draft tokens:
 
 ```text
 gdn_candidates[row][i] = state after anchor + first i draft tokens
-0 <= i <= draft_count <= K_max
+0 <= i <= draft_count <= K_max(drafter)
 
 physical_candidate_row = candidate_start_loc[row] + i
 ```
@@ -178,7 +200,9 @@ prefix_hash[i] = hash(
 )
 ```
 
-`cache_namespace` must distinguish any configuration that changes the resulting cache state, including the target model, active adapter, and configured drafter.
+`cache_namespace` must distinguish any configuration that changes the resulting cache state, including the target model,
+active adapter, and configured drafter. A prefix cache owned by one immutable model instance supplies this namespace
+implicitly and may use a fixed initial hash.
 
 After any post-forward commit, publish every newly completed block containing valid entries for every enabled token-addressed cache group. Tentative speculative KV and partial blocks are never published.
 
@@ -485,11 +509,11 @@ The drafter uses the sequence's slot and its K/V region views to retrieve persis
 The number of proposals allowed in the round is:
 
 ```text
-proposal_limit = K_max
+proposal_limit = K_max(drafter)
 
 if hybrid:
     next_checkpoint = (floor(kv_valid / C) + 1) * C
-    proposal_limit = min(K_max, next_checkpoint - kv_valid - 1)
+    proposal_limit = min(K_max(drafter), next_checkpoint - kv_valid - 1)
 ```
 
 The drafter returns at most `proposal_limit` token IDs and temporarily appends them to `request`. If the limit is zero, the round bypasses the drafter. Drafting does not change target-model `kv_valid`.
@@ -534,7 +558,17 @@ query = request[start_pos : start_pos + token_count]
 
 Ordinary generation contributes one anchor. Speculative generation contributes the anchor followed by all temporarily attached proposals.
 
-The scheduling policy chooses which queries enter the batch while respecting token and KV-memory budgets. It may favor `tg`/decode to reduce inter-token latency, favor `pp`/prefill to improve throughput, or mix both. The policy does not change the state contract.
+Before reservation or dispatch, the selected batch must satisfy:
+
+```text
+batch_size <= max_sequences_in_batch
+required_candidate_rows = sum(1 + draft_count[row] for each speculative row)
+required_candidate_rows <= max_candidate_rows
+```
+
+Ordinary prompt and decode rows consume no candidate rows. Because proposal and batch limits derive the candidate bound,
+every otherwise-valid batch fits the arena. The scheduling policy chooses queries while respecting token and KV-memory
+budgets. It may favor `tg`/decode to reduce inter-token latency, favor `pp`/prefill to improve throughput, or mix both.
 
 The selected queries are concatenated in batch order:
 
@@ -612,9 +646,13 @@ The target model receives:
 )
 ```
 
-The GDN inputs are passed only for a hybrid model. Every row reads its active committed bank. An ordinary row writes its final state directly to the inactive bank. A speculative row writes `draft_count + 1` logical candidate columns into its assigned slice of the demand-sized candidate arena. Candidate capacity is ensured before the forward starts.
+The GDN inputs are passed only for a hybrid model. Every row reads its active committed bank. An ordinary row writes its
+final state directly to the inactive bank. A speculative row writes `draft_count + 1` logical candidate columns into its
+assigned slice of the demand-sized, 64-row-bounded candidate arena. Candidate capacity is ensured before the forward starts.
 
-No logical-to-physical table is uploaded. The sparse mappings were established during reservation, and each attention dispatch binds the current layer's views into the shared target-key and target-value buffers (or the MTP buffer's K/V views). A resource-state-to-dispatch barrier orders mapping updates before the compute pass.
+No logical-to-physical table is uploaded. The sparse mappings were established during reservation, and each attention
+dispatch binds the current layer's views into the target or drafter K/V buffers. A resource-state-to-dispatch barrier
+orders mapping updates before the compute pass.
 
 For batch row `i`:
 ```text
@@ -791,4 +829,5 @@ To preserve the contract:
 - treat `gdn_bank` only as publication metadata for an already selected `kv_valid` boundary, never as another progress cursor;
 - do not add a persistent proposal list—the temporary suffix of `request` already represents it;
 - treat CPU logical bindings and hardware sparse mappings as placement and capacity, never as validity;
+- admit at most eight execution rows and at most 64 speculative candidate rows per target batch;
 - do not store positions, query lengths, `query_start_loc`, or `candidate_start_loc` per sequence—they are batch derivations.
