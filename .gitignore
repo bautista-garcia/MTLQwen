@@ -72,3 +72,7 @@ llama-speedup/
 attention_decode_dataflow*
 
 research/
+
+/demo
+
+.tmp-video-sync/
