@@ -1,7 +1,7 @@
 # Qwen3.5 Metal inference engine
 
 This document describes the checked-in engine. The state rules come from
-[`INFERENCE_ENGINE_STATE_CONTRACT.md`](../../INFERENCE_ENGINE_STATE_CONTRACT.md); Section 10 records where the implementation deliberately or currently differs.
+[`INFERENCE_ENGINE_STATE_CONTRACT.md`](INFERENCE_ENGINE_STATE_CONTRACT.md); Section 10 records where the implementation deliberately or currently differs.
 
 ## 1. Scope and fixed limits
 
@@ -34,9 +34,9 @@ DFlash:  maximum 7, default 7, separate draft GGUF required
 
 DFlash ignores embedded MTP tensors. The implementation has no drafter auto-detection.
 
-The execution path is [`runtime/inference.py`](../../runtime/inference.py) for request state and scheduling,
-[`model/qwen.cpp`](../../model/qwen.cpp) for the native transaction, [`model/qwen_ops.cpp`](../../model/qwen_ops.cpp) for graph encoding, and
-[`device.cpp`](device.cpp) plus [`kernel/`](kernel/) for Metal resources and compute.
+The execution path is [`runtime/inference.py`](runtime/inference.py) for request state and scheduling,
+[`model/qwen.cpp`](model/qwen.cpp) for the native transaction, [`model/qwen_ops.cpp`](model/qwen_ops.cpp) for graph encoding, and
+[`device.cpp`](backend/metal/device.cpp) plus [`kernel/`](backend/metal/kernel/) for Metal resources and compute.
 
 ## 2. State ownership
 
