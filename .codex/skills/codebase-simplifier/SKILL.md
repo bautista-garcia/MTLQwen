@@ -19,6 +19,8 @@ Make the system genuinely smaller and easier to understand. A lower line count i
 
 Do not claim a simplification by moving code around. In particular, do not split a source file into multiple files, move code into wrappers or helpers, rename complexity, or hide it behind generated code solely to lower per-file or diff line counts. Add a file or extraction only when it independently improves a stable boundary, ownership, or reuse; explain that reason and do not count it as the simplification itself.
 
+Run the repository's formatter on both the baseline and the final code before measuring line reduction, and leave changed files formatted. Report only the formatted line-count difference. Joining independent statements, declarations, branches, loops, or functions onto fewer physical lines never counts as simplification. If the repository has no formatter, preserve its established layout and exclude formatting-only changes from the reported reduction.
+
 Do not trade behavior, diagnostics, safety checks required by real inputs, performance-critical invariants, or test coverage for fewer lines without explicit authorization.
 
 ## Method
