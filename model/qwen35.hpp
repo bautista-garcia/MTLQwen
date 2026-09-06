@@ -1,9 +1,9 @@
 #pragma once
 #include "backend/metal/device.hpp"
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <exception>
 #include <filesystem>
 #include <mutex>
 #include <thread>
@@ -61,7 +61,7 @@ struct DrafterWeights {
 struct Scratch {
   bool decodeMode = false;
   Tensor hidden[2], inputNorm, postNorm, padInput, mlpGate, mlpUp, mlpMixed;
-  Tensor attnQG, attnK, attnV, attnQRope, attnKRope, attnOut, attnGated, attnPartials;
+  Tensor attnQG, attnK, attnV, attnQRope, attnKRope, attnOut, attnPartials;
   Tensor gdnMixed, gdnZ, gdnB, gdnG, gdnConvolved, gdnQ, gdnK, gdnV, gdnDelta;
   Tensor mid, targetHidden, dflashFeatures, targetLogits;
   void ensure(Device& device, uint32_t rows, Drafter drafter);
@@ -103,14 +103,14 @@ struct Engine {
   Tensor gdnStates[2], candidateStates;
   Scratch workspace;
   Tensor inputIds, batchKvValid, queryStartLoc, draftPositions, sequenceSlots, stateBanks;
-  Tensor draftTokens, outputTokens, rng, mtpSeeds, logitRows;
+  Tensor draftTokens, outputTokens, sampledRng, rng, mtpSeeds, logitRows;
   std::vector<PhysicalBlock> blocks;
   std::unordered_map<uint64_t, HybridCheckpoint> checkpointCache;
   std::array<Sequence*, maxBatchSequences> sequences{};
   std::mutex mutex;
   std::condition_variable condition;
   std::thread worker;
-  bool closing = false, running = false;
+  std::atomic_bool closing = false;
   uint64_t clock = 0;
   uint32_t physicalBlocks = 0;
   uint64_t parameterCount = 0, modelBytes = 0;
@@ -123,19 +123,20 @@ struct Engine {
     return workspace;
   }
   uint32_t acquireBlock();
-  void reserve(const Batch& batch);
+  bool reserve(const Batch& batch);
   void bind(Sequence& sequence, uint32_t logical, uint32_t physical);
+  void commitCandidate(Device& commands, Sequence& sequence, uint32_t stateRow, uint32_t queryRow, uint32_t accepted);
   uint32_t lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_t length);
   void publishPrefix(Sequence& sequence, uint32_t oldValid, uint32_t valid);
   void schedule();
-  void execute(Batch& batch);
+  bool execute(Batch& batch);
 };
 struct Sequence {
   Engine& engine;
   std::vector<int32_t> request;
   std::vector<uint32_t> bindings;
   std::vector<int32_t> stops;
-  std::exception_ptr error;
+  bool error = false;
   uint64_t drafted = 0, accepted = 0, prefixHash = 0;
   uint32_t kvValid = 0;
   uint32_t slot, bank = 0, draftTokens;
@@ -146,6 +147,8 @@ struct Sequence {
   ~Sequence();
 };
 Tensor mtpSeed(Engine& engine, const Sequence& sequence, uint32_t bank);
+void copyGdnState(Device& commands, const Tensor& source, uint32_t sourceRows, uint32_t sourceRow, const Tensor& destination,
+                  uint32_t destinationRows, uint32_t destinationRow);
 void draft(Engine& engine, Batch& batch, uint32_t drafts);
 void forward(Engine& engine, Batch& batch, uint32_t drafts, uint32_t stateRows);
 } // namespace infeng::qwen35
