@@ -1,436 +1,547 @@
 # Qwen3.5 Metal inference engine
 
-This document describes the checked-in engine. The state rules come from
-[`INFERENCE_ENGINE_STATE_CONTRACT.md`](INFERENCE_ENGINE_STATE_CONTRACT.md); Section 10 records where the implementation deliberately or currently differs.
+MTLQwen is a specialized Qwen3.5-9B inference engine for Apple GPUs. Python tokenizes input and reads generated tokens. C++ owns the model, memory, sequence state, continuous scheduler, batching, prefix cache, speculative decoding, and Metal execution.
 
-## 1. Scope and fixed limits
+At most eight sequences are live and one model pass is in flight per engine.
 
-The engine is a specialized Qwen3.5-9B runtime for Apple GPUs with Metal 4 placement-sparse buffers.
+## End-to-end flow
 
-```text
-target layers               = 32
-full-attention layers       = 8, at layers 3, 7, ..., 31
-GDN layers                  = 24
-hidden size                 = 4096
-MLP size                    = 12288
-vocabulary                  = 248320
-KV block size               = 128 tokens
-maximum context             = 65536 tokens
-maximum live/batched slots  = 8
-maximum packed target rows  = 128
-maximum draft tokens        = 7
-maximum GDN candidate rows  = 8 * (7 + 1) = 64
-GDN checkpoint interval     = 512 tokens
-maximum cached checkpoints  = 8
+### 1. Create the engine
+
+Python creates one native `Engine`. During construction, C++:
+
+1. Maps the GGUF weights.
+2. Compiles the Metal source libraries and builds the required pipelines.
+3. Allocates model-wide control buffers, GDN state, RNG state, RoPE tables, and sparse virtual K/V buffers.
+4. Starts the scheduler thread.
+
+The state-bearing fields of the real `Engine` are:
+
+```cpp
+struct Engine {
+  Device device;                              // Metal device, pipelines, commands, and allocations
+  uint32_t maxContext;                        // Maximum computed tokens in one sequence
+  std::unique_ptr<SparseKV> kv;               // Model-wide sparse K/V address space and physical heaps
+
+  Tensor embedding, norm, rope, dflashRope;   // Target embeddings, final norm, and RoPE tables
+  Linear head;                                // Shared language-model head
+  std::array<Layer, targetLayers> layers;      // 32 target-model layers
+  DrafterWeights draftModel;                  // MTP or DFlash weights when enabled
+  Drafter drafter = Drafter::none;            // Active drafting strategy
+
+  Tensor gdnStates[2], candidateStates;        // Persistent GDN banks and temporary speculative states
+  Scratch workspace;                          // Grow-only reusable forward-pass scratch
+
+  Tensor inputIds, batchKvValid;               // Packed input tokens and starting positions
+  Tensor queryStartLoc, draftPositions;        // Packed-query boundaries and MTP positions
+  Tensor sequenceSlots, stateBanks;            // Slot and current-bank metadata sent to kernels
+  Tensor draftTokens, outputTokens;            // Draft proposals and target samples
+  Tensor rng, mtpSeeds, logitRows;              // Per-slot RNG, banked MTP seeds, and sampled row indices
+
+  std::vector<PhysicalBlock> blocks;            // Physical bundle reference and LRU metadata
+  std::unordered_map<uint64_t, HybridCheckpoint> checkpointCache; // Prefix checkpoints by chained hash
+  std::array<Sequence*, maxBatchSequences> sequences{};            // Eight live-sequence slots
+
+  std::mutex mutex;                             // Protects sequence and scheduler state
+  std::condition_variable condition;            // Wakes the scheduler and blocked readers
+  std::thread worker;                            // Continuous scheduler thread
+  bool closing = false, running = false;         // Engine shutdown and in-flight-pass state
+  uint64_t clock = 0;                            // LRU clock for blocks and checkpoints
+  uint32_t physicalBlocks = 0;                   // Physical bundle IDs introduced so far
+  uint64_t parameterCount = 0, modelBytes = 0;   // Model information exposed to Python
+};
 ```
 
-The active drafter is fixed when the model is created:
+### 2. Create a sequence and assign its slot
 
-```text
-none:    maximum 0 proposals
-MTP:     maximum 4, default 2, tensors read from the target GGUF
-DFlash:  maximum 7, default 7, separate draft GGUF required
+Python creates a sequence with fixed stop, sampling, and drafting configuration:
+
+```python
+sequence = engine.sequence(
+    stop_token_ids=...,
+    temperature=...,
+    top_p=...,
+    top_k=...,
+    draft_tokens=...,
+)
 ```
 
-DFlash ignores embedded MTP tensors. The implementation has no drafter auto-detection.
+C++ immediately finds a free entry in `Engine.sequences`. Its index becomes `Sequence.slot`.
 
-The execution path is [`runtime/inference.py`](runtime/inference.py) for request state and scheduling,
-[`model/qwen.cpp`](model/qwen.cpp) for the native transaction, [`model/qwen_ops.cpp`](model/qwen_ops.cpp) for graph encoding, and
-[`device.cpp`](backend/metal/device.cpp) plus [`kernel/`](backend/metal/kernel/) for Metal resources and compute.
+The real `Sequence` is:
 
-## 2. State ownership
+```cpp
+struct Sequence {
+  Engine& engine;                    // Engine that owns the slot and executes this sequence
+  std::vector<int32_t> request;      // Prompt and generated tokens in exact model order
+  std::vector<uint32_t> bindings;    // Logical K/V block -> physical bundle ID
+  std::vector<int32_t> stops;        // Token IDs that end generation
+  std::exception_ptr error;          // Failure observed by Python on its next read
 
-Python owns request policy:
+  uint64_t drafted = 0;              // Total proposals generated
+  uint64_t accepted = 0;             // Total proposals accepted by the target
+  uint64_t prefixHash = 0;            // Chained hash through the committed full blocks
+  uint32_t kvValid = 0;               // Number of tokens committed to target K/V and GDN state
 
-```text
-Session {
-    sequence_id
-    native handle
-    request
-    kv_valid
-    phase                 // pp | tg
-    outputs               // committed speculative tokens awaiting delivery
-    sampling and stop configuration
-    chat-formatting state
-    closed
-}
+  uint32_t slot;                      // Index in Engine.sequences and all per-slot GPU state
+  uint32_t bank = 0;                  // GDN bank containing the current committed state
+  uint32_t draftTokens;               // Fixed requested proposal width
+  float temperature, topP;            // Fixed sampling configuration
+  int32_t topK;                        // Fixed sampling candidate limit
+  bool active = false, busy = false;   // May continue; currently belongs to an in-flight batch
+};
 ```
 
-The native (c++) sequence owns only execution placement:
+Creation allocates no physical K/V memory. `bindings` starts entirely `unbound`.
+
+### 3. Append prompt tokens
+
+Python tokenizes text when necessary and calls `Sequence.append()`. C++:
+
+1. Appends the IDs to `Sequence.request`.
+2. Sets `active = true`.
+3. Wakes the scheduler.
+4. Returns `request.size()` as Python's first output cursor.
+
+The central invariant is:
 
 ```text
-Sequence {
-    slot
-    bindings[logical_block]
-    bank
-}
+request[0 : kvValid]  has completed the target pass
+request[kvValid : ]   still requires a target pass
+
+0 <= kvValid <= request.size()
 ```
 
-The model owns weights, pipelines, the shared physical-block pool, prefix hashes, hybrid checkpoints, both GDN banks, MTP seed banks, batch controls, RNG state, and reusable scratch.
-
-The authoritative validity invariant is:
+The sequence is ready for scheduling when:
 
 ```text
-request[:kv_valid] = tokens committed in target KV, enabled drafter KV, and GDN state
-request[kv_valid:] = tokens not represented by committed persistent state
-
-0 <= kv_valid <= len(request)
+active && !busy && request.size() > kvValid
 ```
 
-Bindings describe allocated address space. Writes beyond `kv_valid` are tentative even when the physical block remains mapped.
-
-During ordinary generation:
+New prompt tokens may be appended only between passes:
 
 ```text
-len(request) = kv_valid + 1
-request[kv_valid] = the uncomputed anchor
+!active && !busy
 ```
 
-If a stop token was accepted during verification, the turn may instead end with:
+### 4. Select the next batch
+
+The scheduler waits until at least one sequence is ready, allows a short coalescing window, and scans all eight entries in `Engine.sequences`.
+
+Every ready sequence enters the next `Batch` and becomes `busy`. Batch membership is then fixed; sequences activated during the pass remain available for the next scan.
+
+The real `Batch` is:
+
+```cpp
+struct Batch {
+  std::array<Query, maxBatchSequences> queries{}; // One query per selected sequence
+  uint32_t size = 0;                              // Number of selected sequences
+};
+```
+
+At this point each query contains only its `Sequence*`. The remaining fields are derived after prefix lookup.
+
+### 5. Restore a cached prefix
+
+Only a selected sequence with `kvValid == 0` performs prefix lookup.
+
+The engine hashes consecutive 128-token blocks. A cache hit is usable only at a 512-token boundary and must leave at least one request token for a target pass.
+
+For the deepest usable hit, C++:
+
+1. Copies the cached GDN state into bank 0.
+2. Restores the bank-0 MTP seed when MTP is active.
+3. Maps the cached physical K/V bundles into this sequence's slot.
+4. Records those bundle IDs in `Sequence.bindings`.
+5. Sets `bank = 0` and advances `kvValid` to the checkpoint boundary.
+
+Without a hit, `kvValid` remains zero.
+
+### 6. Apply the scheduling policy and build each query
+
+After prefix restoration, the scheduler computes:
 
 ```text
-len(request) = kv_valid
+pending = request.size() - kvValid
+
+pending > 1  prompt processing
+pending == 1 ordinary decode or speculative verification
 ```
 
-The next turn reuses the same session. If its first input token repeats that committed boundary token, `_attach` removes the overlap before appending the new prompt. Closing the session, rather than an `eos` phase, releases its native state.
+Every selected sequence first receives one target row. The remaining capacity is assigned in this order:
 
-## 3. Model and Metal initialization
+1. Speculative queries reserve their shared proposal width.
+2. The rows still available are divided among prompt queries.
+3. Ordinary decode queries remain one row wide.
 
-Model creation performs the following work once:
-
-1. Memory-map the target GGUF and, for DFlash, the draft GGUF. Weight tensors remain views into those mappings.
-2. Compile every `.metal` source in `backend/metal/kernel` and lazily create pipelines by function name.
-3. Select quantized linear pipelines from tensor type and shape. The implemented weight formats are Q4_K, Q5_K, Q6_K, Q8_0, and IQ4_XS.
-4. Build the 32 target layers and the selected drafter.
-5. Precompute target RoPE and, when needed, DFlash RoPE for the complete configured context.
-6. Allocate shared CPU/GPU batch controls, two GDN banks per slot, two MTP seed banks when MTP is active, and per-slot RNG state.
-7. Reserve sparse virtual KV address space. Placement heaps and physical pages are allocated only on demand.
-
-Activations use one grow-only private arena. It is rounded to 32 rows and reused through non-overlapping tensor views. Linear kernels use the decode path when the largest query in the batch has at most five rows; larger queries use padded prefill kernels.
-
-Every compute command buffer starts with a resource-state-to-dispatch barrier. Dispatches are device-visible to later dispatches. Submission is synchronous: the CPU waits on a shared event before command memory is reset or cache mappings can be removed.
-
-## 4. Persistent cache
-
-### 4.1 Sparse KV bundles
-
-For configured context `T`:
+For a two-sequence batch, this can produce:
 
 ```text
-max_logical_blocks = ceil(T / 128)
-virtual_blocks      = 8 * max_logical_blocks
-physical_pool_limit = max_logical_blocks
-virtual_block       = slot * max_logical_blocks + logical_block
+ordinary decode + long prompt       1 + 127 rows
+2-proposal verification + long prompt 3 + 125 rows
 ```
 
-The physical pool therefore holds one configured context worth of block bundles shared by all eight slots. It does not hold eight complete contexts.
+The limits are:
+
+```text
+selected sequences <= 8
+total target rows  <= 128
+query end          <= next 512-token checkpoint boundary
+```
+
+The shared proposal width is the minimum allowed by the active drafter, each participating sequence's `draftTokens`, and its remaining room before the next checkpoint.
+
+The real `Query` is:
+
+```cpp
+struct Query {
+  Sequence* sequence = nullptr; // Persistent state advanced by this query
+  uint32_t count = 1;           // Target rows: prompt chunk, one anchor, or anchor + proposals
+  uint32_t logit = unbound;     // Offset in sampled results; unbound for an intermediate prompt chunk
+  uint32_t state = unbound;     // First row in candidateStates; unbound when not speculative
+};
+```
+
+`Query` and `Batch` exist only for this pass. Tokens, K/V bindings, GDN state, and sampling configuration remain owned by `Sequence` and `Engine`.
+
+### 7. Reserve and bind sparse K/V memory
+
+Now that every `Query.count` is known, `Engine::reserve()` calculates the 128-token logical blocks touched by the batch.
+
+For each unbound logical block, C++:
+
+1. Adds physical heap capacity if required.
+2. Acquires a free or evictable physical K/V bundle.
+3. Installs the Metal sparse mappings for every K/V layer.
+4. Stores the bundle ID in `Sequence.bindings[logicalBlock]`.
+
+```text
+logicalBlock = tokenPosition / 128
+virtualBlock = slot * blocksPerSlot + logicalBlock
+
+bindings[logicalBlock] = physicalBundleId
+```
+
+`bindings` does not contain addresses. It is CPU metadata describing which physical bundle backs each logical block. `SparseKV::map()` installs the actual virtual-tile-to-physical-tile mappings used by Metal's MMU.
+
+All required mappings exist before any model kernel runs.
+
+### 8. Pack inputs and kernel metadata
+
+C++ packs all query tokens into `Engine.inputIds` and builds one prefix sum:
+
+```text
+queryStartLoc[0] = 0
+queryStartLoc[i + 1] = queryStartLoc[i] + query[i].count
+```
+
+For example:
+
+```text
+queryStartLoc = [0, 3, 4]
+
+query 0 uses inputIds[0 : 3]
+query 1 uses inputIds[3 : 4]
+```
+
+The complete per-pass metadata is:
+
+```text
+inputIds       packed input and proposal tokens
+queryStartLoc  start and end of every packed query
+batchKvValid   starting token position of every query
+sequenceSlots  slot containing each query's sparse K/V, GDN state, and RNG
+stateBanks     current Sequence.bank for every query
+logitRows      packed rows that require sampling
+draftPositions absolute positions used by MTP proposals
+```
+
+Kernels never receive a `Sequence*` or `Query*`. C++ translates their state into these flat buffers, tensor views, and scalar arguments.
+
+### 9. Optionally produce draft proposals
+
+Drafting is used only when a sequence has one pending anchor and a nonzero `draftTokens`. It does not advance `kvValid`.
+
+#### Target only
+
+The anchor goes directly to the target pass.
+
+#### MTP
+
+MTP starts from the anchor and the committed MTP seed. Its single layer generates proposals sequentially and stores them in `Engine.draftTokens`.
+
+#### DFlash
+
+DFlash packs each speculative query as an anchor followed by mask tokens. Its six layers process that packed input once and write the greedy proposals into `Engine.draftTokens`.
+
+All three branches now join the same target pass.
+
+### 10. Run the target model
+
+The target input for each query is:
+
+```text
+prompt query      next Query.count request tokens
+ordinary decode  one pending anchor
+speculative       anchor followed by draft proposals
+```
+
+C++ binds the packed metadata, model weights, reusable scratch, GDN buffers, and sparse K/V resources to the kernels. The target pass:
+
+1. Embeds the packed rows.
+2. Runs 24 GDN layers and 8 full-attention layers.
+3. Writes target K/V through the sequence's sparse virtual addresses.
+4. Produces logits only for the rows marked by `logitRows`.
+5. Samples with greedy argmax or the sequence's fixed sampling configuration.
+6. Updates persistent drafter K/V and MTP seed data when applicable.
+
+Attention uses `sequenceSlots` and token positions to address K/V. Metal's MMU follows the mappings installed in step 7.
+
+GDN uses two persistent banks per slot:
+
+```text
+read bank  = Sequence.bank
+write bank = 1 - Sequence.bank
+```
+
+### 11. Commit the result and select speculative candidates
+
+Every successful query switches banks, whether it processed a prompt, ordinary decode, or speculative verification.
+
+For non-speculative work, GDN kernels write the final state directly into:
+
+```text
+Engine.gdnStates[1 - Sequence.bank]
+```
+
+For speculative work, every verified position could become the accepted endpoint. GDN therefore writes one state after the anchor and one after each proposal into one engine-owned buffer shared by the speculative queries in that pass:
+
+```text
+Engine.candidateStates
+```
+
+Each candidate row contains the convolution and recurrent state of all 24 GDN layers. The buffer uses private GPU storage; “shared” here means that all queries use the same allocation.
+
+The candidate location is carried by `Query.state`:
+
+```text
+candidate selected for A accepted proposals = Query.state + A
+```
+
+After target samples are compared with the proposals, C++ copies that candidate into `gdnStates[1 - bank]`. Rejected candidates are ignored.
+
+`stateBanks` contains the current bank bit packed for GPU work. It does not contain candidate states or candidate offsets; those live in `candidateStates` and `Query.state` respectively.
+
+C++ then commits each sequence:
+
+```text
+prompt or ordinary  kvValid += Query.count
+speculative         kvValid += 1 anchor + accepted proposals
+
+append sampled or accepted tokens to request
+update RNG and speculative counters
+bank ^= 1
+```
+
+After the flip, `bank` names the newly committed GDN state. MTP seeds follow the same bank bit.
+
+The commit restores the invariant before readers are notified:
+
+```text
+request[0 : kvValid]  has valid target K/V and GDN state
+request[kvValid : ]   is pending work
+```
+
+Complete 128-token blocks extend the sequence's prefix hash. At an exact 512-token boundary, the engine may publish a new prefix checkpoint.
+
+### 12. Continue, stream, or stop
+
+If the sequence remains active and `request.size() > kvValid`, the scheduler discovers it in the next scan. This single rule drives prompt continuation, ordinary decoding, and speculative verification; no explicit requeue exists.
+
+Generated tokens are already appended to `Sequence.request`. Python calls:
+
+```python
+token = sequence.read(cursor)
+cursor += 1
+```
+
+The cursor belongs to the caller. `read()` waits while the requested token has not appeared and generation is still active. It returns `None` after the sequence becomes inactive and the cursor has consumed every available token.
+
+C++ clears `active` when:
+
+```text
+a stop token is generated
+kvValid reaches maxContext
+the caller cancels
+execution fails
+```
+
+A frontend output limit is implemented by calling `cancel()` after reading the requested number of tokens.
+
+### 13. Close the sequence
+
+Closing a sequence:
+
+1. Clears `active`.
+2. Waits for its in-flight batch, if any.
+3. Unmaps every bundle recorded in `Sequence.bindings`.
+4. Decrements the physical bundle reference counts.
+5. Clears `Engine.sequences[slot]`.
+
+The slot can then be reused by another sequence.
+
+## Appendix A: sparse K/V memory
+
+Each slot receives enough sparse virtual address space for `maxContext`, but all slots share one physical pool:
+
+```text
+blocksPerSlot       = ceil(maxContext / 128)
+virtualBlockCount   = 8 * blocksPerSlot
+physicalBundleLimit = blocksPerSlot
+```
+
+The state-bearing fields of the real `SparseKV` are:
+
+```cpp
+class SparseKV {
+  static constexpr uint64_t pageBytes = 256ull << 10; // One Metal sparse tile
+  static constexpr uint64_t heapBytes = 64ull << 20;  // One placement heap
+  Device& device;                                      // Installs sparse mappings
+  uint32_t virtualBlocks;                              // Virtual blocks across all slots
+  uint32_t maxPhysicalBlocks;                          // Shared physical bundle limit
+  uint32_t layers;                                     // Target plus drafter K/V layers
+  uint32_t tilesPerBlock;                              // Two tiles per layer: K and V
+  uint32_t physicalBlocks = 0;                         // Bundles backed by current heaps
+  uint32_t blocksPerHeap;                              // Complete bundles fitting in one heap
+  uint64_t regionBytes;                                // Virtual bytes in one layer region
+  Tensor resources[2];                                 // Sparse K resource and sparse V resource
+  std::vector<NS::SharedPtr<MTL::Heap>> heaps;         // Physical 64 MiB placement heaps
+};
+```
 
 One physical ID owns a complete 128-token bundle:
 
 ```text
-target only:  8 K tiles + 8 V tiles                         = 4 MiB
-MTP:          target tiles + 1 MTP K tile + 1 MTP V tile   = 4.5 MiB
-DFlash:       target tiles + 6 DFlash K tiles + 6 V tiles  = 7 MiB
+target only  8 K + 8 V tiles                 = 4 MiB
+MTP          target + 1 MTP K + 1 MTP V      = 4.5 MiB
+DFlash       target + 6 DFlash K + 6 V       = 7 MiB
 ```
 
-Each tile is one 256 KiB sparse page. Pages are backed by 64 MiB placement heaps.
+Physical bundle metadata is:
 
-The sparse resources are:
+```cpp
+struct PhysicalBlock {
+  uint32_t refs = 0; // Number of live sequence bindings using this bundle
+  uint64_t touch = 0; // Last-use clock for eviction
+};
+```
 
 ```text
-target:  one 8-region K buffer and one 8-region V buffer
-MTP:     one 2-region buffer containing K then V
-DFlash:  one 6-region K buffer and one 6-region V buffer
+refs > 0  bundle is pinned by a live sequence
+refs == 0 bundle may be reused by the LRU allocator
 ```
 
-At the 65,536-token maximum, one region spans 1 GiB across all slots. Splitting the resources keeps each sparse buffer within the device limit.
+If every physical bundle is pinned, allocation fails with `KV block pool has no evictable capacity`.
 
-Attention binds the current layer's region view. The shader addresses:
+## Appendix B: prefix checkpoints
+
+Attention K/V alone cannot restore Qwen3.5 because its GDN layers also carry recurrent state. A reusable prefix therefore needs both sparse bindings and a GDN checkpoint:
+
+```cpp
+struct HybridCheckpoint {
+  Tensor arena;                   // Copied GDN state and optional MTP seed
+  std::vector<uint32_t> bindings; // Physical bundle IDs through the boundary
+  uint64_t touch = 0;             // Last-use clock for checkpoint eviction
+};
+```
+
+Hashes are chained from block zero, so a cache entry identifies the entire preceding token prefix. The cache is local to one engine and retains up to eight LRU checkpoints.
+
+## Appendix C: weights and pipelines
+
+The engine maps each GGUF once and creates `Tensor` views into the mapped bytes. It does not copy individual weights.
+
+During model construction:
+
+1. Tensor names are resolved from the GGUF metadata.
+2. Shapes and quantization types select the matching Metal linear kernels.
+3. Pipeline states are created when first requested during model construction and cached by kernel name.
+4. The 32 target layers are assembled from those tensor views and pipelines.
+5. MTP layers come from the combined target/MTP GGUF; DFlash layers come from its separate GGUF.
+
+The target topology is fixed:
 
 ```text
-slot * (max_logical_blocks * 128) + token_position
+hidden size       4096
+MLP size          12288
+target layers     32
+GDN layers        24
+full-attention    8
 ```
 
-Metal's MMU resolves the mapped page. No GPU page-table tensor or physical-block lookup is used by a shader.
+## Appendix D: reusable and temporary buffers
 
-### 4.2 Allocation and references
+`Engine.workspace` is one grow-only `Scratch` arena. It expands when a pass needs more packed rows, then its tensor views are reused by later passes.
+
+```cpp
+struct Scratch {
+  bool decodeMode = false;                    // Selects decode or prefill linear kernels
+  Tensor hidden[2], inputNorm, postNorm;       // Ping-pong hidden states and normalization outputs
+  Tensor padInput, mlpGate, mlpUp, mlpMixed;   // Padded input and MLP intermediates
+  Tensor attnQG, attnK, attnV, attnQRope;      // Attention projections and rotated queries
+  Tensor attnKRope, attnOut, attnGated;        // Rotated keys and attention outputs
+  Tensor attnPartials;                         // Partial attention reductions
+  Tensor gdnMixed, gdnZ, gdnB, gdnG;           // GDN projections and scalar parameters
+  Tensor gdnConvolved, gdnQ, gdnK, gdnV;       // GDN convolution and Q/K/V intermediates
+  Tensor gdnDelta, mid;                        // Delta-rule output and layer residual
+  Tensor targetHidden, dflashFeatures;         // Drafter inputs captured from the target
+  Tensor targetLogits;                         // Reusable logits storage
+  void ensure(Device&, uint32_t rows, Drafter); // Grows and partitions the arena when necessary
+};
+```
+
+`Engine.candidateStates` is also grow-only, but contains meaningful data only during speculative verification. It is shared by every speculative query in the current pass; their `Query.state` offsets keep the ranges separate.
+
+The control tensors are small shared-memory buffers written by C++ and read directly by Metal. Weights, GDN states, sparse K/V, candidates, and most scratch storage use private GPU memory.
+
+## Appendix E: Python boundary
+
+The complete Python-side generation loop is:
+
+```python
+from runtime import InferenceEngine
+
+engine = InferenceEngine("weights/Qwen3.5-9B-UD-Q4_K_XL.gguf")
+sequence = engine.sequence()
+
+cursor = sequence.append([248045, 846, 198])
+while (token := sequence.read(cursor)) is not None:
+  cursor += 1
+  print(token)
+
+sequence.close()
+engine.close()
+```
+
+Python owns only the native handle, optional tokenizer, stop-token copy used by the frontend, draft-width copy used for metrics, and its local read cursor. The authoritative token and inference state remains in the native `Sequence`.
+
+## Source map
 
 ```text
-refs[physical] = number of live native sequence bindings to physical
+runtime/inference.py          Python API and C ABI bindings
+model/qwen.cpp                scheduler, query sizing, commit, and C API
+model/qwen35.hpp              engine, sequence, batch, and model state
+model/qwen35_weights.cpp      weight loading, pipelines, and engine construction
+model/qwen_ops.cpp            draft and target forward passes
+backend/metal/device.cpp      Metal commands, sparse allocation, and prefix cache
+backend/metal/kernel/*.metal  GPU kernels
 ```
 
-Prefix-table membership is not a reference. A zero-reference block remains a soft cache entry until the allocator needs it.
-
-Before a batch executes, `reserve` finds every block touched by `[kv_valid, kv_valid + count)`. It first proves that enough unused or zero-reference blocks exist for the complete batch. Only then does it grow heaps, select LRU victims, install mappings, add bindings, and increment references.
-
-The conditions are:
-
-```text
-refs > 0  => block cannot be evicted
-refs == 0 => block is eligible, not immediately evicted
-```
-
-Eviction removes the prefix entry that still points to the victim, clears its hash metadata, and reuses the whole bundle. Target and drafter pages never have separate allocation lifetimes.
-
-Releasing a sequence unmaps every bound virtual block and decrements its references. Completed GPU work is already synchronized by the engine lock and synchronous command submission.
-
-### 4.3 GDN state
-
-Each of the 24 GDN layers has two per-slot state banks:
-
-```text
-active   = bank
-inactive = 1 - bank
-```
-
-An ordinary query reads the active convolution and recurrent state and writes its final state to the inactive bank. At `kv_valid == 0`, kernels synthesize zero initial state instead of reading old slot contents.
-
-A speculative target query does not overwrite either bank. It writes one convolution and recurrent snapshot after each query token into grow-only candidate storage:
-
-```text
-state_start_loc[row + 1] = state_start_loc[row] + query_count[row]  if speculative
-state_start_loc[row + 1] = state_start_loc[row]                     otherwise
-```
-
-Verification with `A` accepted proposals selects candidate column `A`, copies it to the inactive bank, and then flips `bank`. With at most eight rows and eight snapshots per speculative row, normal admission requires at most 64 candidate rows.
-
-MTP seeds are double-buffered with the same bank selector. This makes the committed GDN state and the committed seed publish together.
-
-## 5. Prefix cache
-
-Only a new session performs prefix lookup. Blocks are hashed consecutively from block zero with an initial hash of zero. The model object is the cache namespace, so model weights and drafter configuration cannot share entries across engines.
-
-Lookup leaves at least one prompt token for a target pass:
-
-```text
-complete_blocks_considered = floor((len(request) - 1) / 128)
-```
-
-Qwen3.5 is hybrid, so attention KV alone is insufficient. A hit is usable only at a 512-token boundary for which all preceding block hashes exist and a GDN checkpoint exists. The deepest such checkpoint is restored; later attention-only hits are ignored.
-
-Restoration is synchronous and consists of:
-
-```text
-copy checkpoint GDN state into bank 0
-copy checkpoint MTP seed into seed bank 0, when MTP is active
-bind every sparse block through the checkpoint
-set bank = 0
-set kv_valid = checkpoint boundary
-```
-
-If no complete checkpoint exists, `kv_valid` remains zero and no prefix blocks are bound.
-
-A prefix hit maps the same physical KV pages into the new slot and increments their references; it does not copy KV. Only the checkpoint's GDN state and optional MTP seed are copied.
-
-After a successful commit, every newly completed 128-token block is published. At an exact 512-token boundary, the committed GDN state and optional MTP seed are copied into an immutable checkpoint. Checkpoints use a separate eight-entry LRU and do not hold physical KV references.
-
-Prefix publication is an optimization: `publishPrefix` suppresses its own exceptions, so a failed publication does not fail an otherwise committed inference step.
-
-## 6. Request scheduling and batch construction
-
-`Session.forward` submits work to one scheduler thread and waits on a future. The scheduler selects at most eight requests that share the newest queued request's `(temperature, top_p, top_k)` tuple. Different sampling configurations cannot share one native batch because those values are batch-wide scalars.
-
-After every pass, unfinished prompt requests return to the queue. Requests arriving during that pass can join the next batch, which is how chunked prefill and decode are continuously rebatched.
-
-For every selected row:
-
-```text
-start_pos = kv_valid
-```
-
-The scheduler is intended to apply these conditions:
-
-```text
-ordinary decode count = 1
-speculative count     = 1 + common_draft_count
-prompt count          = a positive share of the remaining 128-row budget
-query end             <= next 512-token checkpoint boundary
-packed target rows    <= 128
-```
-
-The common draft count is the minimum requested count among eligible speculative rows, the drafter maximum, and the available checkpoint room. A row can request fewer proposals than another row, but all speculative rows selected for that pass execute the same width.
-
-The native batch derives temporary metadata:
-
-```text
-query_start_loc[0] = 0
-query_start_loc[i + 1] = query_start_loc[i] + query_count[i]
-
-state_start_loc[0] = 0
-state_start_loc[i + 1] = state_start_loc[i] + (query_count[i] if speculative else 0)
-```
-
-Tokens, `kv_valid`, slot IDs, bank IDs, and these prefix sums are packed into shared Metal buffers. Prompt, ordinary decode, and speculative verification rows use the same target forward path.
-
-## 7. Forward transaction
-
-One inference step is a prepare/execute/commit transaction.
-
-### 7.1 Attach and prepare
-
-For a fresh request:
-
-```text
-require len(input) > 0
-request = input
-kv_valid = deepest restorable prefix, or 0
-phase = pp
-```
-
-A repeated prompt must preserve `request[:kv_valid]`. Active generation replaces the uncommitted suffix with the submitted anchor or next-turn tokens. If more than one token remains above `kv_valid`, the phase returns to `pp`.
-
-The runtime derives query counts and flags, packs only the selected token suffix, and calls the native API while holding the engine lock. Native execution snapshots RNG state and reserves all required cache blocks before launching a drafter or target kernel.
-
-### 7.2 Optional draft
-
-Drafting starts only from a generation anchor and never advances `kv_valid`.
-
-MTP runs one autoregressive step per proposal. The first step combines the committed target-hidden seed with the anchor embedding. Later steps combine the previous MTP hidden state with the previously proposed token. Each step uses greedy argmax. Its K/V writes at and above `kv_valid` are tentative.
-
-DFlash packs each speculative row as:
-
-```text
-anchor + K mask positions, where 1 <= K <= 7
-```
-
-It runs six draft transformer layers once and greedily reads the mask-position logits. The first five layers use a 4,096-token sliding window; the last uses the full available context. Draft-layer K/V for the current proposal block is temporary.
-
-### 7.3 Target model
-
-The target pass:
-
-1. Embeds all packed rows.
-2. Runs 32 decoder layers. Every fourth layer uses full attention; the others use causal convolution plus the gated delta rule. Every layer ends with its residual MLP.
-3. Writes target KV for every query token. Each attention row sees committed KV plus the causal prefix of its current query.
-4. Produces logits only for requested rows: the final prompt/decode row, or every speculative verification row.
-5. Materializes verified persistent drafter state from target outputs.
-
-For MTP, the target pass writes MTP K/V for every query token. An ordinary row also writes its last target hidden state to the inactive seed bank. A speculative row keeps all target hidden states until verification selects the next seed.
-
-For DFlash, target outputs after layers 1, 5, ..., 29 are concatenated, projected, and normalized. Each of the six draft layers projects that context into persistent DFlash K/V. Tentative draft state is therefore replaced by target-derived state at every verified position.
-
-The forward writes cache and scratch but does not publish Python `request` or `kv_valid`.
-
-### 7.4 Sampling and verification
-
-```text
-temperature <= 0 => greedy argmax
-temperature > 0  => per-slot xorshift64 sampling
-```
-
-With `top_k == 0`, sampling scans the full vocabulary and does not apply `top_p`. With `1 <= top_k <= 64`, it constructs that top-k set and applies `top_p` inside it. The Python API rejects `top_p < 1` when `top_k` is omitted.
-
-For speculation, the target samples one token after the anchor and after each proposal. Python accepts the longest prefix for which target samples equal drafter proposals.
-
-For `A` accepted proposals:
-
-```text
-new_kv_valid = old_kv_valid + 1 + A
-```
-
-If no accepted proposal is a stop token:
-
-```text
-request = old committed prefix + anchor + accepted proposals + replacement_or_bonus
-len(request) = new_kv_valid + 1
-```
-
-If an accepted proposal is a stop token:
-
-```text
-request = prefix through the first accepted stop token
-len(request) = new_kv_valid
-```
-
-Rejected target, MTP, and DFlash entries remain mapped but invalid because they lie at or above the new boundary.
-
-### 7.5 Commit and abort
-
-Native commit performs, in order:
-
-1. For speculative rows, copy candidate GDN column `A` and the selected MTP target hidden state into the inactive bank.
-2. Rebase per-slot RNG state from its pre-forward snapshot using the accepted count and an intended next-token flag.
-3. Flip the sequence bank.
-4. Publish completed prefix blocks and an aligned checkpoint.
-
-Only after native commit succeeds does Python assign the new `request`, `kv_valid`, and phase. The engine lock prevents scheduling or release from observing the native/Python handoff.
-
-An abort restores RNG state and discards the pending native batch. It does not clear tentative KV, inactive GDN state, or candidate scratch; the unchanged bank and `kv_valid` make those writes invisible.
-
-## 8. Speculative output delivery and turns
-
-A speculative verification may commit several user-visible tokens in one target pass. Python returns the first and stores the rest in `Session.outputs`. Later `forward` calls validate the expected token order and drain this queue without running Metal. These are committed outputs, not unverified proposals.
-
-`generate` retains the last returned token as the next anchor, applies the tokenizer's chat template only to the new turn, and preserves the native session across turns. A frontend stop ends generation but does not release cache state. `Session.close` is the only normal terminal transition.
-
-## 9. Concurrency and failure conditions
-
-There is at most one native batch in flight per model:
-
-```text
-scheduler worker + engine lock + synchronous Metal submission
-```
-
-The same lock serializes direct `forward_step`, prefix restore, native commit, and sequence release. Live sparse bindings pin physical blocks through `refs`. Candidate buffers grow before the target dispatch and are reused after commit or abort.
-
-The main rejected conditions are:
-
-```text
-live sessions > 8
-batch size outside 1..8
-duplicate, closed, or foreign sessions in one batch
-empty input
-context outside 1..65536 or request beyond configured context
-speculation without a drafter
-proposal count outside the active drafter limit
-DFlash without a separate draft GGUF
-insufficient zero-reference physical blocks for the complete batch
-stochastic top_k outside 0..64
-top_p < 1 with top_k omitted
-```
-
-Reservation failure launches no forward. Validation or native failure leaves `kv_valid` and the active bank unchanged.
-
-## 10. Differences from the state contract
-
-The implementation preserves the contract's single `kv_valid` validity boundary. Its observable differences are:
-
-- There is no stored `eos` phase. Python uses `closed`, and destruction immediately releases the native sequence.
-- Draft proposals are held in native `draftTokens`; they are not temporarily appended to Python `request`. Only the verified result is published. `Session.outputs` is a separate queue for already committed tokens awaiting frontend delivery.
-- Qwen3.5 always has non-token-addressed GDN state. Consequently, the implementation has no attention-only prefix-restore branch; every usable prefix ends at a 512-token hybrid checkpoint.
-- MTP seed state has two banks selected by the same `Sequence.bank` as GDN, rather than one seed buffer updated by a separate copy protocol.
-- Zero initial GDN and MTP state is established lazily by kernels when `kv_valid == 0`; both banks are not cleared when a slot is acquired.
-- All speculative rows in a batch use one common proposal count. The contract permits a different count per row.
-- The physical block pool contains `ceil(max_context / 128)` bundles total. Eight live sequences compete for that pool.
-- Prefix publication is best-effort and suppresses errors; model-state commit remains authoritative.
-
-Two current gaps require care:
-
-- `_prepare` excludes a speculative row with only one token of checkpoint room when choosing the common draft width, but later marks every speculative generation row as drafted if another row enabled drafting. Such a mixed batch can cross that row's checkpoint boundary and can invalidate the intended 128-row budget calculation.
-- RNG correction tests whether the block-sliced commit segment is longer than absolute `new_kv_valid`. That segment ends at `new_kv_valid`, so the test is always false. A non-terminal speculative commit advances the saved RNG by `A` draws instead of `A + 1`; terminal accepted-stop commits are unaffected because they consume only the `A` accepted draws. Greedy decoding is unaffected.
-
-## 11. Benchmark and profiling
-
-Target-only, MTP, and DFlash use the same benchmark:
+## Verification
 
 ```bash
-python benchmarks/benchmark_qwen35.py --weights weights/Qwen3.5-9B-UD-Q4_K_XL.gguf \
-  --prompt-preset math --decode 256 --iters 3
-
-python benchmarks/benchmark_qwen35.py --weights weights/Qwen3.5-9B-UD-Q4_K_XL-MTP.gguf \
-  --drafter mtp --speculative --prompt-preset math --decode 256 --iters 3
-
-python benchmarks/benchmark_qwen35.py --weights weights/Qwen3.5-9B-UD-Q4_K_XL.gguf \
-  --drafter dflash --draft-weights weights/qwen35-9b-dflash-Q4_K_M.gguf \
-  --speculative --prompt-preset math --decode 256 --iters 3
+pytest -q test/test_qwen35.py
+python benchmarks/benchmark_qwen35.py --prompt-preset math --decode 64 --warmup 1 --iters 2
 ```
 
-Use chat-formatted tokens when measuring acceptance. Random vocabulary IDs measure kernel throughput, not a distribution on which either drafter was trained.
-
-Kernel profiling uses precise Metal timestamps and reports them by `prefill`, `decode`, `verify`, `mtp_draft`, and `dflash_draft` phase:
-
-```bash
-python benchmarks/profile_qwen35.py --prefill 128 --decode 32
-```
-
-Timestamp markers add overhead. Use the wall-clock benchmark for final latency and throughput.
+Keep batch size and proposal count modest on machines with 16 GB of unified memory.

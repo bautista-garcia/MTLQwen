@@ -207,27 +207,25 @@ static inline half gdn_load_context(device const half* x, device const half* pre
 
 [[max_total_threads_per_threadgroup(256)]]
 kernel void gdn_causal_conv_silu(device half* y [[buffer(0)]], device half* state0 [[buffer(1)]], device half* state1 [[buffer(2)]],
-                                 device const half* x [[buffer(3)]], device const float* w [[buffer(4)]], device const uint* slots [[buffer(5)]],
-                                 device const uint* banks [[buffer(6)]], device const uint* valid [[buffer(7)]], constant long& B [[buffer(8)]],
-                                 constant long& L [[buffer(9)]], uint3 gid [[thread_position_in_grid]]) {
-  long span = L > 4 ? L : 4, idx = gid.x, b = idx / (GDN_C * span), rem = idx - b * GDN_C * span;
-  if (b >= B)
-    return;
+                                 device half* candidates [[buffer(3)]], device const half* x [[buffer(4)]], device const float* w [[buffer(5)]],
+                                 constant uint& slot [[buffer(6)]], constant uint& bank [[buffer(7)]], constant uint& valid [[buffer(8)]],
+                                 constant long& L [[buffer(9)]],
+                                 uint3 gid [[thread_position_in_grid]]) {
+  long span = L > 4 ? L : 4, rem = gid.x;
   long p = rem / GDN_C, c = rem - p * GDN_C;
-  uint slot = slots[b], bank = banks[b];
-  bool has_prev = valid[b];
+  bool has_prev = valid;
   device half* state = (bank ? state0 : state1) + slot * GDN_C * 4;
   device const half* prev = (bank ? state1 : state0) + slot * GDN_C * 4;
   if (p < L) {
     float acc = 0.0f;
     for (long r = 0; r < 4; ++r)
-      acc = fma(float(gdn_load_context(x, prev, b, c, L, has_prev ? p + 1 + r : p + r - 3, has_prev)), float(half(w[c * 4 + r])), acc);
+      acc = fma(float(gdn_load_context(x, prev, 0, c, L, has_prev ? p + 1 + r : p + r - 3, has_prev)), float(half(w[c * 4 + r])), acc);
     float hv = float(half(acc));
-    y[(b * L + p) * GDN_C + c] = half(hv / (1.0f + exp(-hv)));
+    y[p * GDN_C + c] = half(hv / (1.0f + exp(-hv)));
   }
   if (p < 4) {
     long pos = (has_prev ? L + p : L - 4 + p);
-    state[c * 4 + p] = gdn_load_context(x, prev, b, c, L, pos, has_prev);
+    state[c * 4 + p] = gdn_load_context(x, prev, 0, c, L, pos, has_prev);
   }
 }
 
@@ -235,34 +233,30 @@ kernel void gdn_causal_conv_silu(device half* y [[buffer(0)]], device half* stat
 [[max_total_threads_per_threadgroup(256)]]
 kernel void gdn_causal_conv_candidates(device half* y [[buffer(0)]], device const half* state0 [[buffer(1)]], device const half* state1 [[buffer(2)]],
                                        device half* candidates [[buffer(3)]], device const half* x [[buffer(4)]], device const float* w [[buffer(5)]],
-                                       device const uint* slots [[buffer(6)]], device const uint* banks [[buffer(7)]],
-                                       device const uint* valid [[buffer(8)]], constant long& B [[buffer(9)]], constant long& L [[buffer(10)]],
-                                       uint3 gid [[thread_position_in_grid]]) {
-  long idx = gid.x, b = idx / (GDN_C * L), rem = idx - b * GDN_C * L;
-  if (b >= B)
-    return;
+                                       constant uint& slot [[buffer(6)]], constant uint& bank [[buffer(7)]],
+                                       constant uint& valid [[buffer(8)]], constant long& L [[buffer(9)]], uint3 gid [[thread_position_in_grid]]) {
+  long rem = gid.x;
   long p = rem / GDN_C, c = rem - p * GDN_C;
-  uint slot = slots[b], bank = banks[b];
-  bool has_prev = valid[b];
+  bool has_prev = valid;
   device const half* prev = (bank ? state1 : state0) + slot * GDN_C * 4;
   float acc = 0.0f;
   for (long r = 0; r < 4; ++r) {
     long position = p - 3 + r;
-    half value = position >= 0 ? x[(b * L + position) * GDN_C + c] : has_prev ? prev[c * 4 + position + 4] : half(0.0f);
+    half value = position >= 0 ? x[position * GDN_C + c] : has_prev ? prev[c * 4 + position + 4] : half(0.0f);
     acc = fma(float(value), float(half(w[c * 4 + r])), acc);
   }
   float hv = float(half(acc));
-  y[(b * L + p) * GDN_C + c] = half(hv / (1.0f + exp(-hv)));
-  device half* state = candidates + (b * L + p) * GDN_C * 4 + c * 4;
+  y[p * GDN_C + c] = half(hv / (1.0f + exp(-hv)));
+  device half* state = candidates + p * GDN_C * 4 + c * 4;
   for (long r = 0; r < 4; ++r) {
     long position = p - 3 + r;
-    state[r] = position >= 0 ? x[(b * L + position) * GDN_C + c] : has_prev ? prev[c * 4 + position + 4] : half(0.0f);
+    state[r] = position >= 0 ? x[position * GDN_C + c] : has_prev ? prev[c * 4 + position + 4] : half(0.0f);
   }
 }
 
 [[max_total_threads_per_threadgroup(128)]]
 kernel void rmsnorm_gated_128(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const half* gate [[buffer(2)]],
-                              device const float* w [[buffer(3)]], constant float& eps [[buffer(4)]], uint3 lane3 [[thread_position_in_threadgroup]],
+                              device const float* w [[buffer(3)]], uint3 lane3 [[thread_position_in_threadgroup]],
                               uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
                               uint3 group [[threadgroup_position_in_grid]]) {
   uint d = lane3.x, row = group.y;
@@ -275,7 +269,7 @@ kernel void rmsnorm_gated_128(device half* y [[buffer(0)]], device const half* x
     float s = simd_lane < 4 ? scratch[simd_lane] : 0.0f;
     s = simd_sum(s);
     if (simd_lane == 0)
-      scratch[4] = rsqrt(s / float(GDN_D) + eps);
+      scratch[4] = rsqrt(s / float(GDN_D) + 1.0e-6f);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float gv = float(gate[row * GDN_D + d]);

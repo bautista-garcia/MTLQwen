@@ -1,18 +1,19 @@
 #pragma once
 #include "backend/metal/device.hpp"
 #include <array>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
-
 namespace infeng::qwen35 {
-using metal::CommandBuffer;
 using metal::Device;
 using metal::Pipeline;
 using metal::SparseKV;
 using metal::Tensor;
-
 inline constexpr uint32_t blockTokens = 128, targetLayers = 32, fullAttentionInterval = 4, targetKvLayers = 8;
 inline constexpr uint32_t mtpLayers = 1, dflashLayers = 6;
 inline constexpr uint32_t maxDraftTokens = 7, maxBatchSequences = 8, maxDecodeRows = 5, maxBatchTokens = blockTokens;
@@ -24,7 +25,6 @@ inline constexpr uint64_t gdnCheckpointBytes = (targetLayers - targetKvLayers) *
 inline constexpr uint64_t gdnOffset(uint32_t layer) {
   return uint64_t(layer - layer / fullAttentionInterval) * (recurrentStateBytes + convStateBytes);
 }
-
 enum class QuantType : uint32_t { F32 = 0, F16 = 1, Q8_0 = 8, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ4_XS = 23 };
 enum class Drafter : uint8_t { none, mtp, dflash };
 enum LinearKernel : uint8_t { linearDecode, linearDecodeAdd, linearPrefill, linearPrefillSmall };
@@ -46,117 +46,106 @@ struct AttentionWeights {
 struct GdnWeights {
   Linear qkv, z, out;
   Tensor b, a, conv, norm, dt, A;
-  bool baF32 = false;
 };
 struct Layer {
-  bool fullAttention = false;
-  uint8_t kvIndex = 0;
   Tensor inputNorm, postNorm;
   MlpWeights mlp;
   AttentionWeights attention;
   GdnWeights gdn;
 };
-struct MtpWeights {
-  Linear fusion;
-  Layer layer;
-  Tensor embeddingNorm, hiddenNorm, outputNorm;
-};
-struct DflashWeights {
+struct DrafterWeights {
   Linear fusion;
   std::array<Layer, dflashLayers> layers;
-  Tensor hiddenNorm, outputNorm;
+  Tensor embeddingNorm, hiddenNorm, outputNorm;
 };
 struct Scratch {
   bool decodeMode = false;
-  Pipeline* padRows = nullptr;
   Tensor hidden[2], inputNorm, postNorm, padInput, mlpGate, mlpUp, mlpMixed;
   Tensor attnQG, attnK, attnV, attnQRope, attnKRope, attnOut, attnGated, attnPartials;
-  Tensor gdnMixed, gdnZ, gdnB, gdnG, gdnConvolved, gdnQ, gdnK, gdnV, gdnDelta, gdnNormed;
-  Tensor mid, projected, mtpFused, targetHidden, dflashFeatures, dflashContext, targetLogits;
+  Tensor gdnMixed, gdnZ, gdnB, gdnG, gdnConvolved, gdnQ, gdnK, gdnV, gdnDelta;
+  Tensor mid, targetHidden, dflashFeatures, targetLogits;
   void ensure(Device& device, uint32_t rows, Drafter drafter);
 };
-struct LayerState {
-  Tensor conv[2], recurrent[2], candidateConv, candidateRecurrent;
+struct GdnState {
+  Tensor conv, recurrent;
 };
+inline GdnState gdnState(const Tensor& arena, uint32_t rows, uint32_t layer) {
+  uint64_t offset = gdnOffset(layer) * rows;
+  return {arena.view(offset, convStateBytes * rows), arena.view(offset + convStateBytes * rows, recurrentStateBytes * rows)};
+}
 struct PhysicalBlock {
   uint32_t refs = 0;
-  uint64_t hash = 0, touch = 0;
+  uint64_t touch = 0;
 };
 struct HybridCheckpoint {
   Tensor arena;
+  std::vector<uint32_t> bindings;
   uint64_t touch = 0;
 };
 struct Sequence;
 struct Query {
   Sequence* sequence = nullptr;
-  const int32_t* tokens = nullptr;
-  uint32_t valid = 0, count = 1, logit = unbound;
-  bool draft = false, sample = false;
+  uint32_t count = 1, logit = unbound, state = unbound;
 };
 struct Batch {
   std::array<Query, maxBatchSequences> queries{};
-  std::array<uint32_t, maxBatchSequences + 1> query_start_loc{}; // First packed token row for each query.
-  std::array<uint32_t, maxBatchSequences + 1> state_start_loc{}; // First temporary GDN-state snapshot for each query.
-  uint32_t size = 0, drafts = 0;
+  uint32_t size = 0;
 };
-struct Model {
+struct Engine {
   Device device;
   uint32_t maxContext;
   std::unique_ptr<SparseKV> kv;
   Tensor embedding, norm, rope, dflashRope;
   Linear head;
   std::array<Layer, targetLayers> layers;
-  MtpWeights mtp;
-  DflashWeights dflash;
+  DrafterWeights draftModel;
   Drafter drafter = Drafter::none;
-  std::array<LayerState, targetLayers> states;
+  Tensor gdnStates[2], candidateStates;
   Scratch workspace;
   Tensor inputIds, batchKvValid, queryStartLoc, draftPositions, sequenceSlots, stateBanks;
   Tensor draftTokens, outputTokens, rng, mtpSeeds, logitRows;
   std::vector<PhysicalBlock> blocks;
-  std::unordered_map<uint64_t, uint32_t> prefixTable;
   std::unordered_map<uint64_t, HybridCheckpoint> checkpointCache;
-  std::array<bool, maxBatchSequences> slots{};
+  std::array<Sequence*, maxBatchSequences> sequences{};
+  std::mutex mutex;
+  std::condition_variable condition;
+  std::thread worker;
+  bool closing = false, running = false;
   uint64_t clock = 0;
-  uint32_t physicalBlocks = 0, maxLogicalBlocks, candidateCapacity = 0;
+  uint32_t physicalBlocks = 0;
   uint64_t parameterCount = 0, modelBytes = 0;
-  Batch pending;
-  std::array<uint64_t, maxBatchSequences> rngBefore{};
-  bool pendingSampling = false;
-  Model(const std::filesystem::path& weights, const std::filesystem::path& kernels, uint32_t maxContext, bool profile, Drafter drafter,
-        const std::filesystem::path& draftWeights);
-  bool hasMtp() const {
-    return drafter == Drafter::mtp;
-  }
-  bool hasDflash() const {
-    return drafter == Drafter::dflash;
-  }
+  Engine(const std::filesystem::path& weights, const std::filesystem::path& kernels, uint32_t maxContext, Drafter drafter,
+         const std::filesystem::path& draftWeights);
+  ~Engine();
   Scratch& scratch(uint32_t query, uint32_t rows) {
     workspace.decodeMode = query <= maxDecodeRows;
     workspace.ensure(device, rows, drafter);
     return workspace;
   }
-  uint8_t acquireSlot();
   uint32_t acquireBlock();
   void reserve(const Batch& batch);
-  void ensureCandidates(uint32_t rows);
   void bind(Sequence& sequence, uint32_t logical, uint32_t physical);
   uint32_t lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_t length);
-  void publishPrefix(Sequence& sequence, const int32_t* tokens, uint32_t tokenOffset, uint32_t oldValid, uint32_t valid);
-  void release(Sequence& sequence);
-  void execute(Batch& batch, float temperature, float topP, int32_t topK);
-  void commit(const int32_t* tokens, const uint32_t* starts, const uint32_t* offsets, const uint32_t* valid, const uint8_t* accepted);
-  void abort();
+  void publishPrefix(Sequence& sequence, uint32_t oldValid, uint32_t valid);
+  void schedule();
+  void execute(Batch& batch);
 };
 struct Sequence {
-  Model& model;
+  Engine& engine;
+  std::vector<int32_t> request;
   std::vector<uint32_t> bindings;
-  uint8_t slot, bank = 0;
-  Sequence(Model& model);
+  std::vector<int32_t> stops;
+  std::exception_ptr error;
+  uint64_t drafted = 0, accepted = 0, prefixHash = 0;
+  uint32_t kvValid = 0;
+  uint32_t slot, bank = 0, draftTokens;
+  float temperature, topP;
+  int32_t topK;
+  bool active = false, busy = false;
+  Sequence(Engine&, const int32_t* stops, uint32_t stopCount, float temperature, float topP, int32_t topK, uint32_t draftTokens);
   ~Sequence();
 };
-
-Tensor mtpSeed(Model& model, const Sequence& sequence, uint32_t bank);
-void draft(Model& model, Batch& batch);
-void forward(Model& model, Batch& batch, float temperature, float topP, int32_t topK);
+Tensor mtpSeed(Engine& engine, const Sequence& sequence, uint32_t bank);
+void draft(Engine& engine, Batch& batch, uint32_t drafts);
+void forward(Engine& engine, Batch& batch, uint32_t drafts, uint32_t stateRows);
 } // namespace infeng::qwen35

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import random
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import perf_counter
 
@@ -19,19 +20,32 @@ MATH_PROMPT = [
 
 
 def run(model, tokens, decode, batch, speculative=False, draft_tokens=None):
-  sessions = [model.session() for _ in range(batch)]
-  for session in sessions:
-    session.configure(speculative=speculative, draft_tokens=draft_tokens)
-  start = perf_counter()
-  current = model.forward_batch(sessions, [tokens] * batch)
-  ttft = perf_counter() - start
-  start = perf_counter()
-  for _ in range(decode):
-    current = ([sessions[0].forward([current[0]])] if batch == 1 else model.forward_batch(sessions, current))
-  elapsed, mapped = perf_counter() - start, sessions[0].mapped_bytes
+  sessions = [model.sequence(draft_tokens=draft_tokens if speculative else 0) for _ in range(batch)]
+  def first(session):
+    cursor = session.append(tokens)
+    assert session.read(cursor) is not None
+    return cursor + 1
+  def finish(item):
+    session, cursor = item
+    for _ in range(decode):
+      if session.read(cursor) is None: break
+      cursor += 1
+    session.cancel()
+    return cursor
+  def stop(item):
+    session, cursor = item
+    while session.read(cursor) is not None: cursor += 1
+  with ThreadPoolExecutor(max_workers=batch) as pool:
+    start = perf_counter()
+    cursors = list(pool.map(first, sessions))
+    ttft = perf_counter() - start
+    start = perf_counter()
+    cursors = list(pool.map(finish, zip(sessions, cursors)))
+    elapsed = perf_counter() - start
+    list(pool.map(stop, zip(sessions, cursors)))
+  mapped = model.mapped_bytes
   spec = [session.speculative_counters() for session in sessions]
-  for session in sessions:
-    session.close()
+  for session in sessions: session.close()
   return ttft, elapsed, mapped, sum(item["drafted_tokens"] for item in spec), sum(item["accepted_tokens"] for item in spec)
 
 

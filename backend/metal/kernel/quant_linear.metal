@@ -560,17 +560,14 @@ kernel void decode_iq4xs(device half* dst [[buffer(0)]], device const half* src 
 
 [[max_total_threads_per_threadgroup(256)]]
 kernel void q4_k_embed(device half* y [[buffer(0)]], device const int* ids [[buffer(1)]], device const uchar* w [[buffer(2)]],
-                       constant long& T [[buffer(3)]], constant long& K [[buffer(4)]], uint3 lane3 [[thread_position_in_threadgroup]],
-                       uint3 group [[threadgroup_position_in_grid]]) {
+                       uint3 lane3 [[thread_position_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
   uint col = group.x * 256 + lane3.x, t = group.y;
-  if (t >= T || col >= K)
-    return;
-  long row = ids[t], nb = K / 256, o = row * nb * 144 + (col >> 8) * 144;
+  long row = ids[t], nb = 4096 / 256, o = row * nb * 144 + (col >> 8) * 144;
   uint r = col & 255, j = r >> 5, qj = (r >> 6) * 32 + (r & 31);
   uchar sc, mn;
   scale_min_k4(j, w + o + 4, sc, mn);
   uchar q = w[o + 16 + qj], v = (r & 32) ? (q >> 4) : (q & 15);
-  y[t * K + col] = half(float(h16(w + o)) * float(sc) * float(v) - float(h16(w + o + 2)) * float(mn));
+  y[t * 4096 + col] = half(float(h16(w + o)) * float(sc) * float(v) - float(h16(w + o + 2)) * float(mn));
 }
 
 #define PREFILL_ARGS device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3

@@ -169,21 +169,17 @@ static inline void run_delta_rule_token(device half* output, device float* state
 
 [[max_total_threads_per_threadgroup(128)]]
 kernel void delta_rule_prefill(device half* output [[buffer(0)]], device float* state0 [[buffer(1)]], device float* state1 [[buffer(2)]],
-                               device const uint* slots [[buffer(3)]], device const uint* banks [[buffer(4)]], device const uint* valid [[buffer(5)]],
-                               device const half* query [[buffer(6)]], device const half* key [[buffer(7)]], device const half* value [[buffer(8)]],
-                               device const float* g [[buffer(9)]], device const half* beta [[buffer(10)]], constant long& batch_size [[buffer(11)]],
-                               constant long& seq_len [[buffer(12)]], constant long& num_heads [[buffer(13)]], constant long& vs0 [[buffer(14)]],
-                               constant long& vs1 [[buffer(15)]], constant long& vs2 [[buffer(16)]], constant long& vs3 [[buffer(17)]],
+                               device float* candidates [[buffer(3)]], device const half* query [[buffer(4)]], device const half* key [[buffer(5)]],
+                               device const half* value [[buffer(6)]], device const float* g [[buffer(7)]], device const half* beta [[buffer(8)]],
+                               constant uint& slot [[buffer(9)]], constant uint& bank [[buffer(10)]], constant uint& valid [[buffer(11)]],
+                               constant long& seq_len [[buffer(12)]],
                                uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
                                uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x;
-  long h = group3.y % num_heads, b = group3.y / num_heads;
-  if (b >= batch_size || h >= num_heads || group3.x || lane >= 128)
-    return;
-  long slot = slots[b];
-  bool has_initial_state = valid[b];
-  device float* state = banks[b] ? state0 : state1;
-  device const float* previous_state = banks[b] ? state1 : state0;
+  long h = group3.y, b = 0, num_heads = 32, vs0 = seq_len * 4096, vs1 = 4096, vs2 = 128, vs3 = 1;
+  bool has_initial_state = valid;
+  device float* state = bank ? state0 : state1;
+  device const float* previous_state = bank ? state1 : state0;
   threadgroup half k_tile[C_PREFILL * D_PREFILL_TILE], w_tile[C_PREFILL * D_PREFILL_TILE], u_tile[C_PREFILL * D_PREFILL_TILE];
   threadgroup half k_full[C_PREFILL * D];
   threadgroup half l_tile[C_PREFILL * C_PREFILL], qk_tile[C_PREFILL * C_PREFILL], m_tile[32 * 32];
@@ -354,23 +350,18 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]], device float* 
 // One threadgroup per (B, n_heads)
 [[max_total_threads_per_threadgroup(512)]]
 kernel void delta_rule_decode(device half* output [[buffer(0)]], device float* state0 [[buffer(1)]], device float* state1 [[buffer(2)]],
-                              device const uint* slots [[buffer(3)]], device const uint* banks [[buffer(4)]], device const uint* valid [[buffer(5)]],
-                              device const half* query [[buffer(6)]], device const half* key [[buffer(7)]], device const half* value [[buffer(8)]],
-                              device const float* g [[buffer(9)]], device const half* beta [[buffer(10)]], constant long& batch_size [[buffer(11)]],
-                              constant long& seq_len [[buffer(12)]], constant long& num_heads [[buffer(13)]], constant long& vs0 [[buffer(14)]],
-                              constant long& vs1 [[buffer(15)]], constant long& vs2 [[buffer(16)]], constant long& vs3 [[buffer(17)]],
+                              device float* candidates [[buffer(3)]], device const half* query [[buffer(4)]], device const half* key [[buffer(5)]],
+                              device const half* value [[buffer(6)]], device const float* g [[buffer(7)]], device const half* beta [[buffer(8)]],
+                              constant uint& slot [[buffer(9)]], constant uint& bank [[buffer(10)]], constant uint& valid [[buffer(11)]],
+                              constant long& length [[buffer(12)]],
                               uint3 gid [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
                               uint simd_group [[simdgroup_index_in_threadgroup]], uint3 lane3 [[thread_position_in_threadgroup]],
                               uint3 group3 [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x;
-  long group = group3.x;
-  if (group >= batch_size * num_heads)
-    return;
-  long b = group / num_heads, h = group - b * num_heads;
-  long slot = slots[b];
-  bool has_initial_state = valid[b];
-  device float* state = banks[b] ? state0 : state1;
-  device const float* previous_state = banks[b] ? state1 : state0;
+  long b = 0, h = group3.x, seq_len = 1, num_heads = 32, vs0 = 4096, vs1 = 4096, vs2 = 128, vs3 = 1;
+  bool has_initial_state = valid;
+  device float* state = bank ? state0 : state1;
+  device const float* previous_state = bank ? state1 : state0;
   threadgroup half q[D], k[D];
   threadgroup float scratch[1025];
   // No divergence: all threads evaluate to same (no risk in barrier inside if)
@@ -388,26 +379,21 @@ kernel void delta_rule_decode(device half* output [[buffer(0)]], device float* s
 [[max_total_threads_per_threadgroup(512)]]
 kernel void
 delta_rule_candidates(device half* output [[buffer(0)]], device const float* state0 [[buffer(1)]], device const float* state1 [[buffer(2)]],
-                      device float* candidates [[buffer(3)]], device const uint* slots [[buffer(4)]], device const uint* banks [[buffer(5)]],
-                      device const uint* valid [[buffer(6)]], device const half* query [[buffer(7)]], device const half* key [[buffer(8)]],
-                      device const half* value [[buffer(9)]], device const float* g [[buffer(10)]], device const half* beta [[buffer(11)]],
-                      constant long& batch_size [[buffer(12)]], constant long& seq_len [[buffer(13)]], constant long& num_heads [[buffer(14)]],
-                      constant long& vs0 [[buffer(15)]], constant long& vs1 [[buffer(16)]], constant long& vs2 [[buffer(17)]],
-                      constant long& vs3 [[buffer(18)]], uint3 gid [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+                      device float* candidates [[buffer(3)]], device const half* query [[buffer(4)]], device const half* key [[buffer(5)]],
+                      device const half* value [[buffer(6)]], device const float* g [[buffer(7)]], device const half* beta [[buffer(8)]],
+                      constant uint& slot [[buffer(9)]], constant uint& bank [[buffer(10)]], constant uint& valid [[buffer(11)]],
+                      constant long& seq_len [[buffer(12)]], uint3 gid [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
                       uint simd_group [[simdgroup_index_in_threadgroup]], uint3 lane3 [[thread_position_in_threadgroup]],
                       uint3 group3 [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x;
-  long group = group3.x;
-  if (group >= batch_size * num_heads)
-    return;
-  long b = group / num_heads, h = group - b * num_heads, slot = slots[b];
-  device const float* committed = banks[b] ? state1 : state0;
+  long b = 0, h = group3.x, num_heads = 32, vs0 = seq_len * 4096, vs1 = 4096, vs2 = 128, vs3 = 1;
+  device const float* committed = bank ? state1 : state0;
   threadgroup half q[D], k[D];
   threadgroup float scratch[1025];
   for (long t = 0; t < seq_len; ++t) {
-    long row = b * seq_len + t, previous_row = t ? row - 1 : valid[b] ? slot : row;
-    device const float* previous = t || !valid[b] ? candidates : committed;
-    if (!valid[b] && t == 0)
+    long row = t, previous_row = t ? row - 1 : valid ? slot : row;
+    device const float* previous = t || !valid ? candidates : committed;
+    if (!valid && t == 0)
       for (uint i = lane; i < D * D; i += 512)
         candidates[state_offset(row, h, i / D, i % D, num_heads)] = 0.0f;
     threadgroup_barrier(mem_flags::mem_device);

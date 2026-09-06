@@ -12,9 +12,7 @@ static inline ulong dflash_kv_offset(uint slot, uint slot_stride, uint token, ui
 }
 
 kernel void capture_hidden(device half* features [[buffer(0)]], device const half* hidden [[buffer(1)]], constant uint& feature [[buffer(2)]],
-                           constant uint& rows [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-  if (i >= rows * 4096)
-    return;
+                           uint i [[thread_position_in_grid]]) {
   uint row = i / 4096, dim = i % 4096;
   features[(row * 8 + feature) * 4096 + dim] = hidden[i];
 }

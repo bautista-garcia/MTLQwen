@@ -21,7 +21,7 @@ class ChatSession:
     self.id, self.title = uuid.uuid4().hex[:12], "New chat"
     self.runtime, self.messages, self.metrics = None, [], {}
     self.updated_at = time.time()
-    self.generating, self.cancel = False, threading.Event()
+    self.generating, self.started, self.sealed, self.cancel = False, False, True, threading.Event()
     self.lock = threading.Lock()
 
   def summary(self):
@@ -33,24 +33,18 @@ class ChatSession:
       "generating": self.generating,
       "message_count": len(self.messages),
       "metrics": self.metrics,
-      "sequence_id": runtime.sequence_id if runtime else None,
-      "mapped_kv_bytes": runtime.mapped_kv_bytes if runtime else 0
+      "sequence_id": self.id if runtime else None,
+      "mapped_kv_bytes": runtime.engine.mapped_bytes if runtime else 0
     }
-
-  def detail(self):
-    return {**self.summary(), "messages": self.messages}
-
 
 class Handler(SimpleHTTPRequestHandler):
   protocol_version = "HTTP/1.1"
   disable_nagle_algorithm, wbufsize = True, 0
-  root: Path
-  args: argparse.Namespace
   engine = None
   loading, load_error = False, ""
   load_config = None
   model_condition = threading.Condition()
-  sessions, sessions_lock = {}, threading.RLock()
+  sessions = {}
   max_sessions = 8
 
   @classmethod
@@ -103,7 +97,6 @@ class Handler(SimpleHTTPRequestHandler):
       cls.loading, cls.load_error = True, ""
       cls.load_config = config
     threading.Thread(target=cls._finish_model_load, args=(config, ), name="infeng-loader", daemon=True).start()
-    return True
 
   def _json(self, status, body):
     payload = json.dumps(body).encode()
@@ -125,22 +118,16 @@ class Handler(SimpleHTTPRequestHandler):
     except (BrokenPipeError, ConnectionResetError):
       return False
 
-  @classmethod
-  def _session(cls, session_id):
-    with cls.sessions_lock:
-      return cls.sessions.get(session_id)
-
   def do_GET(self):
     path = urlparse(self.path).path
     if path == "/": self.path, path = "/index.html", "/index.html"
     if path == "/api/status":
-      with Handler.sessions_lock:
-        sessions = list(Handler.sessions.values())
-        mapped = max((item.runtime.mapped_kv_bytes for item in sessions if item.runtime), default=0)
-        active = sum(item.generating for item in sessions)
+      sessions = list(Handler.sessions.values())
+      mapped = max((item.runtime.engine.mapped_bytes for item in sessions if item.runtime), default=0)
+      active = sum(item.generating for item in sessions)
       drafter = Handler.engine.drafter if Handler.engine else (Handler.load_config or Handler._model_config())["drafter"]
       default_drafts = Handler.engine.default_draft_tokens if Handler.engine else {"none": 0, "mtp": 2, "dflash": 7}[drafter]
-      max_drafts = Handler.engine.max_draft_tokens if Handler.engine else {"none": 0, "mtp": 4, "dflash": 15}[drafter]
+      max_drafts = Handler.engine.max_draft_tokens if Handler.engine else {"none": 0, "mtp": 4, "dflash": 7}[drafter]
       return self._json(
         200, {
           "loaded": Handler.engine is not None,
@@ -158,13 +145,12 @@ class Handler(SimpleHTTPRequestHandler):
           "mapped_kv_bytes": mapped
         })
     if path == "/api/sessions":
-      with Handler.sessions_lock:
-        body = sorted((item.summary() for item in Handler.sessions.values()), key=lambda item: item["updated_at"], reverse=True)
+      body = sorted((item.summary() for item in Handler.sessions.values()), key=lambda item: item["updated_at"], reverse=True)
       return self._json(200, body)
     parts = path.strip("/").split("/")
     if len(parts) == 3 and parts[:2] == ["api", "sessions"]:
-      session = Handler._session(parts[2])
-      return self._json(200, session.detail()) if session else self._json(404, {"error": "session not found"})
+      session = Handler.sessions.get(parts[2])
+      return self._json(200, {**session.summary(), "messages": session.messages}) if session else self._json(404, {"error": "session not found"})
     return super().do_GET()
 
   def do_POST(self):
@@ -172,25 +158,22 @@ class Handler(SimpleHTTPRequestHandler):
     if path == "/api/load":
       data = self._body()
       drafter = data.get("drafter", Handler.args.drafter)
-      try:
-        Handler.start_model_load(drafter)
-      except ValueError as exc:
-        return self._json(400, {"error": str(exc)})
+      Handler.start_model_load(drafter)
       return self._json(200, {"ok": True, "loaded": Handler.engine is not None, "loading": Handler.loading})
     if path == "/api/sessions":
-      with Handler.sessions_lock:
-        if len(Handler.sessions) >= Handler.max_sessions:
-          return self._json(409, {"error": f"at most {Handler.max_sessions} live sessions are supported"})
-        session = ChatSession()
-        Handler.sessions[session.id] = session
-      return self._json(201, session.detail())
+      if len(Handler.sessions) >= Handler.max_sessions:
+        return self._json(409, {"error": f"at most {Handler.max_sessions} live sessions are supported"})
+      session = ChatSession()
+      Handler.sessions[session.id] = session
+      return self._json(201, {**session.summary(), "messages": session.messages})
     parts = path.strip("/").split("/")
     if len(parts) != 4 or parts[:2] != ["api", "sessions"]:
       return self._json(404, {"error": "not found"})
-    session = Handler._session(parts[2])
+    session = Handler.sessions.get(parts[2])
     if not session: return self._json(404, {"error": "session not found"})
     if parts[3] == "cancel":
       session.cancel.set()
+      if session.runtime: session.runtime.cancel()
       return self._json(200, {"ok": True})
     if parts[3] == "chat": return self._chat(session, self._body())
     return self._json(404, {"error": "not found"})
@@ -199,11 +182,10 @@ class Handler(SimpleHTTPRequestHandler):
     parts = urlparse(self.path).path.strip("/").split("/")
     if len(parts) != 3 or parts[:2] != ["api", "sessions"]:
       return self._json(404, {"error": "not found"})
-    with Handler.sessions_lock:
-      session = Handler.sessions.get(parts[2])
-      if not session: return self._json(404, {"error": "session not found"})
-      if session.generating: return self._json(409, {"error": "stop generation before deleting this session"})
-      del Handler.sessions[parts[2]]
+    session = Handler.sessions.get(parts[2])
+    if not session: return self._json(404, {"error": "session not found"})
+    if session.generating: return self._json(409, {"error": "stop generation before deleting this session"})
+    del Handler.sessions[parts[2]]
     if session.runtime: session.runtime.close()
     return self._json(200, {"ok": True})
 
@@ -214,7 +196,6 @@ class Handler(SimpleHTTPRequestHandler):
     session.generating, disconnected = True, False
     session.cancel.clear()
     started = time.perf_counter()
-    generation = None
     try:
       self.send_response(200)
       self.send_header("content-type", "text/event-stream; charset=utf-8")
@@ -223,49 +204,48 @@ class Handler(SimpleHTTPRequestHandler):
       self.end_headers()
       if Handler.engine is None and not self._event({"status": "Loading model…"}): return
       engine = Handler.load_model()
-      if session.runtime is None: session.runtime = engine.session()
-
       text = message.strip()
       session.messages.append({"role": "user", "content": text})
       if session.title == "New chat": session.title = text[:48] + ("…" if len(text) > 48 else "")
       session.updated_at = time.time()
       thinking = bool(data.get("thinking", Handler.args.thinking))
-      temperature = float(data.get("temperature", Handler.args.temperature))
-      top_p, top_k = float(data.get("top_p", Handler.args.top_p)), int(data.get("top_k", Handler.args.top_k))
-      max_tokens = max(1, min(int(data.get("max_tokens", Handler.args.max_new_tokens)), Handler.args.max_new_tokens))
-      speculative = bool(data.get("speculative", Handler.args.speculative))
-      if speculative and engine.drafter == "none":
-        raise ValueError("speculative generation requires --drafter mtp or dflash")
-      requested_drafts = data.get("draft_tokens", Handler.args.draft_tokens)
-      draft_tokens = engine.default_draft_tokens if requested_drafts is None else int(requested_drafts)
-      if engine.max_draft_tokens: draft_tokens = max(1, min(draft_tokens, engine.max_draft_tokens))
-      stop_ids = [token for token in (engine.tokenizer.eos_token_id, engine.tokenizer.convert_tokens_to_ids("<|im_end|>")) if token is not None]
-      before_context = session.runtime.length
+      max_tokens = max(1, min(int(data.get("max_tokens", 1024)), engine.max_context))
+      if session.runtime is None:
+        speculative = bool(data.get("speculative", Handler.args.speculative))
+        if speculative and engine.drafter == "none": raise ValueError("speculative generation requires --drafter mtp or dflash")
+        requested = data.get("draft_tokens", Handler.args.draft_tokens)
+        drafts = engine.default_draft_tokens if requested is None else int(requested)
+        if engine.max_draft_tokens: drafts = max(1, min(drafts, engine.max_draft_tokens))
+        session.runtime = engine.sequence(temperature=float(data.get("temperature", Handler.args.temperature)),
+                                          top_p=float(data.get("top_p", Handler.args.top_p)),
+                                          top_k=int(data.get("top_k", Handler.args.top_k)),
+                                          draft_tokens=drafts if speculative else 0)
+      speculative, stop_ids = bool(session.runtime.draft_tokens), session.runtime.stop_token_ids
+      before_context = session.metrics.get("context_tokens", 0)
       spec_before = session.runtime.speculative_counters() if speculative else None
-      generation = session.runtime.generate(text,
-                                            max_new_tokens=max_tokens,
-                                            thinking=thinking,
-                                            stop_token_ids=stop_ids,
-                                            temperature=temperature,
-                                            top_p=top_p,
-                                            top_k=top_k,
-                                            speculative=speculative,
-                                            draft_tokens=draft_tokens)
-      if not self._event({"status": "Generating…", "sequence_id": session.runtime.sequence_id}):
+      formatted = engine.tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True,
+                                                       enable_thinking=thinking)
+      formatted = ("" if not session.started else "\n" if session.sealed else "<|im_end|>\n") + formatted
+      session.started = True
+      cursor = session.runtime.append(formatted)
+      prompt_tokens = cursor - before_context
+      if not self._event({"status": "Generating…", "sequence_id": session.id}):
         disconnected = True
         session.cancel.set()
+        session.runtime.cancel()
 
       # Stream token deltas; the authoritative response is joined once when generation finishes.
       thought, response, mode = [], [], "thinking" if thinking else "response"
-      first_at, generated, prompt_tokens = None, 0, 0
-      while not session.cancel.is_set() or session.runtime.pending_outputs:
-        try:
-          token_id = next(generation)
-        except StopIteration:
+      first_at, generated, stop_token, stopping = None, 0, None, False
+      while True:
+        token_id = session.runtime.read(cursor)
+        if token_id is None: break
+        cursor += 1
+        if token_id in stop_ids:
+          stop_token = token_id
           break
         now = time.perf_counter()
-        if first_at is None:
-          first_at, prompt_tokens = now, session.runtime.length - before_context
+        if first_at is None: first_at = now
         generated += 1
         token = engine.tokenizer.decode([token_id], skip_special_tokens=False)
         if mode == "thinking" and "</think>" in token:
@@ -283,7 +263,7 @@ class Handler(SimpleHTTPRequestHandler):
         metrics = {
           "prompt_tokens": prompt_tokens,
           "generated_tokens": generated,
-          "context_tokens": before_context + prompt_tokens + generated,
+          "context_tokens": cursor,
           "ttft_ms": round((first_at - started) * 1000, 1),
           "elapsed_ms": round((now - started) * 1000, 1),
           "tps": round((generated - 1) / decode_elapsed, 2) if generated > 1 and decode_elapsed else None,
@@ -293,9 +273,12 @@ class Handler(SimpleHTTPRequestHandler):
         if not disconnected and not self._event({**delta, "metrics": metrics}):
           disconnected = True
           session.cancel.set()
+          session.runtime.cancel()
+        if not stopping and (generated >= max_tokens or session.cancel.is_set()):
+          stopping = True
+          session.runtime.cancel()
 
       now = time.perf_counter()
-      if not prompt_tokens: prompt_tokens = session.runtime.length - before_context
       decode_elapsed = now - first_at if first_at else 0
       spec = {"speculative": speculative, "drafted_tokens": 0, "accepted_tokens": 0, "acceptance_rate": None}
       if spec_before:
@@ -306,13 +289,14 @@ class Handler(SimpleHTTPRequestHandler):
       metrics = {
         "prompt_tokens": prompt_tokens,
         "generated_tokens": generated,
-        "context_tokens": session.runtime.length + len(session.runtime.pending),
+        "context_tokens": cursor,
         "ttft_ms": round(((first_at or now) - started) * 1000, 1),
         "elapsed_ms": round((now - started) * 1000, 1),
         "tps": round((generated - 1) / decode_elapsed, 2) if generated > 1 and decode_elapsed else None,
         **spec
       }
-      cancelled = session.cancel.is_set()
+      cancelled = stopping or session.cancel.is_set()
+      session.sealed = stop_token == engine.tokenizer.convert_tokens_to_ids("<|im_end|>")
       thought, response = "".join(thought), "".join(response)
       session.metrics = metrics
       session.messages.append({"role": "assistant", "content": response, "thinking": thought, "cancelled": cancelled, "metrics": metrics})
@@ -321,7 +305,6 @@ class Handler(SimpleHTTPRequestHandler):
     except Exception as exc:
       if not disconnected: self._event({"error": f"{type(exc).__name__}: {exc}"})
     finally:
-      if generation: generation.close()
       session.generating = False
       session.cancel.clear()
       session.updated_at = time.time()
@@ -347,8 +330,7 @@ def main():
   parser.add_argument("--tokenizer", default="Qwen/Qwen3.5-9B")
   parser.add_argument("--drafter", choices=("none", "mtp", "dflash"), default="none")
   parser.add_argument("--draft-weights", default="weights/qwen35-9b-dflash-Q4_K_M.gguf")
-  parser.add_argument("--max-context", type=int, default=4096)
-  parser.add_argument("--max-new-tokens", type=int, default=10240)
+  parser.add_argument("--max-context", type=int, default=65536)
   parser.add_argument("--thinking", action="store_true")
   parser.add_argument("--speculative", action="store_true")
   parser.add_argument("--draft-tokens", type=int)

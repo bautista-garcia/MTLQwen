@@ -103,7 +103,7 @@
       <button id="settings-scrim" aria-label="Close settings"></button>
       <aside id="settings-panel" aria-label="Generation settings">
         <div class="settings-head">
-          <div><strong>Generation</strong><span>Applied to new responses</span></div>
+          <div><strong>Generation</strong><span>Sampling is fixed when a chat starts</span></div>
           <button id="settings-close" class="icon-btn" aria-label="Close settings">&times;</button>
         </div>
         <label class="toggle-row"
@@ -131,7 +131,7 @@
           ><input type="range" id="top_k" min="1" max="64" step="1" value="20"
         /></label>
         <label class="control-row"
-          ><span><strong>Maximum output</strong><output id="max_tokens-val">1024</output></span
+          ><span><strong>Output target</strong><output id="max_tokens-val">1024</output></span
           ><input type="range" id="max_tokens" min="64" max="4096" step="64" value="1024"
         /></label>
         <div class="settings-note">

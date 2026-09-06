@@ -1,18 +1,17 @@
 #include <metal_stdlib>
 using namespace metal;
 constant uint MAX_SEQUENCES = 8;
+constant uint HIDDEN = 4096;
+constant uint VOCAB = 248320;
 
 kernel void rmsnorm(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const float* w [[buffer(2)]],
-                    constant uint& rows [[buffer(3)]], constant uint& dim [[buffer(4)]], constant float& eps [[buffer(5)]],
                     uint lane [[thread_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
                     uint simd_group [[simdgroup_index_in_threadgroup]], uint2 pos [[threadgroup_position_in_grid]]) {
   uint row = pos.y;
-  if (row >= rows)
-    return;
   threadgroup float sums[9];
   float sum = 0.0f;
-  for (uint d = lane; d < dim; d += 256) {
-    float v = float(x[row * dim + d]);
+  for (uint d = lane; d < HIDDEN; d += 256) {
+    float v = float(x[row * HIDDEN + d]);
     sum += v * v;
   }
   sum = simd_sum(sum);
@@ -23,11 +22,11 @@ kernel void rmsnorm(device half* y [[buffer(0)]], device const half* x [[buffer(
     sum = simd_lane < 8 ? sums[simd_lane] : 0.0f;
     sum = simd_sum(sum);
     if (simd_lane == 0)
-      sums[8] = rsqrt(sum / float(dim) + eps);
+      sums[8] = rsqrt(sum / float(HIDDEN) + 1.0e-6f);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint d = lane; d < dim; d += 256)
-    y[row * dim + d] = half(float(x[row * dim + d]) * sums[8] * w[d]);
+  for (uint d = lane; d < HIDDEN; d += 256)
+    y[row * HIDDEN + d] = half(float(x[row * HIDDEN + d]) * sums[8] * w[d]);
 }
 
 // Packed rows use query_start_loc to recover the owning sequence without padding short decode queries.
@@ -79,34 +78,26 @@ kernel void mtp_fuse(device half* y [[buffer(0)]], device const half* embedding 
 }
 
 kernel void gather_rows(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const uint* rows [[buffer(2)]],
-                        constant uint& count [[buffer(3)]], constant uint& width [[buffer(4)]], uint i [[thread_position_in_grid]]) {
-  if (i < count * width)
-    y[i] = x[rows[i / width] * width + i % width];
+                        uint i [[thread_position_in_grid]]) {
+  y[i] = x[rows[i / HIDDEN] * HIDDEN + i % HIDDEN];
 }
 
-kernel void add_half(device half* y [[buffer(0)]], device const half* a [[buffer(1)]], device const half* b [[buffer(2)]],
-                     constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-  if (i < n)
-    y[i] = a[i] + b[i];
+kernel void add_half(device half* y [[buffer(0)]], device const half* a [[buffer(1)]], device const half* b [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  y[i] = a[i] + b[i];
 }
 
-kernel void silu_mul(device half* y [[buffer(0)]], device const half* gate [[buffer(1)]], device const half* up [[buffer(2)]],
-                     constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-  if (i < n) {
-    float g = float(gate[i]);
-    y[i] = half((g / (1.0f + exp(-g))) * float(up[i]));
-  }
+kernel void silu_mul(device half* y [[buffer(0)]], device const half* gate [[buffer(1)]], device const half* up [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  float g = float(gate[i]);
+  y[i] = half((g / (1.0f + exp(-g))) * float(up[i]));
 }
 
 [[max_total_threads_per_threadgroup(64)]]
 kernel void gdn_ba_prepare_4096x32(device half* beta [[buffer(0)]], device float* g [[buffer(1)]], device const half* x [[buffer(2)]],
                                    device const uchar* wb [[buffer(3)]], device const uchar* wa [[buffer(4)]], device const float* A [[buffer(5)]],
-                                   device const float* dt [[buffer(6)]], constant uint& rows [[buffer(7)]], constant bool& f32 [[buffer(8)]],
+                                   device const float* dt [[buffer(6)]], constant bool& f32 [[buffer(7)]],
                                    ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
                                    uint2 pos [[threadgroup_position_in_grid]]) {
   uint row = pos.y, out = pos.x;
-  if (row >= rows)
-    return;
   device const uchar* w = simd_group ? wa : wb;
   float sum = 0.0f;
   for (uint k = lane; k < 4096; k += 32) {
@@ -128,19 +119,15 @@ kernel void gdn_ba_prepare_4096x32(device half* beta [[buffer(0)]], device float
 }
 
 kernel void split_repeat_qk(device half* q [[buffer(0)]], device half* k [[buffer(1)]], device half* v [[buffer(2)]],
-                            device const half* mixed [[buffer(3)]], constant uint& rows [[buffer(4)]], uint i [[thread_position_in_grid]]) {
-  if (i >= rows * 4096)
-    return;
+                            device const half* mixed [[buffer(3)]], uint i [[thread_position_in_grid]]) {
   uint row = i / 4096, d = i % 4096, source = (d % 2048);
   q[i] = mixed[row * 8192 + source];
   k[i] = mixed[row * 8192 + 2048 + source];
   v[i] = mixed[row * 8192 + 4096 + d];
 }
 
-kernel void init_rope(device half2* rope [[buffer(0)]], constant uint& capacity [[buffer(1)]], constant float& theta [[buffer(2)]],
-                      constant uint& pairs [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-  if (i >= capacity * pairs)
-    return;
+kernel void init_rope(device half2* rope [[buffer(0)]], constant float& theta [[buffer(1)]], constant uint& pairs [[buffer(2)]],
+                      uint i [[thread_position_in_grid]]) {
   uint p = i / pairs, d = i % pairs;
   float angle = float(p) / pow(theta, float(d) / float(pairs));
   rope[i] = half2(half(cos(angle)), half(sin(angle)));
@@ -152,16 +139,16 @@ kernel void pad_rows(device half* y [[buffer(0)]], device const half* x [[buffer
     y[i] = i < rows * dim ? x[i] : half(0.0);
 }
 
-kernel void argmax_logits(device uint* token [[buffer(0)]], device const half* logits [[buffer(1)]], constant uint& n [[buffer(2)]],
-                          constant uint& group [[buffer(3)]], constant uint& stride [[buffer(4)]], uint lane [[thread_index_in_threadgroup]],
+kernel void argmax_logits(device uint* token [[buffer(0)]], device const half* logits [[buffer(1)]], constant uint& group [[buffer(2)]],
+                          constant uint& stride [[buffer(3)]], uint lane [[thread_index_in_threadgroup]],
                           uint2 position [[threadgroup_position_in_grid]]) {
   uint row = position.y;
   threadgroup float values[256];
   threadgroup uint indices[256];
   float best = -INFINITY;
   uint index = 0;
-  for (uint i = lane; i < n; i += 256) {
-    float v = float(logits[row * n + i]);
+  for (uint i = lane; i < VOCAB; i += 256) {
+    float v = float(logits[row * VOCAB + i]);
     if (v > best) {
       best = v;
       index = i;
@@ -182,8 +169,8 @@ kernel void argmax_logits(device uint* token [[buffer(0)]], device const half* l
 }
 
 kernel void sample_logits(device int* token [[buffer(0)]], device ulong* rng [[buffer(1)]], device const half* logits [[buffer(2)]],
-                          constant uint& n [[buffer(3)]], constant float& temperature [[buffer(4)]], constant float& top_p [[buffer(5)]],
-                          constant uint& top_k [[buffer(6)]], uint i [[thread_position_in_grid]]) {
+                          constant float& temperature [[buffer(3)]], constant float& top_p [[buffer(4)]], constant uint& top_k [[buffer(5)]],
+                          uint i [[thread_position_in_grid]]) {
   if (i)
     return;
   ulong state = rng[0];
@@ -194,20 +181,20 @@ kernel void sample_logits(device int* token [[buffer(0)]], device ulong* rng [[b
   float random = float(state >> 40) * (1.0f / 16777216.0f);
   if (!top_k) {
     float maximum = -INFINITY;
-    for (uint j = 0; j < n; ++j)
+    for (uint j = 0; j < VOCAB; ++j)
       maximum = max(maximum, float(logits[j]) / temperature);
     float total = 0.0f;
-    for (uint j = 0; j < n; ++j)
+    for (uint j = 0; j < VOCAB; ++j)
       total += exp(float(logits[j]) / temperature - maximum);
     float target = random * total, cumulative = 0.0f;
-    for (uint j = 0; j < n; ++j) {
+    for (uint j = 0; j < VOCAB; ++j) {
       cumulative += exp(float(logits[j]) / temperature - maximum);
       if (cumulative >= target) {
         token[0] = int(j);
         return;
       }
     }
-    token[0] = int(n - 1);
+    token[0] = int(VOCAB - 1);
     return;
   }
   float values[64];
@@ -216,7 +203,7 @@ kernel void sample_logits(device int* token [[buffer(0)]], device ulong* rng [[b
     values[j] = -INFINITY;
     indices[j] = 0;
   }
-  for (uint j = 0; j < n; ++j) {
+  for (uint j = 0; j < VOCAB; ++j) {
     float value = float(logits[j]) / temperature;
     if (value <= values[count - 1])
       continue;

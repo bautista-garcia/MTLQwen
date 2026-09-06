@@ -1,3 +1,3 @@
-from .inference import InferenceEngine
+from .inference import InferenceEngine, Sequence
 
-__all__ = ["InferenceEngine"]
+__all__ = ["InferenceEngine", "Sequence"]
