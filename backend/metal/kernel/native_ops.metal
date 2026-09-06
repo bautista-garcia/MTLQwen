@@ -82,11 +82,13 @@ kernel void gather_rows(device half* y [[buffer(0)]], device const half* x [[buf
   y[i] = x[rows[i / HIDDEN] * HIDDEN + i % HIDDEN];
 }
 
-kernel void add_half(device half* y [[buffer(0)]], device const half* a [[buffer(1)]], device const half* b [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+kernel void add_half(device half* y [[buffer(0)]], device const half* a [[buffer(1)]], device const half* b [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
   y[i] = a[i] + b[i];
 }
 
-kernel void silu_mul(device half* y [[buffer(0)]], device const half* gate [[buffer(1)]], device const half* up [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+kernel void silu_mul(device half* y [[buffer(0)]], device const half* gate [[buffer(1)]], device const half* up [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
   float g = float(gate[i]);
   y[i] = half((g / (1.0f + exp(-g))) * float(up[i]));
 }
@@ -94,9 +96,8 @@ kernel void silu_mul(device half* y [[buffer(0)]], device const half* gate [[buf
 [[max_total_threads_per_threadgroup(64)]]
 kernel void gdn_ba_prepare_4096x32(device half* beta [[buffer(0)]], device float* g [[buffer(1)]], device const half* x [[buffer(2)]],
                                    device const uchar* wb [[buffer(3)]], device const uchar* wa [[buffer(4)]], device const float* A [[buffer(5)]],
-                                   device const float* dt [[buffer(6)]], constant bool& f32 [[buffer(7)]],
-                                   ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
-                                   uint2 pos [[threadgroup_position_in_grid]]) {
+                                   device const float* dt [[buffer(6)]], constant bool& f32 [[buffer(7)]], ushort lane [[thread_index_in_simdgroup]],
+                                   ushort simd_group [[simdgroup_index_in_threadgroup]], uint2 pos [[threadgroup_position_in_grid]]) {
   uint row = pos.y, out = pos.x;
   device const uchar* w = simd_group ? wa : wb;
   float sum = 0.0f;
@@ -168,16 +169,16 @@ kernel void argmax_logits(device uint* token [[buffer(0)]], device const half* l
     token[(row % group) * stride + row / group] = indices[0];
 }
 
-kernel void sample_logits(device int* token [[buffer(0)]], device ulong* rng [[buffer(1)]], device const half* logits [[buffer(2)]],
-                          constant float& temperature [[buffer(3)]], constant float& top_p [[buffer(4)]], constant uint& top_k [[buffer(5)]],
-                          uint i [[thread_position_in_grid]]) {
-  if (i)
-    return;
+kernel void sample_logits(device int* token [[buffer(0)]], device const ulong* rng [[buffer(1)]], device ulong* sampled_rng [[buffer(2)]],
+                          device const half* logits [[buffer(3)]], constant float& temperature [[buffer(4)]], constant float& top_p [[buffer(5)]],
+                          constant uint& top_k [[buffer(6)]], constant uint& offset [[buffer(7)]]) {
   ulong state = rng[0];
-  state ^= state << 13;
-  state ^= state >> 7;
-  state ^= state << 17;
-  rng[0] = state;
+  for (uint i = 0; i <= offset; ++i) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+  }
+  sampled_rng[0] = state;
   float random = float(state >> 40) * (1.0f / 16777216.0f);
   if (!top_k) {
     float maximum = -INFINITY;

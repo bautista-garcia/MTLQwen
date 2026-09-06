@@ -160,11 +160,10 @@ void SparseKV::map(uint32_t virtualBlock, uint32_t physicalBlock) {
   using Operation = MTL4::UpdateSparseBufferMappingOperation;
   for (uint32_t resource = 0; resource < 2; ++resource) {
     auto operation = [&](uint32_t layer) {
-      return Operation{mode, NS::Range::Make(uint64_t(layer) * virtualBlocks + virtualBlock, 1),
-                       heap ? heapOffset + resource * layers + layer : 0};
+      return Operation{mode, NS::Range::Make(uint64_t(layer) * virtualBlocks + virtualBlock, 1), heap ? heapOffset + resource * layers + layer : 0};
     };
-    Operation operations[]{operation(0), operation(1), operation(2),  operation(3),  operation(4),  operation(5),  operation(6),
-                           operation(7), operation(8), operation(9),  operation(10), operation(11), operation(12), operation(13)};
+    Operation operations[]{operation(0), operation(1), operation(2), operation(3),  operation(4),  operation(5),  operation(6),
+                           operation(7), operation(8), operation(9), operation(10), operation(11), operation(12), operation(13)};
     device.queue->updateBufferMappings(resources[resource].buffer.get(), heap, operations, layers);
   }
 }
@@ -188,16 +187,11 @@ uint64_t hashBlock(uint64_t hash, const int32_t* tokens) {
 }
 void copyCheckpoint(Engine& model, Sequence& sequence, const Tensor& arena, bool restore) {
   Device& copies = model.device.command();
-  for (uint32_t i = 0; i < model.layers.size(); ++i)
-    if ((i + 1) % fullAttentionInterval) {
-      GdnState state = gdnState(model.gdnStates[restore ? 0 : sequence.bank], maxBatchSequences, i);
-      Tensor recurrent = state.recurrent.view(uint64_t(sequence.slot) * recurrentStateBytes, recurrentStateBytes);
-      Tensor conv = state.conv.view(uint64_t(sequence.slot) * convStateBytes, convStateBytes);
-      Tensor cachedRecurrent = arena.view(gdnOffset(i), recurrentStateBytes),
-             cachedConv = arena.view(gdnOffset(i) + recurrentStateBytes, convStateBytes);
-      copies.copy(restore ? cachedRecurrent : recurrent, restore ? recurrent : cachedRecurrent);
-      copies.copy(restore ? cachedConv : conv, restore ? conv : cachedConv);
-    }
+  Tensor state = model.gdnStates[restore ? 0 : sequence.bank];
+  if (restore)
+    copyGdnState(copies, arena, 1, 0, state, maxBatchSequences, sequence.slot);
+  else
+    copyGdnState(copies, state, maxBatchSequences, sequence.slot, arena, 1, 0);
   if (model.drafter == Drafter::mtp) {
     Tensor seed = mtpSeed(model, sequence, restore ? 0 : sequence.bank), cached = arena.view(gdnCheckpointBytes, 8192);
     copies.copy(restore ? cached : seed, restore ? seed : cached);
@@ -207,6 +201,24 @@ void copyCheckpoint(Engine& model, Sequence& sequence, const Tensor& arena, bool
 } // namespace
 Tensor mtpSeed(Engine& model, const Sequence& sequence, uint32_t bank) {
   return model.mtpSeeds.view(uint64_t(bank * maxBatchSequences + sequence.slot) * 8192, 8192);
+}
+void copyGdnState(Device& commands, const Tensor& source, uint32_t sourceRows, uint32_t sourceRow, const Tensor& destination,
+                  uint32_t destinationRows, uint32_t destinationRow) {
+  for (uint32_t layer = 0; layer < targetLayers; ++layer)
+    if ((layer + 1) % fullAttentionInterval) {
+      GdnState from = gdnState(source, sourceRows, layer), to = gdnState(destination, destinationRows, layer);
+      commands.copy(from.recurrent.view(uint64_t(sourceRow) * recurrentStateBytes, recurrentStateBytes),
+                    to.recurrent.view(uint64_t(destinationRow) * recurrentStateBytes, recurrentStateBytes));
+      commands.copy(from.conv.view(uint64_t(sourceRow) * convStateBytes, convStateBytes),
+                    to.conv.view(uint64_t(destinationRow) * convStateBytes, convStateBytes));
+    }
+}
+void Engine::commitCandidate(Device& commands, Sequence& sequence, uint32_t stateRow, uint32_t queryRow, uint32_t accepted) {
+  copyGdnState(commands, candidateStates, candidateStates.bytes / gdnCheckpointBytes, stateRow, gdnStates[1 - sequence.bank], maxBatchSequences,
+               sequence.slot);
+  if (drafter == Drafter::mtp)
+    commands.copy(workspace.targetHidden.view(uint64_t(queryStartLoc.contents<uint32_t>()[queryRow] + accepted) * 8192, 8192),
+                  mtpSeed(*this, sequence, 1 - sequence.bank));
 }
 void Engine::bind(Sequence& sequence, uint32_t logical, uint32_t physical) {
   uint32_t block = physical == unbound ? sequence.bindings[logical] : physical;
@@ -226,7 +238,7 @@ uint32_t Engine::acquireBlock() {
       return (a.refs ? UINT64_MAX : a.touch) < (b.refs ? UINT64_MAX : b.touch);
     });
     if (victim->refs)
-      throw std::runtime_error("KV block pool has no evictable capacity");
+      return unbound;
     physical = victim - blocks.begin();
     for (auto checkpoint = checkpointCache.begin(); checkpoint != checkpointCache.end();)
       if (std::find(checkpoint->second.bindings.begin(), checkpoint->second.bindings.end(), physical) != checkpoint->second.bindings.end())
@@ -237,17 +249,21 @@ uint32_t Engine::acquireBlock() {
   blocks[physical] = {};
   return physical;
 }
-void Engine::reserve(const Batch& batch) {
+bool Engine::reserve(const Batch& batch) {
   for (uint32_t row = 0; row < batch.size; ++row) {
     Sequence& sequence = *batch.queries[row].sequence;
     for (uint32_t logical = sequence.kvValid / blockTokens; logical <= (sequence.kvValid + batch.queries[row].count - 1) / blockTokens; ++logical) {
       if (sequence.bindings[logical] == unbound) {
         kv->ensure(std::min<uint32_t>(physicalBlocks + 1, blocks.size()));
-        bind(sequence, logical, acquireBlock());
+        uint32_t physical = acquireBlock();
+        if (physical == unbound)
+          return false;
+        bind(sequence, logical, physical);
       }
       blocks[sequence.bindings[logical]].touch = ++clock;
     }
   }
+  return true;
 }
 uint32_t Engine::lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_t length) {
   uint32_t limit = (length - 1) / blockTokens;
@@ -298,8 +314,8 @@ void Engine::publishPrefix(Sequence& sequence, uint32_t oldValid, uint32_t valid
   } catch (...) {
   }
 }
-Sequence::Sequence(Engine& owner, const int32_t* stopTokens, uint32_t stopCount, float samplingTemperature, float samplingTopP,
-                   int32_t samplingTopK, uint32_t drafts)
+Sequence::Sequence(Engine& owner, const int32_t* stopTokens, uint32_t stopCount, float samplingTemperature, float samplingTopP, int32_t samplingTopK,
+                   uint32_t drafts)
     : engine(owner), bindings(owner.blocks.size(), unbound), draftTokens(drafts), temperature(samplingTemperature), topP(samplingTopP),
       topK(samplingTopK) {
   std::lock_guard lock(engine.mutex);

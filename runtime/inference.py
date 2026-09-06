@@ -19,33 +19,35 @@ def _load():
                     "-framework", "Foundation", "-framework", "Metal", "-o", str(LIB)], check=True)
   lib = ctypes.CDLL(LIB)
   void = ctypes.c_void_p
-  lib.infeng_last_error.restype = ctypes.c_char_p
-  lib.infeng_engine_create.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32)
+  lib.infeng_engine_create.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p)
   lib.infeng_engine_create.restype = void
   lib.infeng_engine_release.argtypes = (void, )
   lib.infeng_sequence_create.argtypes = (void, ctypes.POINTER(ctypes.c_int32), ctypes.c_uint32, ctypes.c_float, ctypes.c_float,
-                                         ctypes.c_int32, ctypes.c_uint32)
+                                         ctypes.c_int32, ctypes.c_uint32, ctypes.c_char_p)
   lib.infeng_sequence_create.restype = void
   lib.infeng_sequence_release.argtypes = (void, )
   lib.infeng_sequence_append.argtypes, lib.infeng_sequence_append.restype = (void, ctypes.POINTER(ctypes.c_int32), ctypes.c_uint32), ctypes.c_int32
   lib.infeng_sequence_read.argtypes, lib.infeng_sequence_read.restype = (void, ctypes.c_uint32), ctypes.c_int32
-  lib.infeng_sequence_cancel.argtypes = (void, )
-  lib.infeng_info.argtypes = (void, void, ctypes.POINTER(_Info))
+  lib.infeng_engine_info.argtypes, lib.infeng_engine_info.restype = (void, ctypes.c_uint32), ctypes.c_uint64
+  lib.infeng_sequence_info.argtypes, lib.infeng_sequence_info.restype = (void, ctypes.c_uint32), ctypes.c_uint64
   return lib
 _LIB = _load()
-def _check(value):
-  if value is None or value == -2: raise RuntimeError((_LIB.infeng_last_error() or b"native Metal operation failed").decode())
+def _check(value, error=None):
+  errors = {-3: "sequence is still generating", -4: "completion has no available model context", -5: "KV block pool has no evictable capacity"}
+  if value is None or value == -2: raise RuntimeError((error.value or b"native Metal operation failed").decode())
+  if value in errors: raise RuntimeError(errors[value])
   return value
 def _snapshot(engine, sequence=None):
-  value = _Info()
-  _LIB.infeng_info(engine, sequence, ctypes.byref(value))
-  return value
+  values = [_LIB.infeng_engine_info(engine, field) for field in range(3)]
+  values += [_LIB.infeng_sequence_info(sequence, field) for field in range(3)] if sequence else [0] * 3
+  return _Info(*values)
 class Sequence:
   def __init__(self, engine, stop_token_ids, temperature, top_p, top_k, draft_tokens):
     self.engine, self.handle = engine, 0
     self.stop_token_ids, self.draft_tokens = frozenset(stop_token_ids), draft_tokens
     stops = (ctypes.c_int32 * len(stop_token_ids))(*stop_token_ids)
-    self.handle = _check(_LIB.infeng_sequence_create(engine.handle, stops, len(stops), temperature, top_p, top_k or 0, draft_tokens))
+    error = ctypes.create_string_buffer(1024)
+    self.handle = _check(_LIB.infeng_sequence_create(engine.handle, stops, len(stops), temperature, top_p, top_k or 0, draft_tokens, error), error)
   def append(self, prompt=""):
     if isinstance(prompt, str):
       if prompt and self.engine.tokenizer is None: raise RuntimeError("string completion requires a tokenizer")
@@ -57,7 +59,7 @@ class Sequence:
     value = _check(_LIB.infeng_sequence_read(self.handle, cursor))
     return None if value == -1 else value
   def cancel(self):
-    if self.handle: _LIB.infeng_sequence_cancel(self.handle)
+    if self.handle: _LIB.infeng_sequence_append(self.handle, None, 0xffffffff)
   @property
   def length(self): return _snapshot(self.engine.handle, self.handle).valid
   def speculative_counters(self):
@@ -78,7 +80,8 @@ class InferenceEngine:
     if drafter != "dflash" and draft_weights is not None: raise ValueError("draft_weights is only valid for dflash")
     native, max_drafts, default_drafts = drafters[drafter]
     draft_path = str(draft_weights).encode() if draft_weights is not None else None
-    self.handle = _check(_LIB.infeng_engine_create(str(weights).encode(), draft_path, str(KERNELS).encode(), max_context, native))
+    error = ctypes.create_string_buffer(1024)
+    self.handle = _check(_LIB.infeng_engine_create(str(weights).encode(), draft_path, str(KERNELS).encode(), max_context, native, error), error)
     self.max_context, self.drafter, self.max_batch_sequences, self.vocab_size = max_context, drafter, MAX_BATCH, VOCAB
     self.max_draft_tokens, self.default_draft_tokens = max_drafts, default_drafts
     self.tokenizer = None

@@ -1,5 +1,6 @@
 #pragma once
 #include <Metal/Metal.hpp>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -47,6 +48,7 @@ class Device {
   Tensor own(MTL::Buffer* buffer, uint64_t bytes);
   void add(MTL::Allocation* allocation);
   void remove(MTL::Allocation* allocation);
+
 public:
   Device(const std::filesystem::path& kernels);
   Device(const Device&) = delete;
@@ -68,7 +70,8 @@ public:
 class SparseKV {
   static constexpr uint64_t pageBytes = 256ull << 10, heapBytes = 64ull << 20;
   Device& device;
-  uint32_t virtualBlocks, maxPhysicalBlocks, layers, tilesPerBlock, physicalBlocks = 0, blocksPerHeap;
+  uint32_t virtualBlocks, maxPhysicalBlocks, layers, tilesPerBlock, blocksPerHeap;
+  std::atomic_uint32_t physicalBlocks = 0;
   uint64_t regionBytes;
   Tensor resources[2];
   std::vector<NS::SharedPtr<MTL::Heap>> heaps;
@@ -77,6 +80,7 @@ class SparseKV {
   Tensor view(uint32_t resource, uint32_t region) const {
     return {resources[resource].buffer, uint64_t(region) * regionBytes, regionBytes};
   }
+
 public:
   SparseKV(Device&, uint32_t virtualBlocks, uint32_t physicalBlocks, uint32_t targetLayers, uint32_t drafterLayers);
   ~SparseKV();

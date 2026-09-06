@@ -107,8 +107,8 @@ Engine::Engine(const std::filesystem::path& path, const std::filesystem::path& k
   rope = makeRope(32);
   if (drafter == Drafter::dflash)
     dflashRope = makeRope(64);
-  Tensor* controls[]{&inputIds,    &batchKvValid, &queryStartLoc, &draftPositions, &sequenceSlots, &stateBanks,
-                     &draftTokens, &outputTokens, &rng,           &logitRows};
+  Tensor* controls[]{&inputIds,     &batchKvValid, &queryStartLoc, &draftPositions, &sequenceSlots, &stateBanks, &draftTokens,
+                     &outputTokens, &sampledRng,   &rng,           &logitRows};
   Tensor control = device.empty(sizeof(controls) / sizeof(*controls) * 512, true);
   for (uint32_t i = 0; i < sizeof(controls) / sizeof(*controls); ++i)
     *controls[i] = control.view(uint64_t(i) * 512, 512);
