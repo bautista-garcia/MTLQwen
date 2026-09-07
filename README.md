@@ -80,7 +80,7 @@ struct Sequence {
 
   uint64_t drafted = 0;              // Total proposals generated
   uint64_t accepted = 0;             // Total proposals accepted by the target
-  uint64_t prefixHash = 0;            // Chained hash through the committed full blocks
+  uint64_t prefixHash = 0;            // Chained hash through the last committed checkpoint
   uint32_t kvValid = 0;               // Number of tokens committed to target K/V and GDN state
 
   uint32_t slot;                      // Index in Engine.sequences and all per-slot GPU state
@@ -145,7 +145,7 @@ At this point each query contains only its `Sequence*`. The remaining fields are
 
 Only a selected sequence with `kvValid == 0` performs prefix lookup.
 
-The engine hashes consecutive 128-token blocks. A cache hit is usable only at a 512-token boundary and must leave at least one request token for a target pass.
+The engine hashes and queries consecutive 512-token checkpoints. A cache hit must leave at least one request token for a target pass.
 
 For the deepest usable hit, C++:
 
@@ -352,7 +352,7 @@ request[0 : kvValid]  has valid target K/V and GDN state
 request[kvValid : ]   is pending work
 ```
 
-Complete 128-token blocks extend the sequence's prefix hash. At an exact 512-token boundary, the engine may publish a new prefix checkpoint.
+At an exact 512-token boundary, the engine extends the sequence's prefix hash and may publish a new prefix checkpoint.
 
 ### 12. Continue, stream, or stop
 

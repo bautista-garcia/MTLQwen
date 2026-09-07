@@ -5,9 +5,9 @@
 #include <stdexcept>
 namespace infeng::qwen35 {
 namespace {
-uint64_t hashBlock(uint64_t hash, const int32_t* tokens) {
+uint64_t hashCheckpoint(uint64_t hash, const int32_t* tokens) {
   hash ^= 0x9e3779b97f4a7c15ull;
-  for (uint32_t i = 0; i < blockTokens; ++i) {
+  for (uint32_t i = 0; i < gdnCheckpointTokens; ++i) {
     hash ^= uint32_t(tokens[i]) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
     hash *= 0x100000001b3ull;
   }
@@ -94,13 +94,13 @@ bool Engine::reserve(const Batch& batch) {
   return true;
 }
 uint32_t Engine::lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_t length) {
-  uint32_t limit = (length - 1) / blockTokens;
+  uint32_t limit = (length - 1) / gdnCheckpointTokens;
   uint64_t hash = 0;
   HybridCheckpoint* checkpoint = nullptr;
-  for (uint32_t logical = 0; logical < limit; ++logical) {
-    hash = hashBlock(hash, tokens + uint64_t(logical) * blockTokens);
+  for (uint32_t index = 0; index < limit; ++index) {
+    hash = hashCheckpoint(hash, tokens + uint64_t(index) * gdnCheckpointTokens);
     auto found = checkpointCache.find(hash);
-    if (!((logical + 1) * blockTokens % gdnCheckpointTokens) && found != checkpointCache.end()) {
+    if (found != checkpointCache.end()) {
       checkpoint = &found->second;
       sequence.prefixHash = hash;
     }
@@ -116,15 +116,11 @@ uint32_t Engine::lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_
   sequence.bank = 0;
   return checkpoint->bindings.size() * blockTokens;
 }
-void Engine::publishPrefix(Sequence& sequence, uint32_t oldValid, uint32_t valid) {
+void Engine::publishPrefix(Sequence& sequence) {
   try {
-    uint32_t first = oldValid / blockTokens, count = valid / blockTokens;
-    if (first >= count)
+    if (sequence.kvValid % gdnCheckpointTokens)
       return;
-    for (uint32_t logical = first; logical < count; ++logical)
-      sequence.prefixHash = hashBlock(sequence.prefixHash, sequence.request.data() + uint64_t(logical) * blockTokens);
-    if (valid % gdnCheckpointTokens)
-      return;
+    sequence.prefixHash = hashCheckpoint(sequence.prefixHash, sequence.request.data() + sequence.kvValid - gdnCheckpointTokens);
     if (checkpointCache.count(sequence.prefixHash)) {
       checkpointCache.at(sequence.prefixHash).touch = ++clock;
       return;
@@ -135,7 +131,7 @@ void Engine::publishPrefix(Sequence& sequence, uint32_t oldValid, uint32_t valid
       checkpointCache.erase(victim);
     }
     HybridCheckpoint checkpoint{device.empty(gdnCheckpointBytes + (drafter == Drafter::mtp ? 8192 : 0)),
-                                {sequence.bindings.begin(), sequence.bindings.begin() + valid / blockTokens},
+                                {sequence.bindings.begin(), sequence.bindings.begin() + sequence.kvValid / blockTokens},
                                 ++clock};
     copyCheckpoint(*this, sequence, checkpoint.arena, false);
     checkpointCache.emplace(sequence.prefixHash, std::move(checkpoint));
@@ -231,7 +227,7 @@ bool Engine::execute(Batch& batch) {
     Query& query = batch.queries[row];
     Sequence& sequence = *query.sequence;
     bool draft = query.state != unbound;
-    uint32_t accepted = 0, oldValid = sequence.kvValid;
+    uint32_t accepted = 0;
     bool acceptedStop = false;
     uint32_t draftRow = draft ? query.state / query.count : 0;
     if (draft) {
@@ -251,7 +247,6 @@ bool Engine::execute(Batch& batch) {
     sequence.accepted += accepted;
     if (sequence.temperature > 0 && query.logit != unbound)
       rng.contents<uint64_t>()[sequence.slot] = sampledRng.contents<uint64_t>()[query.logit + accepted - acceptedStop];
-    query.state = oldValid;
     sequence.bank ^= 1;
     sequence.active = sequence.active && sequence.kvValid < maxContext &&
                       (query.logit == unbound || !std::count(sequence.stops.begin(), sequence.stops.end(), sequence.request.back()));
@@ -259,7 +254,7 @@ bool Engine::execute(Batch& batch) {
   if (copies)
     copies->commit();
   for (uint32_t row = 0; row < batch.size; ++row)
-    publishPrefix(*batch.queries[row].sequence, batch.queries[row].state, batch.queries[row].sequence->kvValid);
+    publishPrefix(*batch.queries[row].sequence);
   return true;
 }
 } // namespace infeng::qwen35

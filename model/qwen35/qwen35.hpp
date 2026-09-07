@@ -127,7 +127,7 @@ struct Engine {
   void bind(Sequence& sequence, uint32_t logical, uint32_t physical);
   void commitCandidate(Device& commands, Sequence& sequence, uint32_t stateRow, uint32_t queryRow, uint32_t accepted);
   uint32_t lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_t length);
-  void publishPrefix(Sequence& sequence, uint32_t oldValid, uint32_t valid);
+  void publishPrefix(Sequence& sequence);
   void schedule();
   bool execute(Batch& batch);
 };
