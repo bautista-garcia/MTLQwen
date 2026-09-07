@@ -529,11 +529,11 @@ Python owns only the native handle, optional tokenizer, stop-token copy used by 
 
 ```text
 runtime/inference.py          Python API and C ABI bindings
-model/qwen.cpp                scheduler, query sizing, commit, and C API
-model/qwen35.hpp              engine, sequence, batch, and model state
-model/qwen35_weights.cpp      weight loading, pipelines, and engine construction
-model/qwen_ops.cpp            draft and target forward passes
-backend/metal/device.cpp      Metal commands, sparse allocation, and prefix cache
+runtime/engine.cpp            scheduler, query sizing, cache, commit, and C API
+model/qwen35/qwen35.hpp       engine, sequence, batch, and model state
+model/qwen35/model.cpp        weight loading, pipelines, and engine construction
+model/qwen35/forward.cpp      draft and target forward passes
+backend/metal/device.cpp      Metal commands and sparse allocation
 backend/metal/kernel/*.metal  GPU kernels
 ```
 

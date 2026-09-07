@@ -1,4 +1,4 @@
-#include "qwen35.hpp"
+#include "model/qwen35/qwen35.hpp"
 #include <chrono>
 #include <gguf.h>
 #include <tuple>

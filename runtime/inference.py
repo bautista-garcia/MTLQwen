@@ -4,13 +4,13 @@ import subprocess
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LIB, KERNELS = ROOT / ".build/libinfeng.dylib", ROOT / "backend/metal/kernel"
-SOURCES = [ROOT / path for path in ("backend/metal/device.cpp", "model/qwen35_weights.cpp", "model/qwen_ops.cpp", "model/qwen.cpp")]
+SOURCES = [ROOT / path for path in ("backend/metal/device.cpp", "model/qwen35/model.cpp", "model/qwen35/forward.cpp", "runtime/engine.cpp")]
 MAX_BATCH, MAX_DRAFTS, VOCAB = 8, 7, 248320
 class _Info(ctypes.Structure):
   _fields_ = ([(name, ctypes.c_uint64) for name in ("parameters", "weight_bytes", "mapped_bytes", "drafted", "accepted")] +
               [("valid", ctypes.c_uint32)])
 def _load():
-  headers = [*ROOT.glob("backend/metal/*.hpp"), *ROOT.glob("model/*.hpp"), *(ROOT / "third_party/metal-cpp").rglob("*.hpp")]
+  headers = [*ROOT.glob("backend/metal/*.hpp"), *(ROOT / "model").rglob("*.hpp"), *(ROOT / "third_party/metal-cpp").rglob("*.hpp")]
   if not LIB.exists() or any(path.stat().st_mtime > LIB.stat().st_mtime for path in [*SOURCES, *headers]):
     LIB.parent.mkdir(parents=True, exist_ok=True)
     ggml = subprocess.check_output(["pkg-config", "--cflags", "--libs", "ggml"], text=True).split()
