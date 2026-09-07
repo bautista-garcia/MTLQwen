@@ -145,8 +145,7 @@ Sequence::Sequence(Engine& owner, const int32_t* stopTokens, uint32_t stopCount,
   std::lock_guard lock(engine.mutex);
   request.reserve(owner.maxContext + 1);
   stops.assign(stopTokens, stopTokens + stopCount);
-  for (slot = 0; slot < maxBatchSequences && engine.sequences[slot]; ++slot) {
-  }
+  slot = std::find(engine.sequences.begin(), engine.sequences.end(), nullptr) - engine.sequences.begin();
   if (slot == maxBatchSequences)
     throw std::runtime_error("maximum live sequence count reached");
   engine.sequences[slot] = this;
