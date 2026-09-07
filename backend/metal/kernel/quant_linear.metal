@@ -113,9 +113,9 @@ static inline __attribute__((always_inline)) void dequant_tile(iq4xs_tag, thread
 template <typename Q, uint K, uint N>
 [[max_total_threads_per_threadgroup(64)]]
 kernel void prefill_qk_small(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const uchar* w [[buffer(2)]],
-                             constant long& M [[buffer(3)]], uint3 lane3 [[thread_position_in_threadgroup]],
-                             uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
-                             uint3 group [[threadgroup_position_in_grid]]) {
+                             device const half* residual [[buffer(3)]], constant long& M [[buffer(4)]], constant uint& add [[buffer(5)]],
+                             uint3 lane3 [[thread_position_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
+                             uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x;
   long n0 = long(group.x) * 8;
   threadgroup half b_tile[256 * 9];
@@ -137,14 +137,17 @@ kernel void prefill_qk_small(device half* y [[buffer(0)]], device const half* x 
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint idx = lane; idx < uint(M) * 8; idx += 64) {
     uint r = idx >> 3, n = idx & 7, offset = r * 8 + n;
-    y[r * N + n0 + n] = half(scratch[offset] + scratch[offset + 64]);
+    uint output = r * N + n0 + n;
+    half value = half(scratch[offset] + scratch[offset + 64]);
+    y[output] = add ? value + residual[output] : value;
   }
 }
 
 template <typename Q, uint K, uint N>
 [[max_total_threads_per_threadgroup(512)]]
 kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const uchar* w [[buffer(2)]],
-                       constant long& M [[buffer(3)]], uint3 lane3 [[thread_position_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
+                       device const half* residual [[buffer(3)]], constant long& M [[buffer(4)]], constant uint& add [[buffer(5)]],
+                       uint3 lane3 [[thread_position_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
                        uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x, rb = simd_group * 8;
   long n0 = long(group.x) * 32, m0 = long(group.y) * 128;
@@ -171,7 +174,9 @@ kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buff
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint idx = lane; idx < uint(M) * 32; idx += 512) {
       uint r = idx >> 5, n = idx & 31, tile = n >> 3;
-      y[r * N + n0 + n] = half(scratch[tile * 64 + r * 8 + (n & 7)]);
+      uint output = r * N + n0 + n;
+      half value = half(scratch[tile * 64 + r * 8 + (n & 7)]);
+      y[output] = add ? value + residual[output] : value;
     }
     return;
   }
@@ -211,7 +216,9 @@ kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buff
   uint rows = uint(min(128l, M - m0));
   for (uint idx = lane; idx < rows * 16; idx += 512) {
     uint r = idx >> 4, cp = idx & 15, e = (r & 7) * 32 + (cp << 1);
-    y2[((m0 + r) * N + n0 + (cp << 1)) >> 1] = half2(half(scratch[(r >> 3) * 256 + e]), half(scratch[(r >> 3) * 256 + e + 1]));
+    uint output = ((m0 + r) * N + n0 + (cp << 1)) >> 1;
+    half2 value = half2(half(scratch[(r >> 3) * 256 + e]), half(scratch[(r >> 3) * 256 + e + 1]));
+    y2[output] = add ? value + reinterpret_cast<device const half2*>(residual)[output] : value;
   }
 }
 
@@ -570,7 +577,8 @@ kernel void q4_k_embed(device half* y [[buffer(0)]], device const int* ids [[buf
   y[t * 4096 + col] = half(float(h16(w + o)) * float(sc) * float(v) - float(h16(w + o + 2)) * float(mn));
 }
 
-#define PREFILL_ARGS device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3
+#define PREFILL_ARGS                                                                                                                                 \
+  device half*, device const half*, device const uchar*, device const half*, constant long&, constant uint&, uint3, uint, uint, uint3
 template [[host_name("q4_k_k4096_n1024_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 1024>(PREFILL_ARGS);
 template [[host_name("q4_k_k4096_n1024_prefill_small")]] kernel void prefill_qk_small<q4k_tag, 4096, 1024>(PREFILL_ARGS);
 template [[host_name("q4_k_k4096_n4096_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 4096>(PREFILL_ARGS);

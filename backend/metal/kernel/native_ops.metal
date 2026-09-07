@@ -82,11 +82,6 @@ kernel void gather_rows(device half* y [[buffer(0)]], device const half* x [[buf
   y[i] = x[rows[i / HIDDEN] * HIDDEN + i % HIDDEN];
 }
 
-kernel void add_half(device half* y [[buffer(0)]], device const half* a [[buffer(1)]], device const half* b [[buffer(2)]],
-                     uint i [[thread_position_in_grid]]) {
-  y[i] = a[i] + b[i];
-}
-
 kernel void silu_mul(device half* y [[buffer(0)]], device const half* gate [[buffer(1)]], device const half* up [[buffer(2)]],
                      uint i [[thread_position_in_grid]]) {
   float g = float(gate[i]);
@@ -134,12 +129,6 @@ kernel void init_rope(device half2* rope [[buffer(0)]], constant float& theta [[
   rope[i] = half2(half(cos(angle)), half(sin(angle)));
 }
 
-kernel void pad_rows(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], constant uint& rows [[buffer(2)]],
-                     constant uint& padded [[buffer(3)]], constant uint& dim [[buffer(4)]], uint i [[thread_position_in_grid]]) {
-  if (i < padded * dim)
-    y[i] = i < rows * dim ? x[i] : half(0.0);
-}
-
 kernel void argmax_logits(device uint* token [[buffer(0)]], device const half* logits [[buffer(1)]], constant uint& group [[buffer(2)]],
                           constant uint& stride [[buffer(3)]], uint lane [[thread_index_in_threadgroup]],
                           uint2 position [[threadgroup_position_in_grid]]) {
@@ -171,14 +160,15 @@ kernel void argmax_logits(device uint* token [[buffer(0)]], device const half* l
 
 kernel void sample_logits(device int* token [[buffer(0)]], device const ulong* rng [[buffer(1)]], device ulong* sampled_rng [[buffer(2)]],
                           device const half* logits [[buffer(3)]], constant float& temperature [[buffer(4)]], constant float& top_p [[buffer(5)]],
-                          constant uint& top_k [[buffer(6)]], constant uint& offset [[buffer(7)]]) {
+                          constant uint& top_k [[buffer(6)]], uint i [[thread_position_in_grid]]) {
   ulong state = rng[0];
-  for (uint i = 0; i <= offset; ++i) {
+  for (uint step = 0; step <= i; ++step) {
     state ^= state << 13;
     state ^= state >> 7;
     state ^= state << 17;
   }
-  sampled_rng[0] = state;
+  sampled_rng[i] = state;
+  logits += ulong(i) * VOCAB;
   float random = float(state >> 40) * (1.0f / 16777216.0f);
   if (!top_k) {
     float maximum = -INFINITY;
@@ -191,11 +181,11 @@ kernel void sample_logits(device int* token [[buffer(0)]], device const ulong* r
     for (uint j = 0; j < VOCAB; ++j) {
       cumulative += exp(float(logits[j]) / temperature - maximum);
       if (cumulative >= target) {
-        token[0] = int(j);
+        token[i] = int(j);
         return;
       }
     }
-    token[0] = int(VOCAB - 1);
+    token[i] = int(VOCAB - 1);
     return;
   }
   float values[64];
@@ -230,9 +220,9 @@ kernel void sample_logits(device int* token [[buffer(0)]], device const ulong* r
   for (uint j = 0; j < keep; ++j) {
     cumulative += exp(values[j] - values[0]);
     if (cumulative >= target) {
-      token[0] = int(indices[j]);
+      token[i] = int(indices[j]);
       return;
     }
   }
-  token[0] = int(indices[keep - 1]);
+  token[i] = int(indices[keep - 1]);
 }

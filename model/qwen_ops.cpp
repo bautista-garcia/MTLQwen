@@ -1,5 +1,6 @@
 #include "qwen35.hpp"
 #include <algorithm>
+#include <numeric>
 namespace infeng::qwen35 {
 namespace {
 constexpr uint32_t attentionConcurrency = 8;
@@ -11,12 +12,6 @@ struct Ops {
   Engine& model;
   Scratch& scratch;
   Tensor linear(const Tensor& x, const Linear& weight, uint32_t rows, Tensor output, const Tensor& residual = {}) {
-    if (residual.buffer && !scratch.decodeMode) {
-      Tensor projected = linear(x, weight, rows, scratch.mlpGate);
-      uint32_t elements = rows * weight.n;
-      commands.dispatch("add_half", size(elements), size(256), {output, residual, projected});
-      return output;
-    }
     if (scratch.decodeMode) {
       uint32_t group = weight.pipeline[linearDecode]->maxTotalThreadsPerThreadgroup();
       MTL::Size threads = size((weight.n + weight.outputsPerGroup - 1) / weight.outputsPerGroup * group, rows);
@@ -26,17 +21,12 @@ struct Ops {
         commands.dispatch(weight.pipeline[linearDecode], threads, size(group), {output, x, weight.weight});
       return output;
     }
-    uint32_t padded = (rows + 7) / 8 * 8;
-    Tensor source = x;
-    if (padded != rows) {
-      source = scratch.padInput.view(0, uint64_t(padded) * weight.k * 2);
-      commands.dispatch("pad_rows", size(uint64_t(padded) * weight.k), size(256), {source, x}, rows, padded, weight.k);
-    }
-    bool small = padded <= 8;
+    bool small = rows <= 8;
+    bool add = bool(residual.buffer);
     Pipeline* pipeline = weight.pipeline[small ? linearPrefillSmall : linearPrefill];
     MTL::Size group = size(small ? 64 : 512);
-    MTL::Size threads = size(group.width * (weight.n / (small ? 8 : 32)), (padded + 127) / 128);
-    commands.dispatch(pipeline, threads, group, {output, source, weight.weight}, int64_t(padded));
+    MTL::Size threads = size(group.width * (weight.n / (small ? 8 : 32)), (rows + 127) / 128);
+    commands.dispatch(pipeline, threads, group, {output, x, weight.weight, add ? residual : output}, int64_t(rows), uint32_t(add));
     return output.view(0, uint64_t(rows) * weight.n * 2);
   }
   Tensor rms(const Tensor& x, const Tensor& weight, Tensor output, uint32_t rows) {
@@ -53,14 +43,13 @@ struct Ops {
   Tensor mlp(const Tensor& x, const MlpWeights& weights, const Tensor& residual, Tensor output, uint32_t rows) {
     if (scratch.decodeMode)
       commands.dispatch(weights.fusedDecode, size(12288 / weights.outputsPerGroup * weights.fusedDecode->maxTotalThreadsPerThreadgroup(), rows),
-                        size(weights.fusedDecode->maxTotalThreadsPerThreadgroup()), {scratch.mlpMixed, x, weights.gate.weight, weights.up.weight},
+                        size(weights.fusedDecode->maxTotalThreadsPerThreadgroup()), {scratch.mlpGate, x, weights.gate.weight, weights.up.weight},
                         int64_t(rows));
     else {
       Tensor gate = linear(x, weights.gate, rows, scratch.mlpGate), up = linear(x, weights.up, rows, scratch.mlpUp);
-      uint64_t elements = uint64_t(rows) * 12288;
-      commands.dispatch("silu_mul", size(elements), size(256), {scratch.mlpMixed, gate, up});
+      commands.dispatch("silu_mul", size(uint64_t(rows) * 12288), size(256), {scratch.mlpGate, gate, up});
     }
-    return linear(scratch.mlpMixed, weights.down, rows, output, residual);
+    return linear(scratch.mlpGate, weights.down, rows, output, residual);
   }
   Tensor attention(const Layer& layer, const Tensor& x, const Tensor& residual, Tensor output, uint32_t batch, uint32_t rows, uint32_t kvLayer,
                    const Tensor& positions, uint32_t dflash = unbound) {
@@ -103,14 +92,13 @@ struct Ops {
                         size(256), {destination, bank0.conv, bank1.conv, candidate, source, weight.conv}, sequence.slot, sequence.bank,
                         uint32_t(sequence.kvValid != 0), int64_t(length));
     }
-    uint64_t elements = uint64_t(rows) * 4096;
-    commands.dispatch("split_repeat_qk", size(elements), size(256), {scratch.gdnQ, scratch.gdnK, scratch.gdnV, scratch.gdnConvolved});
+    commands.dispatch("split_repeat_qk", size(uint64_t(rows) * 4096), size(256), {scratch.gdnQ, scratch.gdnK, scratch.gdnV, scratch.gdnConvolved});
     for (uint32_t row = 0; row < layout.size; ++row) {
       const Query& query = layout.queries[row];
       uint32_t start = starts[row], length = starts[row + 1] - start;
       uint64_t offset = uint64_t(start) * 4096 * 2;
       const Sequence& sequence = *query.sequence;
-      Tensor destination = scratch.gdnDelta.view(offset, uint64_t(length) * 4096 * 2);
+      Tensor destination = scratch.gdnMixed.view(offset, uint64_t(length) * 4096 * 2);
       Tensor q = scratch.gdnQ.view(offset, uint64_t(length) * 4096 * 2), k = scratch.gdnK.view(offset, uint64_t(length) * 4096 * 2),
              v = scratch.gdnV.view(offset, uint64_t(length) * 4096 * 2);
       Tensor g = scratch.gdnG.view(start * 128ull, length * 128ull), beta = scratch.gdnB.view(start * 64ull, length * 64ull);
@@ -122,7 +110,7 @@ struct Ops {
                         {destination, bank0.recurrent, bank1.recurrent, candidate, q, k, v, g, beta}, sequence.slot, sequence.bank,
                         uint32_t(sequence.kvValid != 0), int64_t(length));
     }
-    commands.dispatch("rmsnorm_gated_128", size(128, uint64_t(rows) * 32), size(128), {scratch.gdnQ, scratch.gdnDelta, z, weight.norm});
+    commands.dispatch("rmsnorm_gated_128", size(128, uint64_t(rows) * 32), size(128), {scratch.gdnQ, scratch.gdnMixed, z, weight.norm});
     return linear(scratch.gdnQ, weight.out, rows, output, residual);
   }
   Tensor decoder(const Layer& layer, const Tensor& hidden, Tensor output, uint32_t rows, uint32_t kvLayer, const Tensor& positions,
@@ -146,14 +134,14 @@ struct Ops {
   void argmax(const Tensor& token, const Tensor& logits, uint32_t rows = 1, uint32_t group = 1, uint32_t stride = 1) {
     commands.dispatch("argmax_logits", size(256, rows), size(256), {token, logits}, group, stride);
   }
-  void sample(const Sequence& sequence, const Tensor& logits, const Tensor& token, float temperature, float topP, int32_t topK, uint32_t offset) {
-    if (temperature <= 0)
-      argmax(token, logits);
+  void sample(const Sequence& sequence, const Tensor& logits, const Tensor& tokens, uint32_t count) {
+    if (sequence.temperature <= 0)
+      argmax(tokens, logits, count);
     else
-      commands.dispatch(
-          "sample_logits", size(1), size(1),
-          {token, model.rng.view(uint64_t(sequence.slot) * 8, 8), model.sampledRng.view((token.offset - model.outputTokens.offset) * 2, 8), logits},
-          temperature, topP, topK, offset);
+      commands.dispatch("sample_logits", size(count), size(1),
+                        {tokens, model.rng.view(uint64_t(sequence.slot) * 8, 8),
+                         model.sampledRng.view((tokens.offset - model.outputTokens.offset) * 2, uint64_t(count) * 8), logits},
+                        sequence.temperature, sequence.topP, sequence.topK);
   }
 };
 uint32_t writeMetadata(Engine& model, const Batch& batch, bool drafts = false) {
@@ -169,32 +157,32 @@ uint32_t writeMetadata(Engine& model, const Batch& batch, bool drafts = false) {
     }
   return rows;
 }
-void encodeMtp(Ops& ops, const Batch& batch, uint32_t rows) {
+void encodeDrafter(Ops& ops, const Batch& batch, uint32_t rows) {
   auto& [commands, model, scratch] = ops;
-  Tensor hidden = ops.mtpInput(model.inputIds, scratch.targetHidden, rows, batch.size, 1);
-  Tensor normalized = ops.rms(hidden, model.draftModel.layers[0].inputNorm, scratch.inputNorm, rows);
-  Tensor k = ops.linear(normalized, model.draftModel.layers[0].attention.k, rows, scratch.attnK),
-         v = ops.linear(normalized, model.draftModel.layers[0].attention.v, rows, scratch.attnV);
-  commands.dispatch("mtp_store_kv", size(uint64_t(rows) * 4 * 256), size(256),
-                    {model.kv->key(targetKvLayers), model.kv->value(targetKvLayers), k, v, model.sequenceSlots, model.batchKvValid,
-                     model.queryStartLoc, model.draftModel.layers[0].attention.kNorm, model.rope},
-                    batch.size, rows, uint32_t(model.blocks.size()) * blockTokens);
-  for (uint32_t row = 0; row < batch.size; ++row)
-    if (batch.queries[row].state == unbound)
-      commands.copy(scratch.targetHidden.view(uint64_t(model.queryStartLoc.contents<uint32_t>()[row + 1] - 1) * 4096 * 2, 4096 * 2),
-                    mtpSeed(model, *batch.queries[row].sequence, 1 - batch.queries[row].sequence->bank));
-}
-void encodeDflash(Ops& ops, const Batch& batch, uint32_t rows) {
-  auto& [commands, model, scratch] = ops;
-  Tensor fused = ops.linear(scratch.dflashFeatures, model.draftModel.fusion, rows, scratch.hidden[0]);
-  Tensor context = ops.rms(fused, model.draftModel.hiddenNorm, scratch.postNorm, rows);
-  for (uint32_t index = 0; index < dflashLayers; ++index) {
-    const AttentionWeights& attention = model.draftModel.layers[index].attention;
-    Tensor k = ops.linear(context, attention.k, rows, scratch.attnK), v = ops.linear(context, attention.v, rows, scratch.attnV);
-    commands.dispatch("dflash_store_kv", size(uint64_t(rows) * 8 * 128), size(128),
-                      {model.kv->key(targetKvLayers + index), model.kv->value(targetKvLayers + index), k, v, model.sequenceSlots, model.batchKvValid,
-                       model.queryStartLoc, attention.kNorm, model.dflashRope},
+  if (model.drafter == Drafter::mtp) {
+    Tensor hidden = ops.mtpInput(model.inputIds, scratch.targetHidden, rows, batch.size, 1);
+    Tensor normalized = ops.rms(hidden, model.draftModel.layers[0].inputNorm, scratch.inputNorm, rows);
+    Tensor k = ops.linear(normalized, model.draftModel.layers[0].attention.k, rows, scratch.attnK),
+           v = ops.linear(normalized, model.draftModel.layers[0].attention.v, rows, scratch.attnV);
+    commands.dispatch("mtp_store_kv", size(uint64_t(rows) * 1024), size(256),
+                      {model.kv->key(targetKvLayers), model.kv->value(targetKvLayers), k, v, model.sequenceSlots, model.batchKvValid,
+                       model.queryStartLoc, model.draftModel.layers[0].attention.kNorm, model.rope},
                       batch.size, rows, uint32_t(model.blocks.size()) * blockTokens);
+    for (uint32_t row = 0; row < batch.size; ++row)
+      if (batch.queries[row].state == unbound)
+        commands.copy(scratch.targetHidden.view(uint64_t(model.queryStartLoc.contents<uint32_t>()[row + 1] - 1) * 8192, 8192),
+                      mtpSeed(model, *batch.queries[row].sequence, 1 - batch.queries[row].sequence->bank));
+  } else {
+    Tensor context = ops.rms(ops.linear(scratch.dflashFeatures, model.draftModel.fusion, rows, scratch.hidden[0]), model.draftModel.hiddenNorm,
+                             scratch.postNorm, rows);
+    for (uint32_t index = 0; index < dflashLayers; ++index) {
+      const AttentionWeights& attention = model.draftModel.layers[index].attention;
+      Tensor k = ops.linear(context, attention.k, rows, scratch.attnK), v = ops.linear(context, attention.v, rows, scratch.attnV);
+      commands.dispatch("dflash_store_kv", size(uint64_t(rows) * 1024), size(128),
+                        {model.kv->key(targetKvLayers + index), model.kv->value(targetKvLayers + index), k, v, model.sequenceSlots,
+                         model.batchKvValid, model.queryStartLoc, attention.kNorm, model.dflashRope},
+                        batch.size, rows, uint32_t(model.blocks.size()) * blockTokens);
+    }
   }
 }
 } // namespace
@@ -203,96 +191,74 @@ void Scratch::ensure(Device& device, uint32_t requested, Drafter drafter) {
   if (uint64_t(target) * 4096 * 2 <= hidden[0].bytes)
     return;
   uint64_t rows = target, hiddenBytes = rows * 4096 * 2, mlpBytes = rows * 12288 * 2;
-  uint64_t padBytes = rows * (drafter == Drafter::dflash ? 32768 : 12288) * 2, kvBytes = rows * 1024 * 2;
+  uint64_t kvBytes = rows * 1024 * 2;
   uint64_t partialBytes = std::max<uint64_t>(rows, attentionConcurrency) * 32 * 130 * 4;
   uint64_t extraBytes = drafter == Drafter::mtp ? hiddenBytes : drafter == Drafter::dflash ? 8 * hiddenBytes : 0;
   uint64_t logitBytes = std::min<uint64_t>(rows, maxLogitRows) * vocabSize * 2;
-  Tensor storage = device.empty(padBytes + 3 * mlpBytes + 18 * hiddenBytes + 3 * kvBytes + rows * 32 * 6 + partialBytes + extraBytes + logitBytes);
+  Tensor storage = device.empty(2 * mlpBytes + 17 * hiddenBytes + 3 * kvBytes + rows * 32 * 6 + partialBytes + extraBytes + logitBytes);
   uint64_t offset = 0;
-  auto take = [&](uint64_t bytes, std::initializer_list<Tensor*> tensors) {
-    for (Tensor* tensor : tensors) {
-      *tensor = storage.view(offset, bytes);
-      offset += bytes;
-    }
-  };
-  take(padBytes, {&padInput});
-  take(mlpBytes, {&mlpGate, &mlpUp});
-  take(hiddenBytes, {&hidden[0], &hidden[1], &inputNorm, &postNorm});
-  take(mlpBytes, {&mlpMixed});
-  take(2 * hiddenBytes, {&attnQG});
-  take(kvBytes, {&attnK, &attnV});
-  take(hiddenBytes, {&attnQRope});
-  take(kvBytes, {&attnKRope});
-  take(hiddenBytes, {&attnOut});
-  take(partialBytes, {&attnPartials});
-  take(2 * hiddenBytes, {&gdnMixed});
-  take(hiddenBytes, {&gdnZ});
-  take(rows * 32 * 2, {&gdnB});
-  take(rows * 32 * 4, {&gdnG});
-  take(2 * hiddenBytes, {&gdnConvolved});
-  take(hiddenBytes, {&gdnQ, &gdnK, &gdnV, &gdnDelta, &mid});
-  take(drafter == Drafter::mtp ? hiddenBytes : 0, {&targetHidden});
-  take(drafter == Drafter::dflash ? 8 * hiddenBytes : 0, {&dflashFeatures});
-  take(logitBytes, {&targetLogits});
-}
-void draftDflash(Engine& model, Batch& batch, uint32_t drafts) {
-  auto* inputs = model.inputIds.contents<int32_t>();
-  auto* logitRows = model.logitRows.contents<uint32_t>();
-  auto* starts = model.queryStartLoc.contents<uint32_t>();
-  uint32_t packed = 0, proposalRows = 0, active = 0;
-  starts[0] = 0;
-  for (uint32_t i = 0; i < batch.size; ++i)
-    if (batch.queries[i].state != unbound) {
-      Query& query = batch.queries[i];
-      inputs[packed++] = query.sequence->request[query.sequence->kvValid];
-      for (uint32_t step = 0; step < drafts; ++step) {
-        inputs[packed] = dflashMaskToken;
-        logitRows[proposalRows++] = packed++;
-      }
-      starts[++active] = packed;
-    }
-  writeMetadata(model, batch, true);
-  Scratch& scratch = model.scratch(drafts + 1, packed);
-  Device& commands = model.device.command();
-  Ops ops{commands, model, scratch};
-  Tensor hidden = ops.embed(model.inputIds, scratch.hidden[0], packed);
-  for (uint32_t index = 0; index < dflashLayers; ++index)
-    hidden = ops.decoder(model.draftModel.layers[index], hidden, scratch.hidden[(index + 1) & 1], packed, targetKvLayers + index, model.batchKvValid,
-                         nullptr, active, index);
-  commands.dispatch("gather_rows", size(uint64_t(proposalRows) * 4096), size(256), {scratch.postNorm, hidden, model.logitRows});
-  Tensor logits = ops.logits(scratch.postNorm, model.draftModel.outputNorm, proposalRows);
-  ops.argmax(model.draftTokens.view(uint64_t(maxBatchSequences) * 4, model.draftTokens.bytes - uint64_t(maxBatchSequences) * 4), logits, proposalRows,
-             drafts, maxBatchSequences);
-  commands.commit();
+  auto take = [&](uint64_t bytes, auto&... tensors) { ((tensors = storage.view(offset, bytes), offset += bytes), ...); };
+  take(mlpBytes, mlpGate, mlpUp);
+  take(hiddenBytes, hidden[0], hidden[1], inputNorm, postNorm);
+  take(2 * hiddenBytes, attnQG);
+  take(kvBytes, attnK, attnV);
+  take(hiddenBytes, attnQRope);
+  take(kvBytes, attnKRope);
+  take(hiddenBytes, attnOut);
+  take(partialBytes, attnPartials);
+  take(2 * hiddenBytes, gdnMixed);
+  take(hiddenBytes, gdnZ);
+  take(rows * 32 * 2, gdnB);
+  take(rows * 32 * 4, gdnG);
+  take(2 * hiddenBytes, gdnConvolved);
+  take(hiddenBytes, gdnQ, gdnK, gdnV, mid);
+  take(drafter == Drafter::mtp ? hiddenBytes : 0, targetHidden);
+  take(drafter == Drafter::dflash ? 8 * hiddenBytes : 0, dflashFeatures);
+  take(logitBytes, targetLogits);
 }
 void draft(Engine& model, Batch& batch, uint32_t drafts) {
-  if (model.drafter == Drafter::dflash)
-    return draftDflash(model, batch, drafts);
-  auto* anchors = model.draftTokens.contents<int32_t>();
-  auto* positions = model.draftPositions.contents<uint32_t>();
+  bool dflash = model.drafter == Drafter::dflash;
+  uint32_t rows = writeMetadata(model, batch, true), packed = rows * (dflash ? drafts + 1 : 1);
+  auto* starts = model.queryStartLoc.contents<uint32_t>();
   for (uint32_t i = 0; i < batch.size; ++i)
     if (batch.queries[i].state != unbound) {
       Query& query = batch.queries[i];
       uint32_t row = query.state / query.count;
-      anchors[row] = query.sequence->request[query.sequence->kvValid];
-      for (uint32_t step = 0; step < drafts; ++step)
-        positions[step * maxBatchSequences + row] = query.sequence->kvValid + step;
+      if (dflash) {
+        uint32_t start = row * (drafts + 1);
+        model.inputIds.contents<int32_t>()[start] = query.sequence->request[query.sequence->kvValid];
+        std::fill_n(model.inputIds.contents<int32_t>() + start + 1, drafts, dflashMaskToken);
+        std::iota(model.logitRows.contents<uint32_t>() + row * drafts, model.logitRows.contents<uint32_t>() + (row + 1) * drafts, start + 1);
+      } else {
+        model.draftTokens.contents<int32_t>()[row] = query.sequence->request[query.sequence->kvValid];
+        for (uint32_t step = 0; step < drafts; ++step)
+          model.draftPositions.contents<uint32_t>()[step * maxBatchSequences + row] = query.sequence->kvValid + step;
+      }
     }
-  uint32_t rows = writeMetadata(model, batch, true);
-  auto* starts = model.queryStartLoc.contents<uint32_t>();
-  starts[0] = 0;
-  for (uint32_t row = 0; row < rows; ++row)
-    starts[row + 1] = row + 1;
-  Scratch& scratch = model.scratch(1, rows);
+  for (uint32_t row = 0; row <= rows; ++row)
+    starts[row] = row * (dflash ? drafts + 1 : 1);
+  Scratch& scratch = model.scratch(dflash ? drafts + 1 : 1, packed);
   Device& commands = model.device.command();
   Ops ops{commands, model, scratch};
-  for (uint32_t step = 0; step < drafts; ++step) {
-    Tensor ids = model.draftTokens.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(rows) * 4);
-    Tensor stepPositions = model.draftPositions.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(rows) * 4);
-    Tensor hidden = ops.mtpInput(ids, scratch.inputNorm, rows, rows, step ? 0 : 2);
-    hidden = ops.decoder(model.draftModel.layers[0], hidden, scratch.hidden[1], rows, targetKvLayers, stepPositions);
-    Tensor logits = ops.logits(hidden, model.draftModel.outputNorm, rows);
-    ops.argmax(model.draftTokens.view(uint64_t(step + 1) * maxBatchSequences * 4, uint64_t(rows) * 4), logits, rows);
+  if (dflash) {
+    Tensor hidden = ops.embed(model.inputIds, scratch.hidden[0], packed);
+    for (uint32_t index = 0; index < dflashLayers; ++index)
+      hidden = ops.decoder(model.draftModel.layers[index], hidden, scratch.hidden[(index + 1) & 1], packed, targetKvLayers + index,
+                           model.batchKvValid, nullptr, rows, index);
+    uint32_t proposals = rows * drafts;
+    commands.dispatch("gather_rows", size(uint64_t(proposals) * 4096), size(256), {scratch.postNorm, hidden, model.logitRows});
+    Tensor logits = ops.logits(scratch.postNorm, model.draftModel.outputNorm, proposals);
+    ops.argmax(model.draftTokens.view(uint64_t(maxBatchSequences) * 4, model.draftTokens.bytes - uint64_t(maxBatchSequences) * 4), logits, proposals,
+               drafts, maxBatchSequences);
+  } else {
+    for (uint32_t step = 0; step < drafts; ++step) {
+      Tensor ids = model.draftTokens.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(rows) * 4);
+      Tensor positions = model.draftPositions.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(rows) * 4);
+      Tensor hidden = ops.mtpInput(ids, scratch.inputNorm, rows, rows, step ? 0 : 2);
+      hidden = ops.decoder(model.draftModel.layers[0], hidden, scratch.hidden[1], rows, targetKvLayers, positions);
+      Tensor logits = ops.logits(hidden, model.draftModel.outputNorm, rows);
+      ops.argmax(model.draftTokens.view(uint64_t(step + 1) * maxBatchSequences * 4, uint64_t(rows) * 4), logits, rows);
+    }
   }
   commands.commit();
 }
@@ -346,17 +312,12 @@ void forward(Engine& model, Batch& batch, uint32_t drafts, uint32_t stateRows) {
       if (batch.queries[row].logit != unbound) {
         Query& query = batch.queries[row];
         uint32_t count = query.state != unbound ? query.count : 1;
-        for (uint32_t i = 0; i < count; ++i) {
-          uint32_t result = query.logit + i;
-          ops.sample(*query.sequence, logits.view(uint64_t(result) * vocabSize * 2, uint64_t(vocabSize) * 2),
-                     model.outputTokens.view(uint64_t(result) * 4, 4), query.sequence->temperature, query.sequence->topP, query.sequence->topK, i);
-        }
+        ops.sample(*query.sequence, logits.view(uint64_t(query.logit) * vocabSize * 2, uint64_t(count) * vocabSize * 2),
+                   model.outputTokens.view(uint64_t(query.logit) * 4, uint64_t(count) * 4), count);
       }
   }
-  if (model.drafter == Drafter::mtp)
-    encodeMtp(ops, batch, rows);
-  else if (model.drafter == Drafter::dflash)
-    encodeDflash(ops, batch, rows);
+  if (model.drafter != Drafter::none)
+    encodeDrafter(ops, batch, rows);
   commands.commit();
 }
 } // namespace infeng::qwen35

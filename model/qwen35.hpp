@@ -60,9 +60,9 @@ struct DrafterWeights {
 };
 struct Scratch {
   bool decodeMode = false;
-  Tensor hidden[2], inputNorm, postNorm, padInput, mlpGate, mlpUp, mlpMixed;
+  Tensor hidden[2], inputNorm, postNorm, mlpGate, mlpUp;
   Tensor attnQG, attnK, attnV, attnQRope, attnKRope, attnOut, attnPartials;
-  Tensor gdnMixed, gdnZ, gdnB, gdnG, gdnConvolved, gdnQ, gdnK, gdnV, gdnDelta;
+  Tensor gdnMixed, gdnZ, gdnB, gdnG, gdnConvolved, gdnQ, gdnK, gdnV;
   Tensor mid, targetHidden, dflashFeatures, targetLogits;
   void ensure(Device& device, uint32_t rows, Drafter drafter);
 };
