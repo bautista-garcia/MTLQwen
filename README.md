@@ -1,5 +1,7 @@
 # Qwen3.5 Metal inference engine
 
+Read the accompanying blog post: [Inside an LLM inference engine](https://bautista-garcia.github.io/blog/posts/inside-an-llm-inference-engine/).
+
 MTLQwen is a specialized Qwen3.5-9B inference engine for Apple GPUs. Python tokenizes input and reads generated tokens. C++ owns the model, memory, sequence state, continuous scheduler, batching, prefix cache, speculative decoding, and Metal execution.
 
 At most eight sequences are live and one model pass is in flight per engine.
