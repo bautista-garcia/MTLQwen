@@ -21,10 +21,12 @@ MATH_PROMPT = [
 
 def run(model, tokens, decode, batch, speculative=False, draft_tokens=None):
   sessions = [model.sequence(draft_tokens=draft_tokens if speculative else 0) for _ in range(batch)]
+
   def first(session):
     cursor = session.append(tokens)
     assert session.read(cursor) is not None
     return cursor + 1
+
   def finish(item):
     session, cursor = item
     for _ in range(decode):
@@ -32,9 +34,12 @@ def run(model, tokens, decode, batch, speculative=False, draft_tokens=None):
       cursor += 1
     session.cancel()
     return cursor
+
   def stop(item):
     session, cursor = item
-    while session.read(cursor) is not None: cursor += 1
+    while session.read(cursor) is not None:
+      cursor += 1
+
   with ThreadPoolExecutor(max_workers=batch) as pool:
     start = perf_counter()
     cursors = list(pool.map(first, sessions))
@@ -45,7 +50,8 @@ def run(model, tokens, decode, batch, speculative=False, draft_tokens=None):
     list(pool.map(stop, zip(sessions, cursors)))
   mapped = model.mapped_bytes
   spec = [session.speculative_counters() for session in sessions]
-  for session in sessions: session.close()
+  for session in sessions:
+    session.close()
   return ttft, elapsed, mapped, sum(item["drafted_tokens"] for item in spec), sum(item["accepted_tokens"] for item in spec)
 
 

@@ -209,8 +209,7 @@ static inline half gdn_load_context(device const half* x, device const half* pre
 kernel void gdn_causal_conv_silu(device half* y [[buffer(0)]], device half* state0 [[buffer(1)]], device half* state1 [[buffer(2)]],
                                  device half* candidates [[buffer(3)]], device const half* x [[buffer(4)]], device const float* w [[buffer(5)]],
                                  constant uint& slot [[buffer(6)]], constant uint& bank [[buffer(7)]], constant uint& valid [[buffer(8)]],
-                                 constant long& L [[buffer(9)]],
-                                 uint3 gid [[thread_position_in_grid]]) {
+                                 constant long& L [[buffer(9)]], uint3 gid [[thread_position_in_grid]]) {
   long span = L > 4 ? L : 4, rem = gid.x;
   long p = rem / GDN_C, c = rem - p * GDN_C;
   bool has_prev = valid;
@@ -233,8 +232,8 @@ kernel void gdn_causal_conv_silu(device half* y [[buffer(0)]], device half* stat
 [[max_total_threads_per_threadgroup(256)]]
 kernel void gdn_causal_conv_candidates(device half* y [[buffer(0)]], device const half* state0 [[buffer(1)]], device const half* state1 [[buffer(2)]],
                                        device half* candidates [[buffer(3)]], device const half* x [[buffer(4)]], device const float* w [[buffer(5)]],
-                                       constant uint& slot [[buffer(6)]], constant uint& bank [[buffer(7)]],
-                                       constant uint& valid [[buffer(8)]], constant long& L [[buffer(9)]], uint3 gid [[thread_position_in_grid]]) {
+                                       constant uint& slot [[buffer(6)]], constant uint& bank [[buffer(7)]], constant uint& valid [[buffer(8)]],
+                                       constant long& L [[buffer(9)]], uint3 gid [[thread_position_in_grid]]) {
   long rem = gid.x;
   long p = rem / GDN_C, c = rem - p * GDN_C;
   bool has_prev = valid;

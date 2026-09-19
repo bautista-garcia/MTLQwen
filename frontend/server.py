@@ -37,6 +37,7 @@ class ChatSession:
       "mapped_kv_bytes": runtime.engine.mapped_bytes if runtime else 0
     }
 
+
 class Handler(SimpleHTTPRequestHandler):
   protocol_version = "HTTP/1.1"
   disable_nagle_algorithm, wbufsize = True, 0
@@ -223,7 +224,12 @@ class Handler(SimpleHTTPRequestHandler):
       speculative, stop_ids = bool(session.runtime.draft_tokens), session.runtime.stop_token_ids
       before_context = session.metrics.get("context_tokens", 0)
       spec_before = session.runtime.speculative_counters() if speculative else None
-      formatted = engine.tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True,
+      formatted = engine.tokenizer.apply_chat_template([{
+        "role": "user",
+        "content": text
+      }],
+                                                       tokenize=False,
+                                                       add_generation_prompt=True,
                                                        enable_thinking=thinking)
       formatted = ("" if not session.started else "\n" if session.sealed else "<|im_end|>\n") + formatted
       session.started = True

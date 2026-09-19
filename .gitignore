@@ -75,4 +75,7 @@ research/
 
 /demo
 
+# Local Codex skills
+/.codex/skills/codebase-simplifier/
+
 .tmp-video-sync/

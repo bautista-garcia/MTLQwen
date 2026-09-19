@@ -172,9 +172,9 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]], device float* 
                                device float* candidates [[buffer(3)]], device const half* query [[buffer(4)]], device const half* key [[buffer(5)]],
                                device const half* value [[buffer(6)]], device const float* g [[buffer(7)]], device const half* beta [[buffer(8)]],
                                constant uint& slot [[buffer(9)]], constant uint& bank [[buffer(10)]], constant uint& valid [[buffer(11)]],
-                               constant long& seq_len [[buffer(12)]],
-                               uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
-                               uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
+                               constant long& seq_len [[buffer(12)]], uint simd_lane [[thread_index_in_simdgroup]],
+                               uint simd_group [[simdgroup_index_in_threadgroup]], uint3 lane3 [[thread_position_in_threadgroup]],
+                               uint3 group3 [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x;
   long h = group3.y, b = 0, num_heads = 32, vs0 = seq_len * 4096, vs1 = 4096, vs2 = 128, vs3 = 1;
   bool has_initial_state = valid;
@@ -353,10 +353,9 @@ kernel void delta_rule_decode(device half* output [[buffer(0)]], device float* s
                               device float* candidates [[buffer(3)]], device const half* query [[buffer(4)]], device const half* key [[buffer(5)]],
                               device const half* value [[buffer(6)]], device const float* g [[buffer(7)]], device const half* beta [[buffer(8)]],
                               constant uint& slot [[buffer(9)]], constant uint& bank [[buffer(10)]], constant uint& valid [[buffer(11)]],
-                              constant long& length [[buffer(12)]],
-                              uint3 gid [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
-                              uint simd_group [[simdgroup_index_in_threadgroup]], uint3 lane3 [[thread_position_in_threadgroup]],
-                              uint3 group3 [[threadgroup_position_in_grid]]) {
+                              constant long& length [[buffer(12)]], uint3 gid [[thread_position_in_grid]],
+                              uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
+                              uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x;
   long b = 0, h = group3.x, seq_len = 1, num_heads = 32, vs0 = 4096, vs1 = 4096, vs2 = 128, vs3 = 1;
   bool has_initial_state = valid;
@@ -377,14 +376,14 @@ kernel void delta_rule_decode(device half* output [[buffer(0)]], device float* s
 
 // Each target query token produces a selectable recurrent-state column; only the accepted column is committed.
 [[max_total_threads_per_threadgroup(512)]]
-kernel void
-delta_rule_candidates(device half* output [[buffer(0)]], device const float* state0 [[buffer(1)]], device const float* state1 [[buffer(2)]],
-                      device float* candidates [[buffer(3)]], device const half* query [[buffer(4)]], device const half* key [[buffer(5)]],
-                      device const half* value [[buffer(6)]], device const float* g [[buffer(7)]], device const half* beta [[buffer(8)]],
-                      constant uint& slot [[buffer(9)]], constant uint& bank [[buffer(10)]], constant uint& valid [[buffer(11)]],
-                      constant long& seq_len [[buffer(12)]], uint3 gid [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
-                      uint simd_group [[simdgroup_index_in_threadgroup]], uint3 lane3 [[thread_position_in_threadgroup]],
-                      uint3 group3 [[threadgroup_position_in_grid]]) {
+kernel void delta_rule_candidates(device half* output [[buffer(0)]], device const float* state0 [[buffer(1)]],
+                                  device const float* state1 [[buffer(2)]], device float* candidates [[buffer(3)]],
+                                  device const half* query [[buffer(4)]], device const half* key [[buffer(5)]],
+                                  device const half* value [[buffer(6)]], device const float* g [[buffer(7)]], device const half* beta [[buffer(8)]],
+                                  constant uint& slot [[buffer(9)]], constant uint& bank [[buffer(10)]], constant uint& valid [[buffer(11)]],
+                                  constant long& seq_len [[buffer(12)]], uint3 gid [[thread_position_in_grid]],
+                                  uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
+                                  uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x;
   long b = 0, h = group3.x, num_heads = 32, vs0 = seq_len * 4096, vs1 = 4096, vs2 = 128, vs3 = 1;
   device const float* committed = bank ? state1 : state0;

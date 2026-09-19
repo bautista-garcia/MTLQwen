@@ -35,7 +35,8 @@ def complete(sequence, prompt=(), limit=None):
     output.append(token)
   if limit is not None:
     sequence.cancel()
-    while sequence.read(cursor) is not None: cursor += 1
+    while sequence.read(cursor) is not None:
+      cursor += 1
   return output
 
 
