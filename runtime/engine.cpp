@@ -42,6 +42,7 @@ Tensor mtpSeed(Engine& model, const Sequence& sequence, uint32_t bank) {
   return model.mtpSeeds.view(uint64_t(bank * maxBatchSequences + sequence.slot) * 8192, 8192);
 }
 
+// KV ALLOCATOR FUNCTIONS
 void Engine::bind(Sequence& sequence, uint32_t physical) {
   uint32_t logical = sequence.bindings.size();
   kv->map(uint32_t(sequence.slot) * blocks.size() + logical, physical);
@@ -49,33 +50,32 @@ void Engine::bind(Sequence& sequence, uint32_t physical) {
   ++blocks[physical].refs;
 }
 
-uint32_t Engine::acquireBlock() {
-  if (physicalBlocks < blocks.size()) {
-    kv->ensure(physicalBlocks + 1);
-    return physicalBlocks++;
-  }
-  auto victim = std::min_element(blocks.begin(), blocks.end(), [](const PhysicalBlock& a, const PhysicalBlock& b) {
-    return (a.refs ? UINT64_MAX : a.touch) < (b.refs ? UINT64_MAX : b.touch);
-  });
-  if (victim->refs)
-    return unbound;
-  uint32_t physical = victim - blocks.begin();
-  for (auto checkpoint = checkpointCache.begin(); checkpoint != checkpointCache.end();)
-    if (std::find(checkpoint->second.bindings.begin(), checkpoint->second.bindings.end(), physical) != checkpoint->second.bindings.end())
-      checkpoint = checkpointCache.erase(checkpoint);
-    else
-      ++checkpoint;
-  return physical;
-}
-
 bool Engine::reserve(const Batch& batch) {
   for (uint32_t row = 0; row < batch.size; ++row) {
-    Sequence& sequence = *batch.queries[row].sequence;
-    for (uint32_t logical = sequence.kvValid / blockTokens; logical <= (sequence.kvValid + batch.queries[row].count - 1) / blockTokens; ++logical) {
+    const Query& query = batch.queries[row];
+    Sequence& sequence = *query.sequence;
+    for (uint32_t logical = sequence.kvValid / blockTokens; logical <= (sequence.kvValid + query.count - 1) / blockTokens; ++logical) {
       if (logical == sequence.bindings.size()) {
-        uint32_t physical = acquireBlock();
-        if (physical == unbound)
-          return false;
+        uint32_t physical = physicalBlocks;
+        // free block
+        if (physical < blocks.size()) {
+          kv->ensure(physical + 1);
+          ++physicalBlocks;
+        } else {
+          // evict block
+          auto victim = std::min_element(blocks.begin(), blocks.end(), [](const PhysicalBlock& a, const PhysicalBlock& b) {
+            return (a.refs ? UINT64_MAX : a.touch) < (b.refs ? UINT64_MAX : b.touch);
+          });
+          if (victim->refs)
+            return false;
+          physical = victim - blocks.begin();
+          // remove prefix reference from evicted block
+          for (auto checkpoint = checkpointCache.begin(); checkpoint != checkpointCache.end();)
+            if (std::find(checkpoint->second.bindings.begin(), checkpoint->second.bindings.end(), physical) != checkpoint->second.bindings.end())
+              checkpoint = checkpointCache.erase(checkpoint);
+            else
+              ++checkpoint;
+        }
         bind(sequence, physical);
       }
       blocks[sequence.bindings[logical]].touch = ++clock;
