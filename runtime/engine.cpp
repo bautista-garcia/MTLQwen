@@ -6,6 +6,7 @@
 
 namespace infeng::qwen35 {
 namespace {
+// hash is the previous prefix hash, chained with the new 512 token block
 uint64_t hashCheckpoint(uint64_t hash, const int32_t* tokens) {
   hash ^= 0x9e3779b97f4a7c15ull;
   for (uint32_t i = 0; i < gdnCheckpointTokens; ++i) {
@@ -15,43 +16,29 @@ uint64_t hashCheckpoint(uint64_t hash, const int32_t* tokens) {
   return hash;
 }
 
-void copyCheckpoint(Engine& model, Sequence& sequence, const Tensor& arena, bool restore) {
-  Device& copies = model.device.command();
-  Tensor state = model.gdnStates[restore ? 0 : sequence.bank];
-  if (restore)
-    copyGdnState(copies, arena, 1, 0, state, maxBatchSequences, sequence.slot);
-  else
-    copyGdnState(copies, state, maxBatchSequences, sequence.slot, arena, 1, 0);
-  if (model.drafter == Drafter::mtp) {
-    Tensor seed = mtpSeed(model, sequence, restore ? 0 : sequence.bank), cached = arena.view(gdnCheckpointBytes, 8192);
-    copies.copy(restore ? cached : seed, restore ? seed : cached);
-  }
-  copies.commit();
+struct State {
+  const Tensor& gdn;
+  uint32_t row;
+  Tensor mtp;
+};
+
+void copyState(Device& commands, const State& source, const State& destination) {
+  uint32_t sourceRows = source.gdn.bytes / gdnCheckpointBytes, destinationRows = destination.gdn.bytes / gdnCheckpointBytes;
+  for (uint32_t layer = 0; layer < targetLayers; ++layer)
+    if ((layer + 1) % fullAttentionInterval) {
+      GdnState from = gdnState(source.gdn, sourceRows, layer), to = gdnState(destination.gdn, destinationRows, layer);
+      commands.copy(from.recurrent.view(uint64_t(source.row) * recurrentStateBytes, recurrentStateBytes),
+                    to.recurrent.view(uint64_t(destination.row) * recurrentStateBytes, recurrentStateBytes));
+      commands.copy(from.conv.view(uint64_t(source.row) * convStateBytes, convStateBytes),
+                    to.conv.view(uint64_t(destination.row) * convStateBytes, convStateBytes));
+    }
+  if (source.mtp.buffer)
+    commands.copy(source.mtp, destination.mtp);
 }
 } // namespace
 
 Tensor mtpSeed(Engine& model, const Sequence& sequence, uint32_t bank) {
   return model.mtpSeeds.view(uint64_t(bank * maxBatchSequences + sequence.slot) * 8192, 8192);
-}
-
-void copyGdnState(Device& commands, const Tensor& source, uint32_t sourceRows, uint32_t sourceRow, const Tensor& destination,
-                  uint32_t destinationRows, uint32_t destinationRow) {
-  for (uint32_t layer = 0; layer < targetLayers; ++layer)
-    if ((layer + 1) % fullAttentionInterval) {
-      GdnState from = gdnState(source, sourceRows, layer), to = gdnState(destination, destinationRows, layer);
-      commands.copy(from.recurrent.view(uint64_t(sourceRow) * recurrentStateBytes, recurrentStateBytes),
-                    to.recurrent.view(uint64_t(destinationRow) * recurrentStateBytes, recurrentStateBytes));
-      commands.copy(from.conv.view(uint64_t(sourceRow) * convStateBytes, convStateBytes),
-                    to.conv.view(uint64_t(destinationRow) * convStateBytes, convStateBytes));
-    }
-}
-
-void Engine::commitCandidate(Device& commands, Sequence& sequence, uint32_t stateRow, uint32_t queryRow, uint32_t accepted) {
-  copyGdnState(commands, candidateStates, candidateStates.bytes / gdnCheckpointBytes, stateRow, gdnStates[1 - sequence.bank], maxBatchSequences,
-               sequence.slot);
-  if (drafter == Drafter::mtp)
-    commands.copy(workspace.targetHidden.view(uint64_t(queryStartLoc.contents<uint32_t>()[queryRow] + accepted) * 8192, 8192),
-                  mtpSeed(*this, sequence, 1 - sequence.bank));
 }
 
 void Engine::bind(Sequence& sequence, uint32_t logical, uint32_t physical) {
@@ -117,7 +104,10 @@ uint32_t Engine::lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_
   if (!checkpoint)
     return 0;
   checkpoint->touch = ++clock;
-  copyCheckpoint(*this, sequence, checkpoint->arena, true);
+  Device& copies = device.command();
+  copyState(copies, {checkpoint->arena, 0, drafter == Drafter::mtp ? checkpoint->arena.view(gdnCheckpointBytes, 8192) : Tensor{}},
+            {gdnStates[0], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, 0) : Tensor{}});
+  copies.commit();
   for (uint32_t logical = 0; logical < checkpoint->bindings.size(); ++logical) {
     bind(sequence, logical, checkpoint->bindings[logical]);
     device.wait();
@@ -143,7 +133,10 @@ void Engine::publishPrefix(Sequence& sequence) {
     HybridCheckpoint checkpoint{device.empty(gdnCheckpointBytes + (drafter == Drafter::mtp ? 8192 : 0)),
                                 {sequence.bindings.begin(), sequence.bindings.begin() + sequence.kvValid / blockTokens},
                                 ++clock};
-    copyCheckpoint(*this, sequence, checkpoint.arena, false);
+    Device& copies = device.command();
+    copyState(copies, {gdnStates[sequence.bank], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, sequence.bank) : Tensor{}},
+              {checkpoint.arena, 0, drafter == Drafter::mtp ? checkpoint.arena.view(gdnCheckpointBytes, 8192) : Tensor{}});
+    copies.commit();
     checkpointCache.emplace(sequence.prefixHash, std::move(checkpoint));
   } catch (...) {
   }
@@ -252,7 +245,11 @@ bool Engine::execute(Batch& batch) {
         if ((acceptedStop = std::count(sequence.stops.begin(), sequence.stops.end(), token)))
           break;
       }
-      commitCandidate(*copies, sequence, query.state + accepted, row, accepted);
+      copyState(*copies,
+                {candidateStates, query.state + accepted,
+                 drafter == Drafter::mtp ? workspace.targetHidden.view(uint64_t(queryStartLoc.contents<uint32_t>()[row] + accepted) * 8192, 8192)
+                                         : Tensor{}},
+                {gdnStates[1 - sequence.bank], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, 1 - sequence.bank) : Tensor{}});
     }
     if (query.logit != unbound && (!draft || !acceptedStop))
       sequence.request.push_back(sampled[query.logit + accepted]);

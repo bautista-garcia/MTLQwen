@@ -143,7 +143,6 @@ struct Engine {
   uint32_t acquireBlock();
   bool reserve(const Batch& batch);
   void bind(Sequence& sequence, uint32_t logical, uint32_t physical);
-  void commitCandidate(Device& commands, Sequence& sequence, uint32_t stateRow, uint32_t queryRow, uint32_t accepted);
   uint32_t lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_t length);
   void publishPrefix(Sequence& sequence);
   void schedule();
@@ -167,8 +166,6 @@ struct Sequence {
 };
 
 Tensor mtpSeed(Engine& engine, const Sequence& sequence, uint32_t bank);
-void copyGdnState(Device& commands, const Tensor& source, uint32_t sourceRows, uint32_t sourceRow, const Tensor& destination,
-                  uint32_t destinationRows, uint32_t destinationRow);
 void draft(Engine& engine, Batch& batch, uint32_t drafts);
 void forward(Engine& engine, Batch& batch, uint32_t drafts, uint32_t stateRows);
 } // namespace infeng::qwen35
