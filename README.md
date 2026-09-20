@@ -17,6 +17,8 @@ Python creates one native `Engine`. During construction, C++:
 3. Allocates model-wide control buffers, GDN state, RNG state, RoPE tables, and sparse virtual K/V buffers.
 4. Starts the scheduler thread.
 
+An optional drafter GGUF is identified from its tensors: a combined MTP model replaces the target weights, while DFlash supplements them.
+
 The state-bearing fields of the real `Engine` are:
 
 ```cpp
@@ -94,11 +96,11 @@ struct Sequence {
 };
 ```
 
-Creation allocates no physical K/V memory. `bindings` starts entirely `unbound`.
+Creation allocates no physical K/V memory. `bindings` starts empty and grows with the sequence's contiguous logical blocks.
 
 ### 3. Append prompt tokens
 
-Python tokenizes text when necessary and calls `Sequence.append()`. C++:
+The Python frontend tokenizes text and passes token IDs to `Sequence.append()`. C++:
 
 1. Appends the IDs to `Sequence.request`.
 2. Sets `active = true`.
@@ -525,7 +527,7 @@ sequence.close()
 engine.close()
 ```
 
-Python owns only the native handle, optional tokenizer, stop-token copy used by the frontend, draft-width copy used for metrics, and its local read cursor. The authoritative token and inference state remains in the native `Sequence`.
+The frontend owns one tokenizer and performs chat templating, encoding, and decoding. The Python runtime boundary owns only native handles, sequence configuration, and the caller's read cursor. The authoritative token and inference state remains in the native `Sequence`.
 
 ## Source map
 

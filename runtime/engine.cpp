@@ -22,6 +22,7 @@ struct State {
   Tensor mtp;
 };
 
+// copy gdnState for publish/restoring prefix checkpoints and candidate commits
 void copyState(Device& commands, const State& source, const State& destination) {
   uint32_t sourceRows = source.gdn.bytes / gdnCheckpointBytes, destinationRows = destination.gdn.bytes / gdnCheckpointBytes;
   for (uint32_t layer = 0; layer < targetLayers; ++layer)
@@ -41,34 +42,29 @@ Tensor mtpSeed(Engine& model, const Sequence& sequence, uint32_t bank) {
   return model.mtpSeeds.view(uint64_t(bank * maxBatchSequences + sequence.slot) * 8192, 8192);
 }
 
-void Engine::bind(Sequence& sequence, uint32_t logical, uint32_t physical) {
-  uint32_t block = physical == unbound ? sequence.bindings[logical] : physical;
-  if (physical == unbound) {
-    kv->map(uint32_t(sequence.slot) * blocks.size() + logical, unbound);
-    --blocks[block].refs;
-  } else {
-    kv->map(uint32_t(sequence.slot) * blocks.size() + logical, physical);
-    ++blocks[block].refs;
-  }
-  sequence.bindings[logical] = physical;
+void Engine::bind(Sequence& sequence, uint32_t physical) {
+  uint32_t logical = sequence.bindings.size();
+  kv->map(uint32_t(sequence.slot) * blocks.size() + logical, physical);
+  sequence.bindings.push_back(physical);
+  ++blocks[physical].refs;
 }
 
 uint32_t Engine::acquireBlock() {
-  uint32_t physical = physicalBlocks < blocks.size() ? physicalBlocks++ : unbound;
-  if (physical == unbound) {
-    auto victim = std::min_element(blocks.begin(), blocks.end(), [](const PhysicalBlock& a, const PhysicalBlock& b) {
-      return (a.refs ? UINT64_MAX : a.touch) < (b.refs ? UINT64_MAX : b.touch);
-    });
-    if (victim->refs)
-      return unbound;
-    physical = victim - blocks.begin();
-    for (auto checkpoint = checkpointCache.begin(); checkpoint != checkpointCache.end();)
-      if (std::find(checkpoint->second.bindings.begin(), checkpoint->second.bindings.end(), physical) != checkpoint->second.bindings.end())
-        checkpoint = checkpointCache.erase(checkpoint);
-      else
-        ++checkpoint;
+  if (physicalBlocks < blocks.size()) {
+    kv->ensure(physicalBlocks + 1);
+    return physicalBlocks++;
   }
-  blocks[physical] = {};
+  auto victim = std::min_element(blocks.begin(), blocks.end(), [](const PhysicalBlock& a, const PhysicalBlock& b) {
+    return (a.refs ? UINT64_MAX : a.touch) < (b.refs ? UINT64_MAX : b.touch);
+  });
+  if (victim->refs)
+    return unbound;
+  uint32_t physical = victim - blocks.begin();
+  for (auto checkpoint = checkpointCache.begin(); checkpoint != checkpointCache.end();)
+    if (std::find(checkpoint->second.bindings.begin(), checkpoint->second.bindings.end(), physical) != checkpoint->second.bindings.end())
+      checkpoint = checkpointCache.erase(checkpoint);
+    else
+      ++checkpoint;
   return physical;
 }
 
@@ -76,12 +72,11 @@ bool Engine::reserve(const Batch& batch) {
   for (uint32_t row = 0; row < batch.size; ++row) {
     Sequence& sequence = *batch.queries[row].sequence;
     for (uint32_t logical = sequence.kvValid / blockTokens; logical <= (sequence.kvValid + batch.queries[row].count - 1) / blockTokens; ++logical) {
-      if (sequence.bindings[logical] == unbound) {
-        kv->ensure(std::min<uint32_t>(physicalBlocks + 1, blocks.size()));
+      if (logical == sequence.bindings.size()) {
         uint32_t physical = acquireBlock();
         if (physical == unbound)
           return false;
-        bind(sequence, logical, physical);
+        bind(sequence, physical);
       }
       blocks[sequence.bindings[logical]].touch = ++clock;
     }
@@ -108,10 +103,8 @@ uint32_t Engine::lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_
   copyState(copies, {checkpoint->arena, 0, drafter == Drafter::mtp ? checkpoint->arena.view(gdnCheckpointBytes, 8192) : Tensor{}},
             {gdnStates[0], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, 0) : Tensor{}});
   copies.commit();
-  for (uint32_t logical = 0; logical < checkpoint->bindings.size(); ++logical) {
-    bind(sequence, logical, checkpoint->bindings[logical]);
-    device.wait();
-  }
+  for (uint32_t physical : checkpoint->bindings)
+    bind(sequence, physical);
   sequence.bank = 0;
   return checkpoint->bindings.size() * blockTokens;
 }
@@ -130,9 +123,7 @@ void Engine::publishPrefix(Sequence& sequence) {
                                      [](const auto& a, const auto& b) { return a.second.touch < b.second.touch; });
       checkpointCache.erase(victim);
     }
-    HybridCheckpoint checkpoint{device.empty(gdnCheckpointBytes + (drafter == Drafter::mtp ? 8192 : 0)),
-                                {sequence.bindings.begin(), sequence.bindings.begin() + sequence.kvValid / blockTokens},
-                                ++clock};
+    HybridCheckpoint checkpoint{device.empty(gdnCheckpointBytes + (drafter == Drafter::mtp ? 8192 : 0)), sequence.bindings, ++clock};
     Device& copies = device.command();
     copyState(copies, {gdnStates[sequence.bank], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, sequence.bank) : Tensor{}},
               {checkpoint.arena, 0, drafter == Drafter::mtp ? checkpoint.arena.view(gdnCheckpointBytes, 8192) : Tensor{}});
@@ -144,8 +135,7 @@ void Engine::publishPrefix(Sequence& sequence) {
 
 Sequence::Sequence(Engine& owner, const int32_t* stopTokens, uint32_t stopCount, float samplingTemperature, float samplingTopP, int32_t samplingTopK,
                    uint32_t drafts)
-    : engine(owner), bindings(owner.blocks.size(), unbound), draftTokens(drafts), temperature(samplingTemperature), topP(samplingTopP),
-      topK(samplingTopK) {
+    : engine(owner), draftTokens(drafts), temperature(samplingTemperature), topP(samplingTopP), topK(samplingTopK) {
   std::lock_guard lock(engine.mutex);
   request.reserve(owner.maxContext + 1);
   stops.assign(stopTokens, stopTokens + stopCount);
@@ -159,8 +149,10 @@ Sequence::~Sequence() {
   std::unique_lock lock(engine.mutex);
   active = false;
   engine.condition.wait(lock, [&] { return !busy; });
-  for (uint32_t logical = 0; logical < bindings.size() && bindings[logical] != unbound; ++logical)
-    engine.bind(*this, logical, unbound);
+  for (uint32_t logical = 0; logical < bindings.size(); ++logical) {
+    engine.kv->map(uint32_t(slot) * engine.blocks.size() + logical, unbound);
+    --engine.blocks[bindings[logical]].refs;
+  }
   engine.sequences[slot] = nullptr;
 }
 

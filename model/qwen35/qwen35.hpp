@@ -142,7 +142,7 @@ struct Engine {
 
   uint32_t acquireBlock();
   bool reserve(const Batch& batch);
-  void bind(Sequence& sequence, uint32_t logical, uint32_t physical);
+  void bind(Sequence& sequence, uint32_t physical);
   uint32_t lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_t length);
   void publishPrefix(Sequence& sequence);
   void schedule();
