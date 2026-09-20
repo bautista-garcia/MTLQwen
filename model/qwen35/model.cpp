@@ -2,21 +2,29 @@
 #include <chrono>
 #include <gguf.h>
 #include <tuple>
+
 namespace infeng::qwen35 {
 namespace {
 constexpr const char* quantNames[]{"q8_0", "q4_k", "q5_k", "q6_k", "iq4_xs"};
 constexpr uint8_t quantOutputs[]{2, 4, 4, 8, 4};
 using Weight = std::tuple<Tensor, uint32_t, uint32_t, QuantType>;
+
 struct GGUF {
   Tensor file;
   std::unique_ptr<gguf_context, decltype(&gguf_free)> context{nullptr, gguf_free};
   size_t data;
+
   GGUF(Engine& model, const std::filesystem::path& path) : file(model.device.mapped(path)) {
     context.reset(gguf_init_from_buffer(file.contents<uint8_t>(), file.bytes, {true, nullptr}));
     data = gguf_get_data_offset(context.get());
     model.modelBytes += file.bytes - data;
     model.parameterCount += gguf_get_n_tensors(context.get()) == 69 ? 1291904512 : gguf_get_n_tensors(context.get()) == 442 ? 9197093888 : 8953803264;
   }
+
+  bool contains(const char* name) const {
+    return gguf_find_tensor(context.get(), name) >= 0;
+  }
+
   Weight operator()(const std::string& name) {
     int64_t id = gguf_find_tensor(context.get(), name.c_str());
     if (id < 0)
@@ -27,6 +35,7 @@ struct GGUF {
             QuantType(gguf_get_tensor_type(context.get(), id))};
   }
 };
+
 Linear linear(Device& device, Weight weight) {
   auto [data, n, k, type] = weight;
   uint32_t quant = type == QuantType::Q8_0 ? 0 : type == QuantType::IQ4_XS ? 4 : uint32_t(type) - 11;
@@ -41,11 +50,13 @@ Linear linear(Device& device, Weight weight) {
           outputs};
 }
 } // namespace
-Engine::Engine(const std::filesystem::path& path, const std::filesystem::path& kernels, uint32_t context, Drafter selected,
-               const std::filesystem::path& draftPath)
-    : device(kernels), maxContext(context), drafter(selected), blocks((context + blockTokens - 1) / blockTokens) {
-  GGUF target(*this, path);
-  GGUF* g = &target;
+
+Engine::Engine(const std::filesystem::path& path, const std::filesystem::path& kernels, uint32_t context, const std::filesystem::path& draftPath)
+    : device(kernels), maxContext(context), blocks((context + blockTokens - 1) / blockTokens) {
+  auto draft = draftPath.empty() ? nullptr : std::make_unique<GGUF>(*this, draftPath);
+  drafter = !draft ? Drafter::none : draft->contains("blk.32.attn_norm.weight") ? Drafter::mtp : Drafter::dflash;
+  auto target = drafter == Drafter::mtp ? std::move(draft) : std::make_unique<GGUF>(*this, path);
+  GGUF* g = target.get();
   std::string r;
   auto w = [&](const char* name) { return (*g)(r + name); };
   auto t = [&](const char* name) { return std::get<0>(w(name)); };
@@ -86,8 +97,7 @@ Engine::Engine(const std::filesystem::path& path, const std::filesystem::path& k
     draftModel.outputNorm = t("shared_head_norm.weight");
     draftModel.fusion = p("eh_proj.weight");
   } else if (drafter == Drafter::dflash) {
-    GGUF draft(*this, draftPath);
-    g = &draft;
+    g = draft.get();
     r.clear();
     draftModel.fusion = p("fc.weight");
     draftModel.hiddenNorm = t("enc.output_norm.weight");

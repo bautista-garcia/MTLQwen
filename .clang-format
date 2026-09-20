@@ -10,3 +10,4 @@ AllowShortIfStatementsOnASingleLine: Never
 AllowShortLoopsOnASingleLine: false
 PointerAlignment: Left
 SortIncludes: Never
+SeparateDefinitionBlocks: Always

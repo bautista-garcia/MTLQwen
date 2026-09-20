@@ -1,16 +1,20 @@
 #include "model/qwen35/qwen35.hpp"
 #include <algorithm>
 #include <numeric>
+
 namespace infeng::qwen35 {
 namespace {
 constexpr uint32_t attentionConcurrency = 8;
+
 MTL::Size size(uint64_t x, uint64_t y = 1, uint64_t z = 1) {
   return MTL::Size(x, y, z);
 }
+
 struct Ops {
   Device& commands;
   Engine& model;
   Scratch& scratch;
+
   Tensor linear(const Tensor& x, const Linear& weight, uint32_t rows, Tensor output, const Tensor& residual = {}) {
     if (scratch.decodeMode) {
       uint32_t group = weight.pipeline[linearDecode]->maxTotalThreadsPerThreadgroup();
@@ -29,17 +33,21 @@ struct Ops {
     commands.dispatch(pipeline, threads, group, {output, x, weight.weight, add ? residual : output}, int64_t(rows), uint32_t(add));
     return output.view(0, uint64_t(rows) * weight.n * 2);
   }
+
   Tensor rms(const Tensor& x, const Tensor& weight, Tensor output, uint32_t rows) {
     commands.dispatch("rmsnorm", size(256, rows), size(256), {output, x, weight});
     return output;
   }
+
   Tensor embed(const Tensor& ids, Tensor output, uint32_t rows) {
     commands.dispatch("q4_k_embed", size(4096, rows), size(256), {output, ids, model.embedding});
     return output;
   }
+
   Tensor logits(const Tensor& x, const Tensor& norm, uint32_t rows) {
     return linear(rms(x, norm, scratch.inputNorm, rows), model.head, rows, scratch.targetLogits);
   }
+
   Tensor mlp(const Tensor& x, const MlpWeights& weights, const Tensor& residual, Tensor output, uint32_t rows) {
     if (scratch.decodeMode)
       commands.dispatch(weights.fusedDecode, size(12288 / weights.outputsPerGroup * weights.fusedDecode->maxTotalThreadsPerThreadgroup(), rows),
@@ -51,6 +59,7 @@ struct Ops {
     }
     return linear(scratch.mlpGate, weights.down, rows, output, residual);
   }
+
   Tensor attention(const Layer& layer, const Tensor& x, const Tensor& residual, Tensor output, uint32_t batch, uint32_t rows, uint32_t kvLayer,
                    const Tensor& positions, uint32_t dflash = unbound) {
     const AttentionWeights& weight = layer.attention;
@@ -70,6 +79,7 @@ struct Ops {
                       {scratch.attnOut, scratch.attnPartials, qg}, rows, splits);
     return linear(scratch.attnOut, weight.out, rows, output, residual);
   }
+
   Tensor gdn(const Layer& layer, const Tensor& x, const Tensor& residual, Tensor output, uint32_t rows, const Batch& layout) {
     const GdnWeights& weight = layer.gdn;
     uint32_t layerIndex = &layer - model.layers.data();
@@ -113,6 +123,7 @@ struct Ops {
     commands.dispatch("rmsnorm_gated_128", size(128, uint64_t(rows) * 32), size(128), {scratch.gdnQ, scratch.gdnMixed, z, weight.norm});
     return linear(scratch.gdnQ, weight.out, rows, output, residual);
   }
+
   Tensor decoder(const Layer& layer, const Tensor& hidden, Tensor output, uint32_t rows, uint32_t kvLayer, const Tensor& positions,
                  const Batch* layout = nullptr, uint32_t batch = 0, uint32_t dflash = unbound) {
     Tensor x = rms(hidden, layer.inputNorm, scratch.inputNorm, rows);
@@ -123,6 +134,7 @@ struct Ops {
     x = rms(mid, layer.postNorm, dflash == unbound ? scratch.postNorm : scratch.inputNorm, rows);
     return mlp(x, layer.mlp, mid, output, rows);
   }
+
   Tensor mtpInput(const Tensor& ids, const Tensor& hidden, uint32_t rows, uint32_t batch, uint32_t mode) {
     embed(ids, scratch.postNorm, rows);
     commands.dispatch("mtp_fuse", size(256, rows), size(256),
@@ -131,9 +143,11 @@ struct Ops {
                       batch, rows, mode);
     return linear(scratch.gdnMixed, model.draftModel.fusion, rows, scratch.hidden[0]);
   }
+
   void argmax(const Tensor& token, const Tensor& logits, uint32_t rows = 1, uint32_t group = 1, uint32_t stride = 1) {
     commands.dispatch("argmax_logits", size(256, rows), size(256), {token, logits}, group, stride);
   }
+
   void sample(const Sequence& sequence, const Tensor& logits, const Tensor& tokens, uint32_t count) {
     if (sequence.temperature <= 0)
       argmax(tokens, logits, count);
@@ -144,6 +158,7 @@ struct Ops {
                         sequence.temperature, sequence.topP, sequence.topK);
   }
 };
+
 uint32_t writeMetadata(Engine& model, const Batch& batch, bool drafts = false) {
   auto *valid = model.batchKvValid.contents<uint32_t>(), *slots = model.sequenceSlots.contents<uint32_t>(),
        *banks = model.stateBanks.contents<uint32_t>();
@@ -157,6 +172,7 @@ uint32_t writeMetadata(Engine& model, const Batch& batch, bool drafts = false) {
     }
   return rows;
 }
+
 void encodeDrafter(Ops& ops, const Batch& batch, uint32_t rows) {
   auto& [commands, model, scratch] = ops;
   if (model.drafter == Drafter::mtp) {
@@ -186,6 +202,7 @@ void encodeDrafter(Ops& ops, const Batch& batch, uint32_t rows) {
   }
 }
 } // namespace
+
 void Scratch::ensure(Device& device, uint32_t requested, Drafter drafter) {
   uint32_t target = (requested + 31) / 32 * 32;
   if (uint64_t(target) * 4096 * 2 <= hidden[0].bytes)
@@ -216,6 +233,7 @@ void Scratch::ensure(Device& device, uint32_t requested, Drafter drafter) {
   take(drafter == Drafter::dflash ? 8 * hiddenBytes : 0, dflashFeatures);
   take(logitBytes, targetLogits);
 }
+
 void draft(Engine& model, Batch& batch, uint32_t drafts) {
   bool dflash = model.drafter == Drafter::dflash;
   uint32_t rows = writeMetadata(model, batch, true), packed = rows * (dflash ? drafts + 1 : 1);
@@ -262,6 +280,7 @@ void draft(Engine& model, Batch& batch, uint32_t drafts) {
   }
   commands.commit();
 }
+
 void forward(Engine& model, Batch& batch, uint32_t drafts, uint32_t stateRows) {
   auto* starts = model.queryStartLoc.contents<uint32_t>();
   starts[0] = 0;

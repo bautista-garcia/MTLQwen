@@ -10,23 +10,30 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+
 namespace infeng::metal {
 class Device;
+
 struct Tensor {
   std::shared_ptr<MTL::Buffer> buffer;
   uint64_t offset = 0, bytes = 0;
+
   Tensor view(uint64_t byteOffset, uint64_t byteCount) const {
     return {buffer, offset + byteOffset, byteCount};
   }
+
   MTL::GPUAddress address() const {
     return buffer->gpuAddress() + offset;
   }
+
   template <class T> T* contents() const {
     return reinterpret_cast<T*>(static_cast<uint8_t*>(buffer->contents()) + offset);
   }
 };
+
 using Pipeline = MTL::ComputePipelineState;
 class SparseKV;
+
 class Device {
   friend class SparseKV;
   NS::SharedPtr<MTL::Device> metalDevice;
@@ -62,11 +69,14 @@ public:
   void dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group, std::initializer_list<Tensor> tensors, const Scalars&... scalars);
   template <class... Scalars>
   void dispatch(const std::string& kernel, MTL::Size threads, MTL::Size group, std::initializer_list<Tensor> tensors, const Scalars&... scalars);
+
   void copy(const Tensor& source, const Tensor& destination) {
     encoder->copyFromBuffer(source.buffer.get(), source.offset, destination.buffer.get(), destination.offset, destination.bytes);
   }
+
   void commit();
 };
+
 class SparseKV {
   static constexpr uint64_t pageBytes = 256ull << 10, heapBytes = 64ull << 20;
   Device& device;
@@ -77,6 +87,7 @@ class SparseKV {
   std::vector<NS::SharedPtr<MTL::Heap>> heaps;
   Tensor makeBuffer(uint32_t regions);
   void addHeap();
+
   Tensor view(uint32_t resource, uint32_t region) const {
     return {resources[resource].buffer, uint64_t(region) * regionBytes, regionBytes};
   }
@@ -86,16 +97,20 @@ public:
   ~SparseKV();
   void ensure(uint32_t blocks);
   void map(uint32_t virtualBlock, uint32_t physicalBlock);
+
   Tensor key(uint32_t layer) const {
     return view(0, layer);
   }
+
   Tensor value(uint32_t layer) const {
     return view(1, layer);
   }
+
   uint64_t mappedBytes() const {
     return uint64_t(physicalBlocks) * tilesPerBlock * pageBytes;
   }
 };
+
 template <class T> void Device::scalar(MTL4::ArgumentTable* table, uint32_t index, const T& value) {
   static_assert(std::is_trivially_copyable_v<T>);
   constantOffset = (constantOffset + 15) & ~15ull;
@@ -103,6 +118,7 @@ template <class T> void Device::scalar(MTL4::ArgumentTable* table, uint32_t inde
   table->setAddress(constants.address() + constantOffset, index);
   constantOffset += sizeof(T);
 }
+
 template <class... Scalars>
 void Device::dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group, std::initializer_list<Tensor> tensors, const Scalars&... scalars) {
   auto* argumentTable = table();
@@ -115,6 +131,7 @@ void Device::dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group, st
   encoder->dispatchThreads(threads, group);
   encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
 }
+
 template <class... Scalars>
 void Device::dispatch(const std::string& kernel, MTL::Size threads, MTL::Size group, std::initializer_list<Tensor> tensors,
                       const Scalars&... scalars) {

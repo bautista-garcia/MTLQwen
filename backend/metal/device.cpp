@@ -9,16 +9,19 @@
 #include <sstream>
 #include <stdexcept>
 #include <unistd.h>
+
 namespace infeng::metal {
 static std::string message(NS::Error* error) {
   auto* description = error ? error->localizedDescription() : nullptr;
   return description ? description->utf8String() : "Metal operation failed";
 }
+
 template <class T> T* require(T* value, const std::string& error) {
   if (!value)
     throw std::runtime_error(error);
   return value;
 }
+
 Device::Device(const std::filesystem::path& kernels) {
   auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
   metalDevice = NS::TransferPtr(require(MTL::CreateSystemDefaultDevice(), "Metal device unavailable"));
@@ -42,22 +45,27 @@ Device::Device(const std::filesystem::path& kernels) {
   }
   constants = empty(1 << 18, true);
 }
+
 Device::~Device() {
   queue->removeResidencySet(residency.get());
 }
+
 void Device::add(MTL::Allocation* allocation) {
   residency->addAllocation(allocation);
   residency->commit();
 }
+
 void Device::remove(MTL::Allocation* allocation) {
   residency->removeAllocation(allocation);
   residency->commit();
 }
+
 void Device::wait() {
   uint64_t signal = ++eventValue;
   queue->signalEvent(event.get(), signal);
   event->waitUntilSignaledValue(signal, std::numeric_limits<uint64_t>::max());
 }
+
 Tensor Device::own(MTL::Buffer* buffer, uint64_t bytes) {
   add(buffer);
   return {std::shared_ptr<MTL::Buffer>(buffer,
@@ -67,10 +75,12 @@ Tensor Device::own(MTL::Buffer* buffer, uint64_t bytes) {
                                        }),
           0, bytes};
 }
+
 Tensor Device::empty(uint64_t bytes, bool shared) {
   auto mode = shared ? MTL::ResourceStorageModeShared : MTL::ResourceStorageModePrivate;
   return own(require(metalDevice->newBuffer(bytes, mode), "buffer allocation failed"), bytes);
 }
+
 Tensor Device::mapped(const std::filesystem::path& path) {
   uint64_t bytes = std::filesystem::file_size(path);
   uint64_t page = uint64_t(getpagesize());
@@ -83,6 +93,7 @@ Tensor Device::mapped(const std::filesystem::path& path) {
   });
   return own(buffer, bytes);
 }
+
 Pipeline* Device::pipeline(const std::string& name) {
   if (auto found = pipelines.find(name); found != pipelines.end())
     return found->second.get();
@@ -97,6 +108,7 @@ Pipeline* Device::pipeline(const std::string& name) {
   pipelines.emplace(name, NS::TransferPtr(pipelineState));
   return pipelineState;
 }
+
 Device& Device::command() {
   constantOffset = tableIndex = 0;
   metalCommandBuffer = NS::TransferPtr(require(metalDevice->newCommandBuffer(), "MTL4 command buffer creation failed"));
@@ -106,6 +118,7 @@ Device& Device::command() {
   encoder->barrierAfterQueueStages(MTL::StageResourceState, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
   return *this;
 }
+
 MTL4::ArgumentTable* Device::table() {
   if (tableIndex < tables.size())
     return tables[tableIndex++].get();
@@ -118,6 +131,7 @@ MTL4::ArgumentTable* Device::table() {
   ++tableIndex;
   return argumentTable;
 }
+
 void Device::commit() {
   encoder->endEncoding();
   metalCommandBuffer->endCommandBuffer();
@@ -126,16 +140,19 @@ void Device::commit() {
   wait();
   allocator->reset();
 }
+
 Tensor SparseKV::makeBuffer(uint32_t regions) {
   uint64_t bytes = regionBytes * regions;
   return device.own(
       require(device.metalDevice->newBuffer(bytes, MTL::ResourceStorageModePrivate, MTL::SparsePageSize256), "sparse KV allocation failed"), bytes);
 }
+
 SparseKV::SparseKV(Device& device, uint32_t virtualCount, uint32_t physicalCount, uint32_t layers, uint32_t drafterLayers)
     : device(device), virtualBlocks(virtualCount), maxPhysicalBlocks(physicalCount), layers(layers + drafterLayers), tilesPerBlock(this->layers * 2),
       blocksPerHeap(uint32_t(heapBytes / pageBytes) / tilesPerBlock), regionBytes(uint64_t(virtualBlocks) * pageBytes),
       resources{makeBuffer(this->layers), makeBuffer(this->layers)} {
 }
+
 void SparseKV::addHeap() {
   auto descriptor = NS::TransferPtr(MTL::HeapDescriptor::alloc()->init());
   descriptor->setType(MTL::HeapTypePlacement);
@@ -148,10 +165,12 @@ void SparseKV::addHeap() {
   heaps.push_back(NS::TransferPtr(heap));
   physicalBlocks += std::min(blocksPerHeap, maxPhysicalBlocks - physicalBlocks);
 }
+
 void SparseKV::ensure(uint32_t blocks) {
   while (physicalBlocks < blocks)
     addHeap();
 }
+
 void SparseKV::map(uint32_t virtualBlock, uint32_t physicalBlock) {
   MTL::Heap* heap = physicalBlock == UINT32_MAX ? nullptr : heaps[physicalBlock / blocksPerHeap].get();
   uint32_t heapOffset = physicalBlock == UINT32_MAX ? 0 : physicalBlock % blocksPerHeap * tilesPerBlock;
@@ -166,6 +185,7 @@ void SparseKV::map(uint32_t virtualBlock, uint32_t physicalBlock) {
     device.queue->updateBufferMappings(resources[resource].buffer.get(), heap, operations, layers);
   }
 }
+
 SparseKV::~SparseKV() {
   device.wait();
   for (Tensor& resource : resources)

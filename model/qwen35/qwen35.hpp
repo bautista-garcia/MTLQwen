@@ -9,6 +9,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
 namespace infeng::qwen35 {
 using metal::Device;
 using metal::Pipeline;
@@ -22,42 +23,51 @@ inline constexpr uint32_t gdnCheckpointTokens = 512, maxGdnCheckpoints = 8;
 inline constexpr uint32_t unbound = UINT32_MAX;
 inline constexpr uint64_t convStateBytes = 8192 * 4 * 2, recurrentStateBytes = uint64_t(32) * 128 * 128 * 4;
 inline constexpr uint64_t gdnCheckpointBytes = (targetLayers - targetKvLayers) * (recurrentStateBytes + convStateBytes);
+
 inline constexpr uint64_t gdnOffset(uint32_t layer) {
   return uint64_t(layer - layer / fullAttentionInterval) * (recurrentStateBytes + convStateBytes);
 }
 enum class QuantType : uint32_t { F32 = 0, F16 = 1, Q8_0 = 8, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ4_XS = 23 };
 enum class Drafter : uint8_t { none, mtp, dflash };
+
 enum LinearKernel : uint8_t { linearDecode, linearDecodeAdd, linearPrefill, linearPrefillSmall };
+
 struct Linear {
   Tensor weight;
   Pipeline* pipeline[4]{};
   uint32_t k = 0, n = 0;
   uint8_t outputsPerGroup = 0;
 };
+
 struct MlpWeights {
   Linear gate, up, down;
   Pipeline* fusedDecode = nullptr;
   uint8_t outputsPerGroup = 0;
 };
+
 struct AttentionWeights {
   Linear q, k, v, out;
   Tensor qNorm, kNorm;
 };
+
 struct GdnWeights {
   Linear qkv, z, out;
   Tensor b, a, conv, norm, dt, A;
 };
+
 struct Layer {
   Tensor inputNorm, postNorm;
   MlpWeights mlp;
   AttentionWeights attention;
   GdnWeights gdn;
 };
+
 struct DrafterWeights {
   Linear fusion;
   std::array<Layer, dflashLayers> layers;
   Tensor embeddingNorm, hiddenNorm, outputNorm;
 };
+
 struct Scratch {
   bool decodeMode = false;
   Tensor hidden[2], inputNorm, postNorm, mlpGate, mlpUp;
@@ -66,31 +76,38 @@ struct Scratch {
   Tensor mid, targetHidden, dflashFeatures, targetLogits;
   void ensure(Device& device, uint32_t rows, Drafter drafter);
 };
+
 struct GdnState {
   Tensor conv, recurrent;
 };
+
 inline GdnState gdnState(const Tensor& arena, uint32_t rows, uint32_t layer) {
   uint64_t offset = gdnOffset(layer) * rows;
   return {arena.view(offset, convStateBytes * rows), arena.view(offset + convStateBytes * rows, recurrentStateBytes * rows)};
 }
+
 struct PhysicalBlock {
   uint32_t refs = 0;
   uint64_t touch = 0;
 };
+
 struct HybridCheckpoint {
   Tensor arena;
   std::vector<uint32_t> bindings;
   uint64_t touch = 0;
 };
 struct Sequence;
+
 struct Query {
   Sequence* sequence = nullptr;
   uint32_t count = 1, logit = unbound, state = unbound;
 };
+
 struct Batch {
   std::array<Query, maxBatchSequences> queries{};
   uint32_t size = 0;
 };
+
 struct Engine {
   Device device;
   uint32_t maxContext;
@@ -114,14 +131,15 @@ struct Engine {
   uint64_t clock = 0;
   uint32_t physicalBlocks = 0;
   uint64_t parameterCount = 0, modelBytes = 0;
-  Engine(const std::filesystem::path& weights, const std::filesystem::path& kernels, uint32_t maxContext, Drafter drafter,
-         const std::filesystem::path& draftWeights);
+  Engine(const std::filesystem::path& weights, const std::filesystem::path& kernels, uint32_t maxContext, const std::filesystem::path& draftWeights);
   ~Engine();
+
   Scratch& scratch(uint32_t query, uint32_t rows) {
     workspace.decodeMode = query <= maxDecodeRows;
     workspace.ensure(device, rows, drafter);
     return workspace;
   }
+
   uint32_t acquireBlock();
   bool reserve(const Batch& batch);
   void bind(Sequence& sequence, uint32_t logical, uint32_t physical);
@@ -131,6 +149,7 @@ struct Engine {
   void schedule();
   bool execute(Batch& batch);
 };
+
 struct Sequence {
   Engine& engine;
   std::vector<int32_t> request;
@@ -146,6 +165,7 @@ struct Sequence {
   Sequence(Engine&, const int32_t* stops, uint32_t stopCount, float temperature, float topP, int32_t topK, uint32_t draftTokens);
   ~Sequence();
 };
+
 Tensor mtpSeed(Engine& engine, const Sequence& sequence, uint32_t bank);
 void copyGdnState(Device& commands, const Tensor& source, uint32_t sourceRows, uint32_t sourceRow, const Tensor& destination,
                   uint32_t destinationRows, uint32_t destinationRow);
