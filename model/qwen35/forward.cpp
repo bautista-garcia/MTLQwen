@@ -234,28 +234,28 @@ void Scratch::ensure(Device& device, uint32_t requested, Drafter drafter) {
   take(logitBytes, targetLogits);
 }
 
-void draft(Engine& model, Batch& batch, uint32_t drafts) {
+void draft(Engine& model, Batch& batch) {
   bool dflash = model.drafter == Drafter::dflash;
-  uint32_t rows = writeMetadata(model, batch, true), packed = rows * (dflash ? drafts + 1 : 1);
+  uint32_t width = model.draftWidth, rows = writeMetadata(model, batch, true), packed = rows * (dflash ? width + 1 : 1);
   auto* starts = model.queryStartLoc.contents<uint32_t>();
-  for (uint32_t i = 0; i < batch.size; ++i)
-    if (batch.queries[i].state != unbound) {
-      Query& query = batch.queries[i];
-      uint32_t row = query.state / query.count;
+  for (uint32_t row = 0; row < batch.size; ++row)
+    if (batch.queries[row].state != unbound) {
+      Query& query = batch.queries[row];
+      uint32_t draftRow = query.state / query.count;
       if (dflash) {
-        uint32_t start = row * (drafts + 1);
+        uint32_t start = draftRow * (width + 1);
         model.inputIds.contents<int32_t>()[start] = query.sequence->request[query.sequence->kvValid];
-        std::fill_n(model.inputIds.contents<int32_t>() + start + 1, drafts, dflashMaskToken);
-        std::iota(model.logitRows.contents<uint32_t>() + row * drafts, model.logitRows.contents<uint32_t>() + (row + 1) * drafts, start + 1);
+        std::fill_n(model.inputIds.contents<int32_t>() + start + 1, width, dflashMaskToken);
+        std::iota(model.logitRows.contents<uint32_t>() + draftRow * width, model.logitRows.contents<uint32_t>() + (draftRow + 1) * width, start + 1);
       } else {
-        model.draftTokens.contents<int32_t>()[row] = query.sequence->request[query.sequence->kvValid];
-        for (uint32_t step = 0; step < drafts; ++step)
-          model.draftPositions.contents<uint32_t>()[step * maxBatchSequences + row] = query.sequence->kvValid + step;
+        model.draftTokens.contents<int32_t>()[draftRow] = query.sequence->request[query.sequence->kvValid];
+        for (uint32_t step = 0; step < width; ++step)
+          model.draftPositions.contents<uint32_t>()[step * maxBatchSequences + draftRow] = query.sequence->kvValid + step;
       }
     }
   for (uint32_t row = 0; row <= rows; ++row)
-    starts[row] = row * (dflash ? drafts + 1 : 1);
-  Scratch& scratch = model.scratch(dflash ? drafts + 1 : 1, packed);
+    starts[row] = row * (dflash ? width + 1 : 1);
+  Scratch& scratch = model.scratch(dflash ? width + 1 : 1, packed);
   Device& commands = model.device.command();
   Ops ops{commands, model, scratch};
   if (dflash) {
@@ -263,13 +263,13 @@ void draft(Engine& model, Batch& batch, uint32_t drafts) {
     for (uint32_t index = 0; index < dflashLayers; ++index)
       hidden = ops.decoder(model.draftModel.layers[index], hidden, scratch.hidden[(index + 1) & 1], packed, targetKvLayers + index,
                            model.batchKvValid, nullptr, rows, index);
-    uint32_t proposals = rows * drafts;
+    uint32_t proposals = rows * width;
     commands.dispatch("gather_rows", size(uint64_t(proposals) * 4096), size(256), {scratch.postNorm, hidden, model.logitRows});
     Tensor logits = ops.logits(scratch.postNorm, model.draftModel.outputNorm, proposals);
     ops.argmax(model.draftTokens.view(uint64_t(maxBatchSequences) * 4, model.draftTokens.bytes - uint64_t(maxBatchSequences) * 4), logits, proposals,
-               drafts, maxBatchSequences);
+               width, maxBatchSequences);
   } else {
-    for (uint32_t step = 0; step < drafts; ++step) {
+    for (uint32_t step = 0; step < width; ++step) {
       Tensor ids = model.draftTokens.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(rows) * 4);
       Tensor positions = model.draftPositions.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(rows) * 4);
       Tensor hidden = ops.mtpInput(ids, scratch.inputNorm, rows, rows, step ? 0 : 2);
@@ -281,7 +281,7 @@ void draft(Engine& model, Batch& batch, uint32_t drafts) {
   commands.commit();
 }
 
-void forward(Engine& model, Batch& batch, uint32_t drafts, uint32_t stateRows) {
+void forward(Engine& model, Batch& batch, uint32_t candidateRows) {
   auto* starts = model.queryStartLoc.contents<uint32_t>();
   starts[0] = 0;
   for (uint32_t row = 0; row < batch.size; ++row)
@@ -294,7 +294,7 @@ void forward(Engine& model, Batch& batch, uint32_t drafts, uint32_t stateRows) {
     if (query.state != unbound) {
       tokens[starts[row]] = query.sequence->request[query.sequence->kvValid];
       uint32_t draftRow = query.state / query.count;
-      for (uint32_t step = 0; step < drafts; ++step)
+      for (uint32_t step = 0; step < model.draftWidth; ++step)
         tokens[starts[row] + step + 1] = proposed[(step + 1) * maxBatchSequences + draftRow];
     } else
       std::copy_n(query.sequence->request.data() + query.sequence->kvValid, query.count, tokens + starts[row]);
@@ -307,8 +307,8 @@ void forward(Engine& model, Batch& batch, uint32_t drafts, uint32_t stateRows) {
       logitRows[logitCount++] = starts[row] + (query.state != unbound ? i : query.count - 1);
   }
   writeMetadata(model, batch);
-  if (gdnCheckpointBytes * stateRows > model.candidateStates.bytes)
-    model.candidateStates = model.device.empty(gdnCheckpointBytes * stateRows);
+  if (gdnCheckpointBytes * candidateRows > model.candidateStates.bytes)
+    model.candidateStates = model.device.empty(gdnCheckpointBytes * candidateRows);
   Scratch& scratch = model.scratch(maxQuery, rows);
   Device& commands = model.device.command();
   Ops ops{commands, model, scratch};

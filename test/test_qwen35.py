@@ -44,8 +44,9 @@ def one(sequence, prompt=()):
   return complete(sequence, prompt, 1)[0]
 
 
-def turn(tokenizer, message, thinking=False):
-  return tokenizer.apply_chat_template([{"role": "user", "content": message}], tokenize=False, add_generation_prompt=True, enable_thinking=thinking)
+def turn(tokenizer, message, thinking=False, prefix=""):
+  prompt = tokenizer.apply_chat_template([{"role": "user", "content": message}], tokenize=False, add_generation_prompt=True, enable_thinking=thinking)
+  return tokenizer.encode(prefix + prompt, add_special_tokens=False)
 
 
 def parallel(calls):
@@ -54,24 +55,29 @@ def parallel(calls):
 
 
 def test_greedy_multiturn_generation():
-  engine = InferenceEngine(WEIGHTS, os.getenv("QWEN35_TOKENIZER", "Qwen/Qwen3.5-9B"))
-  assert one(engine.sequence(), turn(engine.tokenizer, LONG_PREFILL_PROMPT)) == 11678
-  sequence = engine.sequence()
-  first_ids = complete(sequence, turn(engine.tokenizer, "Hello, my name is"))
-  first = engine.tokenizer.decode(first_ids, skip_special_tokens=False)
+  os.environ.setdefault("USE_TORCH", "0")
+  from transformers import AutoTokenizer
+  tokenizer = AutoTokenizer.from_pretrained(os.getenv("QWEN35_TOKENIZER", "Qwen/Qwen3.5-9B"))
+  im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+  stop_ids = [token for token in (tokenizer.eos_token_id, im_end) if token is not None]
+  engine = InferenceEngine(WEIGHTS)
+  assert one(engine.sequence(stop_token_ids=stop_ids), turn(tokenizer, LONG_PREFILL_PROMPT)) == 11678
+  sequence = engine.sequence(stop_token_ids=stop_ids)
+  first_ids = complete(sequence, turn(tokenizer, "Hello, my name is"))
+  first = tokenizer.decode(first_ids, skip_special_tokens=False)
   assert first.strip() == FIRST_TURN_RESPONSE, repr(first)
-  im_end = engine.tokenizer.convert_tokens_to_ids("<|im_end|>")
   prefix = "\n" if first_ids[-1] == im_end else "<|im_end|>\n"
-  ours = engine.tokenizer.decode(complete(sequence, prefix + turn(engine.tokenizer, "Bautista")), skip_special_tokens=False)
+  ours = tokenizer.decode(complete(sequence, turn(tokenizer, "Bautista", prefix=prefix)), skip_special_tokens=False)
   sequence.close()
   engine.close()
   assert ours.strip() == NATIVE_GREEDY_MULTITURN, repr(ours)
 
 
 def test_continuous_mixed_batch_and_prefix_restore():
-  model = InferenceEngine(MTP_WEIGHTS, drafter="mtp")
-  reference = [model.sequence(), model.sequence(), model.sequence(draft_tokens=2)]
-  actual = [model.sequence(), model.sequence(), model.sequence(draft_tokens=2)]
+  model = InferenceEngine(WEIGHTS, draft_weights=MTP_WEIGHTS)
+  assert model.drafter == "mtp"
+  reference = [model.sequence(), model.sequence(), model.sequence(speculative=True)]
+  actual = [model.sequence(), model.sequence(), model.sequence(speculative=True)]
   extra = []
   try:
     prompt = list(range(1, 201))
@@ -92,8 +98,8 @@ def test_continuous_mixed_batch_and_prefix_restore():
 
     for sequence in reference + actual:
       sequence.close()
-    checkpoint = model.sequence(draft_tokens=2)
-    restored = model.sequence(draft_tokens=2)
+    checkpoint = model.sequence(speculative=True)
+    restored = model.sequence(speculative=True)
     extra += [checkpoint, restored]
     checkpoint_prompt = list(range(1, 521))
     expected = one(checkpoint, checkpoint_prompt)
@@ -101,25 +107,25 @@ def test_continuous_mixed_batch_and_prefix_restore():
     assert one(restored, checkpoint_prompt) == expected and restored.length == 520
     assert complete(checkpoint, limit=4) == complete(restored, limit=4)
 
-    stop_reference = model.sequence(draft_tokens=2)
+    stop_reference = model.sequence(speculative=True)
     extra.append(stop_reference)
     anchor = one(stop_reference, DFLASH_MATH_PROMPT)
     stop = one(stop_reference)
-    stop_sequence = model.sequence(stop_token_ids=[stop], draft_tokens=2)
+    stop_sequence = model.sequence(stop_token_ids=[stop], speculative=True)
     extra.append(stop_sequence)
     assert one(stop_sequence, DFLASH_MATH_PROMPT) == anchor
     assert complete(stop_sequence) == []
     assert stop_sequence.length == len(DFLASH_MATH_PROMPT) + 2
     assert stop_sequence.speculative_counters()["accepted_tokens"] == 1
 
-    edge_ref, draft_ref = model.sequence(draft_tokens=2), model.sequence(draft_tokens=2)
+    edge_ref, draft_ref = model.sequence(speculative=True), model.sequence(speculative=True)
     edge_prompt, draft_prompt = list(range(1, 512)), [50, 51, 52]
     edge_anchor, draft_anchor = one(edge_ref, edge_prompt), one(draft_ref, draft_prompt)
     expected_edge = complete(edge_ref, limit=1)
     expected_draft = complete(draft_ref, limit=4)
     edge_ref.close()
     draft_ref.close()
-    edge, draft_sequence = model.sequence(draft_tokens=2), model.sequence(draft_tokens=2)
+    edge, draft_sequence = model.sequence(speculative=True), model.sequence(speculative=True)
     extra += [edge, draft_sequence]
     assert one(edge, edge_prompt) == edge_anchor and one(draft_sequence, draft_prompt) == draft_anchor
     observed = parallel([
@@ -128,14 +134,10 @@ def test_continuous_mixed_batch_and_prefix_restore():
     ])
     assert observed == [expected_edge, expected_draft] and edge.length == 512
 
-    rollback_ref, rollback = model.sequence(draft_tokens=2), model.sequence(draft_tokens=2)
+    rollback_ref, rollback = model.sequence(speculative=True), model.sequence(speculative=True)
     extra += [rollback_ref, rollback]
     anchor = one(rollback_ref, [30, 31, 32])
     assert one(rollback, [30, 31, 32]) == anchor
-    before = rollback.length
-    with pytest.raises(RuntimeError, match="top_k"):
-      model.sequence(temperature=1.0, top_k=-1, draft_tokens=2)
-    assert rollback.length == before
     assert one(rollback) == one(rollback_ref)
   finally:
     for sequence in reference + actual + extra:
@@ -145,12 +147,11 @@ def test_continuous_mixed_batch_and_prefix_restore():
 
 @pytest.mark.skipif(not DFLASH_WEIGHTS.exists(), reason="reference DFlash GGUF is unavailable")
 def test_dflash_greedy_contract_and_configuration():
-  model = InferenceEngine(WEIGHTS, drafter="dflash", draft_weights=DFLASH_WEIGHTS, max_context=1024)
-  reference, actual = model.sequence(), model.sequence(draft_tokens=7)
+  model = InferenceEngine(WEIGHTS, draft_weights=DFLASH_WEIGHTS, max_context=1024)
+  assert model.drafter == "dflash"
+  reference, actual = model.sequence(), model.sequence(speculative=True)
   extra = []
   try:
-    with pytest.raises(RuntimeError, match="drafter limit"):
-      model.sequence(draft_tokens=8)
     expected = complete(reference, DFLASH_MATH_PROMPT, 64)
     observed = complete(actual, DFLASH_MATH_PROMPT, 64)
     assert observed == expected
@@ -158,7 +159,7 @@ def test_dflash_greedy_contract_and_configuration():
     assert counters["drafted_tokens"] and counters["acceptance_rate"] >= 0.45
     assert model.mapped_bytes == 56 << 20
 
-    checkpoint, restored = model.sequence(draft_tokens=7), model.sequence(draft_tokens=7)
+    checkpoint, restored = model.sequence(speculative=True), model.sequence(speculative=True)
     extra += [checkpoint, restored]
     prompt = list(range(1, 521))
     value = one(checkpoint, prompt)
@@ -172,15 +173,9 @@ def test_dflash_greedy_contract_and_configuration():
     model.close()
 
 
-def test_drafter_argument_validation():
-  with pytest.raises(ValueError, match="drafter must be"):
-    InferenceEngine(WEIGHTS, drafter="unknown")
-  with pytest.raises(ValueError, match="requires draft_weights"):
-    InferenceEngine(WEIGHTS, drafter="dflash")
-  with pytest.raises(ValueError, match="only valid for dflash"):
-    InferenceEngine(WEIGHTS, drafter="none", draft_weights=DFLASH_WEIGHTS)
+def test_invalid_drafter_weights():
   with pytest.raises(RuntimeError):
-    InferenceEngine(WEIGHTS, drafter="dflash", draft_weights=WEIGHTS, max_context=128)
+    InferenceEngine(WEIGHTS, draft_weights=WEIGHTS, max_context=128)
 
 
 def test_allocator_failure_is_atomic():

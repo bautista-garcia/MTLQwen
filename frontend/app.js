@@ -143,15 +143,6 @@ function renderServer() {
   const speculative = $("#speculative");
   speculative.disabled = !serverStatus.loaded || serverStatus.drafter === "none";
   if (speculative.disabled) speculative.checked = false;
-  const drafts = $("#draft_tokens");
-  drafts.disabled = speculative.disabled;
-  const draftConfig = `${serverStatus.drafter}:${serverStatus.default_draft_tokens}:${serverStatus.max_draft_tokens}`;
-  if (serverStatus.loaded && drafts.dataset.config !== draftConfig) {
-    drafts.dataset.config = draftConfig;
-    drafts.max = serverStatus.max_draft_tokens;
-    drafts.value = serverStatus.default_draft_tokens || 1;
-    $("#draft_tokens-val").textContent = drafts.value;
-  }
 }
 
 function renderSidebar() {
@@ -394,7 +385,6 @@ function getParameters() {
     top_k: Number($("#top_k").value),
     max_tokens: Number($("#max_tokens").value),
     speculative: $("#speculative").checked,
-    draft_tokens: Number($("#draft_tokens").value),
   };
 }
 
@@ -647,7 +637,7 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
-const settingIds = ["thinking", "speculative", "draft_tokens", "temperature", "top_p", "top_k", "max_tokens"];
+const settingIds = ["thinking", "speculative", "temperature", "top_p", "top_k", "max_tokens"];
 try {
   const saved = JSON.parse(localStorage.getItem("mtlqwen-settings") || localStorage.getItem("infeng-settings") || "{}");
   settingIds.forEach((id) => {

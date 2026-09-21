@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -41,7 +42,8 @@ class ChatSession:
 class Handler(SimpleHTTPRequestHandler):
   protocol_version = "HTTP/1.1"
   disable_nagle_algorithm, wbufsize = True, 0
-  engine = None
+  engine = tokenizer = None
+  stop_token_ids, im_end_token_id = frozenset(), None
   loading, load_error = False, ""
   load_config = None
   model_condition = threading.Condition()
@@ -51,25 +53,30 @@ class Handler(SimpleHTTPRequestHandler):
   @classmethod
   def _model_config(cls, drafter=None):
     drafter = drafter or cls.args.drafter
-    if drafter not in ("none", "mtp", "dflash"): raise ValueError("drafter must be none, mtp, or dflash")
-    weights = cls.args.mtp_weights if drafter == "mtp" else cls.args.weights
-    return {"drafter": drafter, "weights": weights, "draft_weights": cls.args.draft_weights if drafter == "dflash" else None}
+    paths = {"none": None, "mtp": cls.args.mtp_weights, "dflash": cls.args.draft_weights}
+    if drafter not in paths: raise ValueError("drafter must be none, mtp, or dflash")
+    return {"drafter": drafter, "draft_weights": paths[drafter]}
 
   @classmethod
   def _finish_model_load(cls, config):
+    tokenizer, stop_token_ids, im_end_token_id = cls.tokenizer, cls.stop_token_ids, cls.im_end_token_id
     try:
       print(f"loading {config['drafter']} model on native Metal 4 with float16", flush=True)
-      engine = InferenceEngine(config["weights"],
-                               cls.args.tokenizer,
-                               drafter=config["drafter"],
-                               draft_weights=config["draft_weights"],
-                               max_context=cls.args.max_context)
+      if tokenizer is None:
+        os.environ.setdefault("USE_TORCH", "0")
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(cls.args.tokenizer)
+        im_end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        stop_token_ids = frozenset(token for token in (tokenizer.eos_token_id, im_end_token_id) if token is not None)
+      engine = InferenceEngine(cls.args.weights, draft_weights=config["draft_weights"], max_context=cls.args.max_context)
       error = ""
       print("model loaded on native Metal 4 with float16", flush=True)
     except Exception as exc:
       engine, error = None, f"{type(exc).__name__}: {exc}"
       print(f"model load failed: {error}", flush=True)
     with cls.model_condition:
+      if engine:
+        cls.tokenizer, cls.stop_token_ids, cls.im_end_token_id = tokenizer, stop_token_ids, im_end_token_id
       cls.engine, cls.loading, cls.load_error = engine, False, error
       cls.model_condition.notify_all()
     return engine
@@ -127,8 +134,6 @@ class Handler(SimpleHTTPRequestHandler):
       mapped = max((item.runtime.engine.mapped_bytes for item in sessions if item.runtime), default=0)
       active = sum(item.generating for item in sessions)
       drafter = Handler.engine.drafter if Handler.engine else (Handler.load_config or Handler._model_config())["drafter"]
-      default_drafts = Handler.engine.default_draft_tokens if Handler.engine else {"none": 0, "mtp": 2, "dflash": 7}[drafter]
-      max_drafts = Handler.engine.max_draft_tokens if Handler.engine else {"none": 0, "mtp": 4, "dflash": 7}[drafter]
       return self._json(
         200, {
           "loaded": Handler.engine is not None,
@@ -138,8 +143,6 @@ class Handler(SimpleHTTPRequestHandler):
           "drafter": drafter,
           "mtp": drafter == "mtp",
           "dflash": drafter == "dflash",
-          "default_draft_tokens": default_drafts,
-          "max_draft_tokens": max_drafts,
           "sessions": len(sessions),
           "active_sessions": active,
           "max_sessions": Handler.max_sessions,
@@ -204,7 +207,7 @@ class Handler(SimpleHTTPRequestHandler):
       self.send_header("connection", "close")
       self.end_headers()
       if Handler.engine is None and not self._event({"status": "Loading model…"}): return
-      engine = Handler.load_model()
+      engine, tokenizer = Handler.load_model(), Handler.tokenizer
       text = message.strip()
       session.messages.append({"role": "user", "content": text})
       if session.title == "New chat": session.title = text[:48] + ("…" if len(text) > 48 else "")
@@ -214,26 +217,24 @@ class Handler(SimpleHTTPRequestHandler):
       if session.runtime is None:
         speculative = bool(data.get("speculative", Handler.args.speculative))
         if speculative and engine.drafter == "none": raise ValueError("speculative generation requires --drafter mtp or dflash")
-        requested = data.get("draft_tokens", Handler.args.draft_tokens)
-        drafts = engine.default_draft_tokens if requested is None else int(requested)
-        if engine.max_draft_tokens: drafts = max(1, min(drafts, engine.max_draft_tokens))
-        session.runtime = engine.sequence(temperature=float(data.get("temperature", Handler.args.temperature)),
+        session.runtime = engine.sequence(stop_token_ids=Handler.stop_token_ids,
+                                          temperature=float(data.get("temperature", Handler.args.temperature)),
                                           top_p=float(data.get("top_p", Handler.args.top_p)),
                                           top_k=int(data.get("top_k", Handler.args.top_k)),
-                                          draft_tokens=drafts if speculative else 0)
-      speculative, stop_ids = bool(session.runtime.draft_tokens), session.runtime.stop_token_ids
+                                          speculative=speculative)
+      speculative, stop_ids = session.runtime.speculative, session.runtime.stop_token_ids
       before_context = session.metrics.get("context_tokens", 0)
       spec_before = session.runtime.speculative_counters() if speculative else None
-      formatted = engine.tokenizer.apply_chat_template([{
+      formatted = tokenizer.apply_chat_template([{
         "role": "user",
         "content": text
       }],
-                                                       tokenize=False,
-                                                       add_generation_prompt=True,
-                                                       enable_thinking=thinking)
+                                                tokenize=False,
+                                                add_generation_prompt=True,
+                                                enable_thinking=thinking)
       formatted = ("" if not session.started else "\n" if session.sealed else "<|im_end|>\n") + formatted
       session.started = True
-      cursor = session.runtime.append(formatted)
+      cursor = session.runtime.append(tokenizer.encode(formatted, add_special_tokens=False))
       prompt_tokens = cursor - before_context
       if not self._event({"status": "Generating…", "sequence_id": session.id}):
         disconnected = True
@@ -253,7 +254,7 @@ class Handler(SimpleHTTPRequestHandler):
         now = time.perf_counter()
         if first_at is None: first_at = now
         generated += 1
-        token = engine.tokenizer.decode([token_id], skip_special_tokens=False)
+        token = tokenizer.decode([token_id], skip_special_tokens=False)
         if mode == "thinking" and "</think>" in token:
           before, after = token.split("</think>", 1)
           thought.append(before)
@@ -302,7 +303,7 @@ class Handler(SimpleHTTPRequestHandler):
         **spec
       }
       cancelled = stopping or session.cancel.is_set()
-      session.sealed = stop_token == engine.tokenizer.convert_tokens_to_ids("<|im_end|>")
+      session.sealed = stop_token == Handler.im_end_token_id
       thought, response = "".join(thought), "".join(response)
       session.metrics = metrics
       session.messages.append({"role": "assistant", "content": response, "thinking": thought, "cancelled": cancelled, "metrics": metrics})
@@ -339,7 +340,6 @@ def main():
   parser.add_argument("--max-context", type=int, default=65536)
   parser.add_argument("--thinking", action="store_true")
   parser.add_argument("--speculative", action="store_true")
-  parser.add_argument("--draft-tokens", type=int)
   parser.add_argument("--temperature", type=float)
   parser.add_argument("--top-p", type=float)
   parser.add_argument("--top-k", type=int, default=20)

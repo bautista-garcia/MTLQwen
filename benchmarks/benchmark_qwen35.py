@@ -19,8 +19,8 @@ MATH_PROMPT = [
 ]
 
 
-def run(model, tokens, decode, batch, speculative=False, draft_tokens=None):
-  sessions = [model.sequence(draft_tokens=draft_tokens if speculative else 0) for _ in range(batch)]
+def run(model, tokens, decode, batch, speculative=False):
+  sessions = [model.sequence(speculative=speculative) for _ in range(batch)]
 
   def first(session):
     cursor = session.append(tokens)
@@ -58,7 +58,6 @@ def run(model, tokens, decode, batch, speculative=False, draft_tokens=None):
 def main():
   p = argparse.ArgumentParser(description="Qwen3.5 native Metal 4 macro benchmark")
   p.add_argument("--weights", type=Path, default=WEIGHTS)
-  p.add_argument("--drafter", choices=("none", "mtp", "dflash"), default="none")
   p.add_argument("--draft-weights", type=Path)
   p.add_argument("--max-context", type=int, default=4096)
   p.add_argument("--prefill", type=int, default=128)
@@ -69,11 +68,10 @@ def main():
   p.add_argument("--warmup", type=int, default=3)
   p.add_argument("--iters", type=int, default=5)
   p.add_argument("--speculative", action="store_true")
-  p.add_argument("--draft-tokens", type=int)
   a = p.parse_args()
   if a.prompt_ids and a.prompt_preset: p.error("--prompt-ids and --prompt-preset are mutually exclusive")
-  print(f"[load] weights={a.weights} drafter={a.drafter} draft_weights={a.draft_weights}", flush=True)
-  model = InferenceEngine(a.weights, drafter=a.drafter, draft_weights=a.draft_weights, max_context=a.max_context)
+  print(f"[load] weights={a.weights} draft_weights={a.draft_weights}", flush=True)
+  model = InferenceEngine(a.weights, draft_weights=a.draft_weights, max_context=a.max_context)
   if not 1 <= a.batch <= model.max_batch_sequences:
     p.error(f"--batch must be between 1 and {model.max_batch_sequences}")
   params, model_bytes = model.parameter_count, model.weight_bytes
@@ -81,22 +79,19 @@ def main():
   tokens = ([int(token) for token in a.prompt_ids.split(",")]
             if a.prompt_ids else MATH_PROMPT if a.prompt_preset else [rng.randrange(model.vocab_size) for _ in range(a.prefill)])
   a.prefill = len(tokens)
-  if a.speculative and model.drafter == "none": p.error("--speculative requires --drafter mtp or dflash")
-  drafts = model.default_draft_tokens if a.draft_tokens is None else a.draft_tokens
-  if a.speculative and not 1 <= drafts <= model.max_draft_tokens:
-    p.error(f"--draft-tokens must be between 1 and {model.max_draft_tokens} for {model.drafter}")
+  if a.speculative and model.drafter == "none": p.error("--speculative requires --draft-weights")
   print(
     f"# Qwen3.5 Metal 4 Benchmark\nweights={a.weights} drafter={model.drafter} dtype=float16 "
-    f"speculative={a.speculative} draft_tokens={drafts} "
+    f"speculative={a.speculative} draft_width={model.draft_width} "
     f"batch={a.batch} prefill={a.prefill} decode={a.decode} warmup={a.warmup} iters={a.iters}",
     flush=True)
   for i in range(a.warmup):
     print(f"warmup={i + 1}/{a.warmup}", flush=True)
-    run(model, tokens, a.decode, a.batch, a.speculative, drafts)
+    run(model, tokens, a.decode, a.batch, a.speculative)
   ttft, decode, mapped, drafted, accepted = [], [], 0, 0, 0
   for i in range(a.iters):
     print(f"iter={i + 1}/{a.iters}", flush=True)
-    ptime, dtime, mapped, proposed, kept = run(model, tokens, a.decode, a.batch, a.speculative, drafts)
+    ptime, dtime, mapped, proposed, kept = run(model, tokens, a.decode, a.batch, a.speculative)
     ttft.append(ptime)
     decode.append(dtime)
     drafted += proposed

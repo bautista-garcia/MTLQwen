@@ -52,12 +52,13 @@ def _check(value, error=None):
 
 class Sequence:
 
-  def __init__(self, engine, stop_token_ids, temperature, top_p, top_k, draft_tokens):
+  def __init__(self, engine, stop_token_ids, temperature, top_p, top_k, speculative):
     self.engine, self.handle = engine, 0
-    self.stop_token_ids, self.draft_tokens = frozenset(stop_token_ids), draft_tokens
+    self.stop_token_ids, self.speculative = frozenset(stop_token_ids), bool(speculative and engine.draft_width)
     stops = (ctypes.c_int32 * len(stop_token_ids))(*stop_token_ids)
     error = ctypes.create_string_buffer(1024)
-    self.handle = _check(_LIB.infeng_sequence_create(engine.handle, stops, len(stops), temperature, top_p, top_k or 0, draft_tokens, error), error)
+    self.handle = _check(_LIB.infeng_sequence_create(engine.handle, stops, len(stops), temperature, top_p, top_k or 0, self.speculative, error),
+                         error)
 
   def append(self, tokens=()):
     ids = (ctypes.c_int32 * len(tokens))(*tokens)
@@ -94,15 +95,14 @@ class InferenceEngine:
     draft_path = str(draft_weights).encode() if draft_weights is not None else None
     error = ctypes.create_string_buffer(1024)
     self.handle = _check(_LIB.infeng_engine_create(str(weights).encode(), draft_path, str(KERNELS).encode(), max_context, error), error)
-    native = _LIB.infeng_engine_info(self.handle, 3)
-    self.drafter, self.max_draft_tokens, self.default_draft_tokens = (("none", 0, 0), ("mtp", 4, 2), ("dflash", 7, 7))[native]
+    self.drafter = ("none", "mtp", "dflash")[_LIB.infeng_engine_info(self.handle, 3)]
+    self.draft_width = _LIB.infeng_engine_info(self.handle, 4)
     self.max_context, self.max_batch_sequences, self.vocab_size = max_context, MAX_BATCH, VOCAB
     self.parameter_count = _LIB.infeng_engine_info(self.handle, 0)
     self.weight_bytes = _LIB.infeng_engine_info(self.handle, 1)
 
-  def sequence(self, *, stop_token_ids=None, temperature=0.0, top_p=1.0, top_k=None, draft_tokens=0):
-    if not 0 <= draft_tokens <= self.max_draft_tokens: raise RuntimeError("draft token count exceeds the active drafter limit")
-    return Sequence(self, list(stop_token_ids or ()), temperature, top_p, top_k, draft_tokens)
+  def sequence(self, *, stop_token_ids=None, temperature=0.0, top_p=1.0, top_k=None, speculative=False):
+    return Sequence(self, list(stop_token_ids or ()), temperature, top_p, top_k, speculative)
 
   @property
   def mapped_bytes(self):

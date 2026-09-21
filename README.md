@@ -32,6 +32,7 @@ struct Engine {
   std::array<Layer, targetLayers> layers;      // 32 target-model layers
   DrafterWeights draftModel;                  // MTP or DFlash weights when enabled
   Drafter drafter = Drafter::none;            // Active drafting strategy
+  uint32_t draftWidth = 0;                     // Engine-wide proposal width
 
   Tensor gdnStates[2], candidateStates;        // Persistent GDN banks and temporary speculative states
   Scratch workspace;                          // Grow-only reusable forward-pass scratch
@@ -66,7 +67,7 @@ sequence = engine.sequence(
     temperature=...,
     top_p=...,
     top_k=...,
-    draft_tokens=...,
+    speculative=...,
 )
 ```
 
@@ -89,9 +90,9 @@ struct Sequence {
 
   uint32_t slot;                      // Index in Engine.sequences and all per-slot GPU state
   uint32_t bank = 0;                  // GDN bank containing the current committed state
-  uint32_t draftTokens;               // Fixed requested proposal width
   float temperature, topP;            // Fixed sampling configuration
   int32_t topK;                        // Fixed sampling candidate limit
+  bool speculative;                   // Whether this sequence uses the engine's drafter
   bool active = false, busy = false;   // May continue; currently belongs to an in-flight batch
 };
 ```
@@ -140,10 +141,11 @@ The real `Batch` is:
 struct Batch {
   std::array<Query, maxBatchSequences> queries{}; // One query per selected sequence
   uint32_t size = 0;                              // Number of selected sequences
+  uint32_t candidateRows = 0;                     // Temporary states required by speculative queries
 };
 ```
 
-At this point each query contains only its `Sequence*`. The remaining fields are derived after prefix lookup.
+The same scan restores cached prefixes, finalizes generation queries, and records prompt queries in a local worklist for fair allocation.
 
 ### 5. Restore a cached prefix
 
@@ -193,13 +195,15 @@ total target rows  <= 128
 query end          <= next 512-token checkpoint boundary
 ```
 
-The shared proposal width is the minimum allowed by the active drafter, each participating sequence's `draftTokens`, and its remaining room before the next checkpoint.
+The engine owns one proposal width: 2 for MTP or 7 for DFlash. A generation query uses it only when its sequence enables speculation and the full verification query fits before the next checkpoint.
 
 The real `Query` is:
 
 ```cpp
 struct Query {
   Sequence* sequence = nullptr; // Persistent state advanced by this query
+  uint32_t pending = 1;         // Request tokens not yet processed by the target
+  uint32_t room = 1;            // Rows available before the next checkpoint
   uint32_t count = 1;           // Target rows: prompt chunk, one anchor, or anchor + proposals
   uint32_t logit = unbound;     // Offset in sampled results; unbound for an intermediate prompt chunk
   uint32_t state = unbound;     // First row in candidateStates; unbound when not speculative
@@ -264,7 +268,7 @@ Kernels never receive a `Sequence*` or `Query*`. C++ translates their state into
 
 ### 9. Optionally produce draft proposals
 
-Drafting is used only when a sequence has one pending anchor and a nonzero `draftTokens`. It does not advance `kvValid`.
+Drafting is used only when a sequence enables speculation, has one pending anchor, and has room for the engine's full draft width. It does not advance `kvValid`.
 
 #### Target only
 

@@ -99,17 +99,17 @@ struct Sequence;
 
 struct Query {
   Sequence* sequence = nullptr;
-  uint32_t count = 1, logit = unbound, state = unbound;
+  uint32_t pending = 1, room = 1, count = 1, logit = unbound, state = unbound;
 };
 
 struct Batch {
   std::array<Query, maxBatchSequences> queries{};
-  uint32_t size = 0;
+  uint32_t size = 0, candidateRows = 0;
 };
 
 struct Engine {
   Device device;
-  uint32_t maxContext;
+  uint32_t maxContext, draftWidth = 0;
   std::unique_ptr<SparseKV> kv;
   Tensor embedding, norm, rope, dflashRope;
   Linear head;
@@ -155,15 +155,15 @@ struct Sequence {
   bool error = false;
   uint64_t drafted = 0, accepted = 0, prefixHash = 0;
   uint32_t kvValid = 0;
-  uint32_t slot, bank = 0, draftTokens;
+  uint32_t slot, bank = 0;
   float temperature, topP;
   int32_t topK;
-  bool active = false, busy = false;
-  Sequence(Engine&, const int32_t* stops, uint32_t stopCount, float temperature, float topP, int32_t topK, uint32_t draftTokens);
+  bool speculative, active = false, busy = false;
+  Sequence(Engine&, const int32_t* stops, uint32_t stopCount, float temperature, float topP, int32_t topK, bool speculative);
   ~Sequence();
 };
 
 Tensor mtpSeed(Engine& engine, const Sequence& sequence, uint32_t bank);
-void draft(Engine& engine, Batch& batch, uint32_t drafts);
-void forward(Engine& engine, Batch& batch, uint32_t drafts, uint32_t stateRows);
+void draft(Engine& engine, Batch& batch);
+void forward(Engine& engine, Batch& batch, uint32_t candidateRows);
 } // namespace infeng::qwen35

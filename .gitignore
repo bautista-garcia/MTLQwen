@@ -78,4 +78,6 @@ research/
 # Local Codex skills
 /.codex/skills/codebase-simplifier/
 
+/.codex/
+
 .tmp-video-sync/

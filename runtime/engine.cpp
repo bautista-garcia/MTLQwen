@@ -131,8 +131,8 @@ void Engine::publishPrefix(Sequence& sequence) {
 }
 
 Sequence::Sequence(Engine& owner, const int32_t* stopTokens, uint32_t stopCount, float samplingTemperature, float samplingTopP, int32_t samplingTopK,
-                   uint32_t drafts)
-    : engine(owner), draftTokens(drafts), temperature(samplingTemperature), topP(samplingTopP), topK(samplingTopK) {
+                   bool useSpeculation)
+    : engine(owner), temperature(samplingTemperature), topP(samplingTopP), topK(samplingTopK), speculative(useSpeculation) {
   std::lock_guard lock(engine.mutex);
   request.reserve(owner.maxContext + 1);
   stops.assign(stopTokens, stopTokens + stopCount);
@@ -168,11 +168,37 @@ void Engine::schedule() {
     if (closing)
       return;
     Batch batch;
+    std::array<Query*, maxBatchSequences> prefills;
+    uint32_t prefillCount = 0, remaining = maxBatchTokens;
     for (Sequence* sequence : sequences)
       if (ready(sequence)) {
         sequence->busy = true;
-        batch.queries[batch.size++].sequence = sequence;
+        if (!sequence->kvValid)
+          restorePrefix(*sequence);
+        Query& query = batch.queries[batch.size++];
+        query.sequence = sequence;
+        query.pending = sequence->request.size() - sequence->kvValid;
+        query.room = std::min(maxContext, (sequence->kvValid / gdnCheckpointTokens + 1) * gdnCheckpointTokens) - sequence->kvValid;
+        // draft width to each t.g sequence (without crossing 512 token boundary)
+        if (query.pending > 1) {
+          prefills[prefillCount++] = &query;
+          continue;
+        }
+        query.logit = 0;
+        if (sequence->speculative && query.room > draftWidth) {
+          query.count += draftWidth;
+          query.state = batch.candidateRows;
+          batch.candidateRows += query.count;
+        }
+        remaining -= query.count;
       }
+    // remaining space for p.p queries
+    for (uint32_t row = 0; row < prefillCount; ++row) {
+      Query& query = *prefills[row];
+      query.count = std::min({query.pending, query.room, remaining / (prefillCount - row)});
+      query.logit = query.count == query.pending ? 0 : unbound;
+      remaining -= query.count;
+    }
     lock.unlock();
     bool success = execute(batch);
     lock.lock();
@@ -187,35 +213,14 @@ void Engine::schedule() {
 }
 
 bool Engine::execute(Batch& batch) {
-  uint32_t drafts = 0, draftRows = 0, stateRows = 0;
-  for (uint32_t row = 0; row < batch.size; ++row) {
-    Query& query = batch.queries[row];
-    Sequence& sequence = *query.sequence;
-    if (!sequence.kvValid)
-      restorePrefix(sequence);
-    query.count = sequence.request.size() - sequence.kvValid;
-    query.state = std::min(maxContext, (sequence.kvValid / gdnCheckpointTokens + 1) * gdnCheckpointTokens) - sequence.kvValid;
-    uint32_t available = query.count == 1 && query.state > 1 ? std::min(sequence.draftTokens, query.state - 1) : 0;
-    drafts = available ? (drafts ? std::min(drafts, available) : available) : drafts;
-    draftRows += available != 0;
-  }
-  uint32_t budget = maxBatchTokens - batch.size - draftRows * drafts;
-  for (uint32_t row = 0; row < batch.size; ++row) {
-    Query& query = batch.queries[row];
-    Sequence& sequence = *query.sequence;
-    bool prompt = query.count > 1;
-    uint32_t count = prompt ? std::min({query.count, query.state, budget + 1}) : 1 + (sequence.draftTokens && query.state > 1 ? drafts : 0);
-    budget -= prompt * (count - 1);
-    query = {&sequence, count, !prompt || count == query.count ? 0 : unbound, !prompt && count > 1 ? stateRows : unbound};
-    stateRows += (!prompt && count > 1) * count;
-  }
+  // allocate KV capacity
   if (!reserve(batch))
     return false;
-  if (drafts)
-    draft(*this, batch, drafts);
-  forward(*this, batch, drafts, stateRows);
+  if (batch.candidateRows)
+    draft(*this, batch);
+  forward(*this, batch, batch.candidateRows);
   auto *sampled = outputTokens.contents<int32_t>(), *proposed = draftTokens.contents<int32_t>();
-  Device* copies = drafts ? &device.command() : nullptr;
+  Device* copies = batch.candidateRows ? &device.command() : nullptr;
   std::lock_guard lock(mutex);
   for (uint32_t row = 0; row < batch.size; ++row) {
     Query& query = batch.queries[row];
@@ -224,16 +229,17 @@ bool Engine::execute(Batch& batch) {
       query.count = 0;
       continue;
     }
-    bool draft = query.state != unbound;
+    bool speculative = query.state != unbound;
     uint32_t accepted = 0;
-    bool acceptedStop = false;
-    uint32_t draftRow = draft ? query.state / query.count : 0;
-    if (draft) {
-      while (accepted < drafts && sampled[query.logit + accepted] == proposed[(accepted + 1) * maxBatchSequences + draftRow]) {
+    bool stopped = false;
+    auto isStop = [&](int32_t token) { return std::find(sequence.stops.begin(), sequence.stops.end(), token) != sequence.stops.end(); };
+    if (speculative) {
+      uint32_t draftRow = query.state / query.count;
+      while (accepted < draftWidth && sampled[query.logit + accepted] == proposed[(accepted + 1) * maxBatchSequences + draftRow]) {
         int32_t token = proposed[(accepted + 1) * maxBatchSequences + draftRow];
         sequence.request.push_back(token);
         ++accepted;
-        if ((acceptedStop = std::count(sequence.stops.begin(), sequence.stops.end(), token)))
+        if ((stopped = isStop(token)))
           break;
       }
       copyState(*copies,
@@ -242,16 +248,18 @@ bool Engine::execute(Batch& batch) {
                                          : Tensor{}},
                 {gdnStates[1 - sequence.bank], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, 1 - sequence.bank) : Tensor{}});
     }
-    if (query.logit != unbound && (!draft || !acceptedStop))
-      sequence.request.push_back(sampled[query.logit + accepted]);
-    sequence.kvValid += draft ? 1 + accepted : query.count;
-    sequence.drafted += draft ? drafts : 0;
-    sequence.accepted += accepted;
     if (sequence.temperature > 0 && query.logit != unbound)
-      rng.contents<uint64_t>()[sequence.slot] = sampledRng.contents<uint64_t>()[query.logit + accepted - acceptedStop];
+      rng.contents<uint64_t>()[sequence.slot] = sampledRng.contents<uint64_t>()[query.logit + accepted - stopped];
+    if (query.logit != unbound && !stopped) {
+      int32_t token = sampled[query.logit + accepted];
+      sequence.request.push_back(token);
+      stopped = isStop(token);
+    }
+    sequence.kvValid += speculative ? 1 + accepted : query.count;
+    sequence.drafted += speculative ? draftWidth : 0;
+    sequence.accepted += accepted;
     sequence.bank ^= 1;
-    sequence.active = sequence.active && sequence.kvValid < maxContext &&
-                      (query.logit == unbound || !std::count(sequence.stops.begin(), sequence.stops.end(), sequence.request.back()));
+    sequence.active = sequence.kvValid < maxContext && !stopped;
   }
   if (copies)
     copies->commit();
@@ -284,8 +292,8 @@ API void infeng_engine_release(void* value) {
 }
 
 API void* infeng_sequence_create(void* value, const int32_t* stops, uint32_t stopCount, float temperature, float topP, int32_t topK,
-                                 uint32_t draftTokens, char* error) {
-  return create([&] { return new Sequence(*static_cast<Engine*>(value), stops, stopCount, temperature, topP, topK, draftTokens); }, error);
+                                 uint32_t speculative, char* error) {
+  return create([&] { return new Sequence(*static_cast<Engine*>(value), stops, stopCount, temperature, topP, topK, speculative); }, error);
 }
 
 API void infeng_sequence_release(void* value) {
@@ -322,7 +330,7 @@ API int32_t infeng_sequence_read(void* value, uint32_t cursor) {
 
 API uint64_t infeng_engine_info(void* value, uint32_t field) {
   Engine& engine = *static_cast<Engine*>(value);
-  uint64_t values[]{engine.parameterCount, engine.modelBytes, engine.kv->mappedBytes(), uint64_t(engine.drafter)};
+  uint64_t values[]{engine.parameterCount, engine.modelBytes, engine.kv->mappedBytes(), uint64_t(engine.drafter), engine.draftWidth};
   return values[field];
 }
 
