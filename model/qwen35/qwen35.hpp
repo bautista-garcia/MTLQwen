@@ -7,7 +7,6 @@
 #include <filesystem>
 #include <mutex>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace infeng::qwen35 {
@@ -92,9 +91,9 @@ struct PhysicalBlock {
 };
 
 struct HybridCheckpoint {
+  uint64_t hash = 0;
   Tensor arena;
   std::vector<uint32_t> bindings;
-  uint64_t touch = 0;
 };
 struct Sequence;
 
@@ -122,7 +121,7 @@ struct Engine {
   Tensor inputIds, batchKvValid, queryStartLoc, draftPositions, sequenceSlots, stateBanks;
   Tensor draftTokens, outputTokens, sampledRng, rng, mtpSeeds, logitRows;
   std::vector<PhysicalBlock> blocks;
-  std::unordered_map<uint64_t, HybridCheckpoint> checkpointCache;
+  std::vector<HybridCheckpoint> checkpointCache;
   std::array<Sequence*, maxBatchSequences> sequences{};
   std::mutex mutex;
   std::condition_variable condition;
@@ -142,7 +141,7 @@ struct Engine {
 
   bool reserve(const Batch& batch);
   void bind(Sequence& sequence, uint32_t physical);
-  uint32_t lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_t length);
+  void restorePrefix(Sequence& sequence);
   void publishPrefix(Sequence& sequence);
   void schedule();
   bool execute(Batch& batch);

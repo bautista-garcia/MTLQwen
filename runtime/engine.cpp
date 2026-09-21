@@ -42,7 +42,6 @@ Tensor mtpSeed(Engine& model, const Sequence& sequence, uint32_t bank) {
   return model.mtpSeeds.view(uint64_t(bank * maxBatchSequences + sequence.slot) * 8192, 8192);
 }
 
-// KV ALLOCATOR FUNCTIONS
 void Engine::bind(Sequence& sequence, uint32_t physical) {
   uint32_t logical = sequence.bindings.size();
   kv->map(uint32_t(sequence.slot) * blocks.size() + logical, physical);
@@ -57,24 +56,22 @@ bool Engine::reserve(const Batch& batch) {
     for (uint32_t logical = sequence.kvValid / blockTokens; logical <= (sequence.kvValid + query.count - 1) / blockTokens; ++logical) {
       if (logical == sequence.bindings.size()) {
         uint32_t physical = physicalBlocks;
-        // free block
         if (physical < blocks.size()) {
           kv->ensure(physical + 1);
           ++physicalBlocks;
         } else {
-          // evict block
           auto victim = std::min_element(blocks.begin(), blocks.end(), [](const PhysicalBlock& a, const PhysicalBlock& b) {
             return (a.refs ? UINT64_MAX : a.touch) < (b.refs ? UINT64_MAX : b.touch);
           });
           if (victim->refs)
             return false;
           physical = victim - blocks.begin();
-          // remove prefix reference from evicted block
-          for (auto checkpoint = checkpointCache.begin(); checkpoint != checkpointCache.end();)
-            if (std::find(checkpoint->second.bindings.begin(), checkpoint->second.bindings.end(), physical) != checkpoint->second.bindings.end())
-              checkpoint = checkpointCache.erase(checkpoint);
-            else
-              ++checkpoint;
+          checkpointCache.erase(std::remove_if(checkpointCache.begin(), checkpointCache.end(),
+                                               [physical](const HybridCheckpoint& checkpoint) {
+                                                 return std::find(checkpoint.bindings.begin(), checkpoint.bindings.end(), physical) !=
+                                                        checkpoint.bindings.end();
+                                               }),
+                                checkpointCache.end());
         }
         bind(sequence, physical);
       }
@@ -84,53 +81,54 @@ bool Engine::reserve(const Batch& batch) {
   return true;
 }
 
-uint32_t Engine::lookupPrefix(Sequence& sequence, const int32_t* tokens, uint32_t length) {
-  uint32_t limit = (length - 1) / gdnCheckpointTokens;
+void Engine::restorePrefix(Sequence& sequence) {
+  uint32_t limit = (sequence.request.size() - 1) / gdnCheckpointTokens;
   uint64_t hash = 0;
-  HybridCheckpoint* checkpoint = nullptr;
+  auto checkpoint = checkpointCache.end();
+  // this can be updated to a hash map if the prefix cache size increase makes it worthwile
   for (uint32_t index = 0; index < limit; ++index) {
-    hash = hashCheckpoint(hash, tokens + uint64_t(index) * gdnCheckpointTokens);
-    auto found = checkpointCache.find(hash);
-    if (found != checkpointCache.end()) {
-      checkpoint = &found->second;
-      sequence.prefixHash = hash;
-    }
+    hash = hashCheckpoint(hash, sequence.request.data() + uint64_t(index) * gdnCheckpointTokens);
+    auto found = std::find_if(checkpointCache.begin(), checkpointCache.end(), [hash](const HybridCheckpoint& entry) { return entry.hash == hash; });
+    if (found != checkpointCache.end())
+      checkpoint = found;
   }
-  if (!checkpoint)
-    return 0;
-  checkpoint->touch = ++clock;
+  if (checkpoint == checkpointCache.end())
+    return;
+  HybridCheckpoint& restored = *std::rotate(checkpoint, checkpoint + 1, checkpointCache.end());
+  sequence.prefixHash = restored.hash;
+  uint64_t touch = ++clock;
   Device& copies = device.command();
-  copyState(copies, {checkpoint->arena, 0, drafter == Drafter::mtp ? checkpoint->arena.view(gdnCheckpointBytes, 8192) : Tensor{}},
+  copyState(copies, {restored.arena, 0, drafter == Drafter::mtp ? restored.arena.view(gdnCheckpointBytes, 8192) : Tensor{}},
             {gdnStates[0], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, 0) : Tensor{}});
   copies.commit();
-  for (uint32_t physical : checkpoint->bindings)
+  for (uint32_t physical : restored.bindings) {
     bind(sequence, physical);
-  sequence.bank = 0;
-  return checkpoint->bindings.size() * blockTokens;
+    blocks[physical].touch = touch;
+  }
+  sequence.kvValid = restored.bindings.size() * blockTokens;
 }
 
 void Engine::publishPrefix(Sequence& sequence) {
-  try {
-    if (sequence.kvValid % gdnCheckpointTokens)
-      return;
-    sequence.prefixHash = hashCheckpoint(sequence.prefixHash, sequence.request.data() + sequence.kvValid - gdnCheckpointTokens);
-    if (checkpointCache.count(sequence.prefixHash)) {
-      checkpointCache.at(sequence.prefixHash).touch = ++clock;
-      return;
-    }
-    if (checkpointCache.size() == maxGdnCheckpoints) {
-      auto victim = std::min_element(checkpointCache.begin(), checkpointCache.end(),
-                                     [](const auto& a, const auto& b) { return a.second.touch < b.second.touch; });
-      checkpointCache.erase(victim);
-    }
-    HybridCheckpoint checkpoint{device.empty(gdnCheckpointBytes + (drafter == Drafter::mtp ? 8192 : 0)), sequence.bindings, ++clock};
-    Device& copies = device.command();
-    copyState(copies, {gdnStates[sequence.bank], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, sequence.bank) : Tensor{}},
-              {checkpoint.arena, 0, drafter == Drafter::mtp ? checkpoint.arena.view(gdnCheckpointBytes, 8192) : Tensor{}});
-    copies.commit();
-    checkpointCache.emplace(sequence.prefixHash, std::move(checkpoint));
-  } catch (...) {
+  if (sequence.kvValid % gdnCheckpointTokens)
+    return;
+  uint64_t hash = sequence.prefixHash = hashCheckpoint(sequence.prefixHash, sequence.request.data() + sequence.kvValid - gdnCheckpointTokens);
+  auto found =
+      std::find_if(checkpointCache.begin(), checkpointCache.end(), [hash](const HybridCheckpoint& checkpoint) { return checkpoint.hash == hash; });
+  if (found != checkpointCache.end()) {
+    std::rotate(found, found + 1, checkpointCache.end());
+    return;
   }
+  if (checkpointCache.size() < maxGdnCheckpoints)
+    checkpointCache.push_back({0, device.empty(gdnCheckpointBytes + (drafter == Drafter::mtp ? 8192 : 0))});
+  else
+    std::rotate(checkpointCache.begin(), checkpointCache.begin() + 1, checkpointCache.end());
+  HybridCheckpoint& checkpoint = checkpointCache.back();
+  checkpoint.hash = hash;
+  checkpoint.bindings = sequence.bindings;
+  Device& copies = device.command();
+  copyState(copies, {gdnStates[sequence.bank], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, sequence.bank) : Tensor{}},
+            {checkpoint.arena, 0, drafter == Drafter::mtp ? checkpoint.arena.view(gdnCheckpointBytes, 8192) : Tensor{}});
+  copies.commit();
 }
 
 Sequence::Sequence(Engine& owner, const int32_t* stopTokens, uint32_t stopCount, float samplingTemperature, float samplingTopP, int32_t samplingTopK,
@@ -197,7 +195,7 @@ bool Engine::execute(Batch& batch) {
     Query& query = batch.queries[row];
     Sequence& sequence = *query.sequence;
     if (!sequence.kvValid)
-      sequence.kvValid = lookupPrefix(sequence, sequence.request.data(), sequence.request.size());
+      restorePrefix(sequence);
     query.count = sequence.request.size() - sequence.kvValid;
     query.state = std::min(maxContext, (sequence.kvValid / gdnCheckpointTokens + 1) * gdnCheckpointTokens) - sequence.kvValid;
     uint32_t available = query.count == 1 && query.state > 1 ? std::min(sequence.draftTokens, query.state - 1) : 0;
