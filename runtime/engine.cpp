@@ -1,6 +1,5 @@
 #include "model/qwen35/qwen35.hpp"
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
@@ -162,12 +161,10 @@ Engine::~Engine() {
 
 void Engine::schedule() {
   std::unique_lock lock(mutex);
-  auto ready = [](Sequence* sequence) { return sequence && sequence->active && sequence->request.size() > sequence->kvValid; };
+  auto ready = [](Sequence* sequence) { return sequence && sequence->active; };
   while (true) {
+    // delay for coalescing arriving sequences can be added if execute() time becomes too high
     condition.wait(lock, [&] { return closing || std::any_of(sequences.begin(), sequences.end(), ready); });
-    uint32_t delay = std::count_if(sequences.begin(), sequences.end(), [](Sequence* sequence) { return sequence; }) > 1 ? 250 : 50;
-    condition.wait_for(lock, std::chrono::microseconds(delay),
-                       [&] { return closing || std::count_if(sequences.begin(), sequences.end(), ready) == maxBatchSequences; });
     if (closing)
       return;
     Batch batch;
@@ -223,6 +220,10 @@ bool Engine::execute(Batch& batch) {
   for (uint32_t row = 0; row < batch.size; ++row) {
     Query& query = batch.queries[row];
     Sequence& sequence = *query.sequence;
+    if (!sequence.active) {
+      query.count = 0;
+      continue;
+    }
     bool draft = query.state != unbound;
     uint32_t accepted = 0;
     bool acceptedStop = false;
@@ -255,7 +256,8 @@ bool Engine::execute(Batch& batch) {
   if (copies)
     copies->commit();
   for (uint32_t row = 0; row < batch.size; ++row)
-    publishPrefix(*batch.queries[row].sequence);
+    if (batch.queries[row].count)
+      publishPrefix(*batch.queries[row].sequence);
   return true;
 }
 } // namespace infeng::qwen35

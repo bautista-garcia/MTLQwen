@@ -43,7 +43,7 @@ struct Engine {
   Tensor rng, mtpSeeds, logitRows;              // Per-slot RNG, banked MTP seeds, and sampled row indices
 
   std::vector<PhysicalBlock> blocks;            // Physical bundle reference and LRU metadata
-  std::unordered_map<uint64_t, HybridCheckpoint> checkpointCache; // Prefix checkpoints by chained hash
+  std::vector<HybridCheckpoint> checkpointCache; // LRU-ordered prefix checkpoints with reusable state arenas
   std::array<Sequence*, maxBatchSequences> sequences{};            // Eight live-sequence slots
 
   std::mutex mutex;                             // Protects sequence and scheduler state
@@ -119,7 +119,7 @@ request[kvValid : ]   still requires a target pass
 The sequence is ready for scheduling when:
 
 ```text
-active && !busy && request.size() > kvValid
+active
 ```
 
 New prompt tokens may be appended only between passes:
@@ -130,7 +130,7 @@ New prompt tokens may be appended only between passes:
 
 ### 4. Select the next batch
 
-The scheduler waits until at least one sequence is ready, allows a short coalescing window, and scans all eight entries in `Engine.sequences`.
+The scheduler waits until at least one sequence is ready, then immediately scans all eight entries in `Engine.sequences`.
 
 Every ready sequence enters the next `Batch` and becomes `busy`. Batch membership is then fixed; sequences activated during the pass remain available for the next scan.
 
@@ -453,13 +453,13 @@ Attention K/V alone cannot restore Qwen3.5 because its GDN layers also carry rec
 
 ```cpp
 struct HybridCheckpoint {
+  uint64_t hash = 0;              // Chained token-prefix hash
   Tensor arena;                   // Copied GDN state and optional MTP seed
   std::vector<uint32_t> bindings; // Physical bundle IDs through the boundary
-  uint64_t touch = 0;             // Last-use clock for checkpoint eviction
 };
 ```
 
-Hashes are chained from block zero, so a cache entry identifies the entire preceding token prefix. The cache is local to one engine and retains up to eight LRU checkpoints.
+Hashes are chained from block zero, so a cache entry identifies the entire preceding token prefix. The cache is ordered from least to most recently used, retains up to eight checkpoints, and reuses the oldest entry's state arena.
 
 ## Appendix C: weights and pipelines
 
