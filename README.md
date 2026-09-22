@@ -40,7 +40,7 @@ struct Engine {
   Tensor inputIds, batchKvValid;               // Packed input tokens and starting positions
   Tensor queryStartLoc, draftPositions;        // Packed-query boundaries and MTP positions
   Tensor sequenceSlots, stateBanks;            // Slot and current-bank metadata sent to kernels
-  Tensor draftTokens, outputTokens;            // Draft proposals and target samples
+  Tensor draftTokens, outputTokens;            // Drafter input/proposals and target samples
   Tensor rng, mtpSeeds, logitRows;              // Per-slot RNG, banked MTP seeds, and sampled row indices
 
   std::vector<PhysicalBlock> blocks;            // Physical bundle reference and LRU metadata

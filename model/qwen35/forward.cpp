@@ -202,51 +202,54 @@ void Scratch::allocate(Device& device, Drafter drafter) {
 }
 
 void draft(Engine& engine, Batch& batch) {
+  // drafter batch building
   bool dflash = engine.drafter == Drafter::dflash;
-  uint32_t width = engine.draftWidth, stride = dflash ? width + 1 : 1, rows = 0;
-  auto* starts = engine.queryStartLoc.contents<uint32_t>();
-  for (uint32_t row = 0; row < batch.size; ++row)
-    if (batch.queries[row].state != unbound) {
-      Query& query = batch.queries[row];
-      uint32_t draftRow = rows++;
-      starts[draftRow] = draftRow * stride;
-      writeMetadata(engine, *query.sequence, draftRow);
-      if (dflash) {
-        uint32_t start = starts[draftRow];
-        engine.inputIds.contents<int32_t>()[start] = query.sequence->request[query.sequence->kvValid];
-        std::fill_n(engine.inputIds.contents<int32_t>() + start + 1, width, dflashMaskToken);
-        std::iota(engine.logitRows.contents<uint32_t>() + draftRow * width, engine.logitRows.contents<uint32_t>() + (draftRow + 1) * width,
-                  start + 1);
-      } else {
-        engine.draftTokens.contents<int32_t>()[draftRow] = query.sequence->request[query.sequence->kvValid];
-        for (uint32_t step = 0; step < width; ++step)
-          engine.draftPositions.contents<uint32_t>()[step * maxBatchSequences + draftRow] = query.sequence->kvValid + step;
-      }
-    }
-  uint32_t packed = rows * stride;
-  starts[rows] = packed;
+  uint32_t draftWidth = engine.draftWidth, draftSequences = batch.candidateRows / (draftWidth + 1);
+  uint32_t rowsPerSequence = dflash ? draftWidth + 1 : 1;
+  auto *queryStarts = engine.queryStartLoc.contents<uint32_t>(), *draftPositions = engine.draftPositions.contents<uint32_t>(),
+       *logitRows = engine.logitRows.contents<uint32_t>();
+  auto* draftTokens = engine.draftTokens.contents<int32_t>();
+  for (uint32_t row = 0; row < batch.size; ++row) {
+    Query& query = batch.queries[row];
+    if (query.state == unbound)
+      continue;
+    const Sequence& sequence = *query.sequence;
+    uint32_t draftIndex = query.state / query.count, inputStart = draftIndex * rowsPerSequence;
+    queryStarts[draftIndex] = inputStart;
+    writeMetadata(engine, sequence, draftIndex);
+    draftTokens[inputStart] = sequence.request[sequence.kvValid];
+    if (dflash) {
+      std::fill_n(draftTokens + inputStart + 1, draftWidth, dflashMaskToken);
+      std::iota(logitRows + draftIndex * draftWidth, logitRows + (draftIndex + 1) * draftWidth, inputStart + 1);
+    } else
+      for (uint32_t step = 0; step < draftWidth; ++step)
+        draftPositions[step * maxBatchSequences + draftIndex] = sequence.kvValid + step;
+  }
+  uint32_t packedRows = draftSequences * rowsPerSequence;
+  queryStarts[draftSequences] = packedRows;
+  // drafter forward pass
   Scratch& scratch = engine.workspace;
   Device& commands = engine.device.command();
-  Ops ops{commands, engine, scratch, stride <= maxDecodeRows};
+  Ops ops{commands, engine, scratch, !dflash};
   if (dflash) {
     Tensor hidden = scratch.hidden[0];
-    commands.dispatch("q4_k_embed", size(4096, packed), size(256), {hidden, engine.inputIds, engine.embedding});
+    commands.dispatch("q4_k_embed", size(4096, packedRows), size(256), {hidden, engine.draftTokens, engine.embedding});
     for (uint32_t index = 0; index < dflashLayers; ++index)
-      hidden = ops.decoder(engine.draftModel.layers[index], hidden, scratch.hidden[(index + 1) & 1], packed, rows, targetKvLayers + index,
-                           engine.batchKvValid, nullptr, index);
-    uint32_t proposals = rows * width;
+      hidden = ops.decoder(engine.draftModel.layers[index], hidden, scratch.hidden[(index + 1) & 1], packedRows, draftSequences,
+                           targetKvLayers + index, engine.batchKvValid, nullptr, index);
+    uint32_t proposals = draftSequences * draftWidth;
     commands.dispatch("gather_rows", size(uint64_t(proposals) * 4096), size(256), {scratch.norm, hidden, engine.logitRows});
     Tensor logits = ops.logits(scratch.norm, engine.draftModel.outputNorm, proposals);
     ops.argmax(engine.draftTokens.view(uint64_t(maxBatchSequences) * 4, engine.draftTokens.bytes - uint64_t(maxBatchSequences) * 4), logits,
-               proposals, width, maxBatchSequences);
+               proposals, draftWidth, maxBatchSequences);
   } else {
-    for (uint32_t step = 0; step < width; ++step) {
-      Tensor ids = engine.draftTokens.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(rows) * 4);
-      Tensor positions = engine.draftPositions.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(rows) * 4);
-      Tensor hidden = ops.mtpInput(ids, scratch.norm, rows, rows, step ? 0 : 2);
-      hidden = ops.decoder(engine.draftModel.layers[0], hidden, scratch.hidden[1], rows, rows, targetKvLayers, positions);
-      Tensor logits = ops.logits(hidden, engine.draftModel.outputNorm, rows);
-      ops.argmax(engine.draftTokens.view(uint64_t(step + 1) * maxBatchSequences * 4, uint64_t(rows) * 4), logits, rows);
+    for (uint32_t step = 0; step < draftWidth; ++step) {
+      Tensor ids = engine.draftTokens.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(draftSequences) * 4);
+      Tensor positions = engine.draftPositions.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(draftSequences) * 4);
+      Tensor hidden = ops.mtpInput(ids, scratch.norm, draftSequences, draftSequences, step ? 0 : 2);
+      hidden = ops.decoder(engine.draftModel.layers[0], hidden, scratch.hidden[1], draftSequences, draftSequences, targetKvLayers, positions);
+      Tensor logits = ops.logits(hidden, engine.draftModel.outputNorm, draftSequences);
+      ops.argmax(engine.draftTokens.view(uint64_t(step + 1) * maxBatchSequences * 4, uint64_t(draftSequences) * 4), logits, draftSequences);
     }
   }
   commands.commit();
