@@ -14,11 +14,13 @@ struct GGUF {
   std::unique_ptr<gguf_context, decltype(&gguf_free)> context{nullptr, gguf_free};
   size_t data;
 
-  GGUF(Engine& model, const std::filesystem::path& path) : file(model.device.mapped(path)) {
+  GGUF(Engine& engine, const std::filesystem::path& path) : file(engine.device.mapped(path)) {
     context.reset(gguf_init_from_buffer(file.contents<uint8_t>(), file.bytes, {true, nullptr}));
     data = gguf_get_data_offset(context.get());
-    model.modelBytes += file.bytes - data;
-    model.parameterCount += gguf_get_n_tensors(context.get()) == 69 ? 1291904512 : gguf_get_n_tensors(context.get()) == 442 ? 9197093888 : 8953803264;
+    engine.modelBytes += file.bytes - data;
+    engine.parameterCount += gguf_get_n_tensors(context.get()) == 69    ? 1291904512
+                             : gguf_get_n_tensors(context.get()) == 442 ? 9197093888
+                                                                        : 8953803264;
   }
 
   bool contains(const char* name) const {

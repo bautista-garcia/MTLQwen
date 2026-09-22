@@ -37,8 +37,8 @@ void copyState(Device& commands, const State& source, const State& destination) 
 }
 } // namespace
 
-Tensor mtpSeed(Engine& model, const Sequence& sequence, uint32_t bank) {
-  return model.mtpSeeds.view(uint64_t(bank * maxBatchSequences + sequence.slot) * 8192, 8192);
+Tensor mtpSeed(Engine& engine, const Sequence& sequence, uint32_t bank) {
+  return engine.mtpSeeds.view(uint64_t(bank * maxBatchSequences + sequence.slot) * 8192, 8192);
 }
 
 void Engine::bind(Sequence& sequence, uint32_t physical) {
