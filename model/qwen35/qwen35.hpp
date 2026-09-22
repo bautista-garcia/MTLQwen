@@ -68,12 +68,11 @@ struct DrafterWeights {
 };
 
 struct Scratch {
-  bool decodeMode = false;
-  Tensor hidden[2], inputNorm, postNorm, mlpGate, mlpUp;
-  Tensor attnQG, attnK, attnV, attnQRope, attnKRope, attnOut, attnPartials;
-  Tensor gdnMixed, gdnZ, gdnB, gdnG, gdnConvolved, gdnQ, gdnK, gdnV;
+  Tensor hidden[2], norm, temporary, mlpGate, mlpUp;
+  Tensor mixed, q, k, v, attnQRope, attnKRope, attnPartials;
+  Tensor gdnB, gdnG, gdnConvolved;
   Tensor mid, targetHidden, dflashFeatures, targetLogits;
-  void ensure(Device& device, uint32_t rows, Drafter drafter);
+  void allocate(Device& device, Drafter drafter);
 };
 
 struct GdnState {
@@ -99,7 +98,7 @@ struct Sequence;
 
 struct Query {
   Sequence* sequence = nullptr;
-  uint32_t pending = 1, room = 1, count = 1, logit = unbound, state = unbound;
+  uint32_t pending = 1, room = 1, start = 0, count = 1, logit = unbound, state = unbound;
 };
 
 struct Batch {
@@ -133,12 +132,6 @@ struct Engine {
   Engine(const std::filesystem::path& weights, const std::filesystem::path& kernels, uint32_t maxContext, const std::filesystem::path& draftWeights);
   ~Engine();
 
-  Scratch& scratch(uint32_t query, uint32_t rows) {
-    workspace.decodeMode = query <= maxDecodeRows;
-    workspace.ensure(device, rows, drafter);
-    return workspace;
-  }
-
   bool reserve(const Batch& batch);
   void bind(Sequence& sequence, uint32_t physical);
   void restorePrefix(Sequence& sequence);
@@ -165,5 +158,5 @@ struct Sequence {
 
 Tensor mtpSeed(Engine& engine, const Sequence& sequence, uint32_t bank);
 void draft(Engine& engine, Batch& batch);
-void forward(Engine& engine, Batch& batch, uint32_t candidateRows);
+void forward(Engine& engine, Batch& batch);
 } // namespace infeng::qwen35

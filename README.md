@@ -35,7 +35,7 @@ struct Engine {
   uint32_t draftWidth = 0;                     // Engine-wide proposal width
 
   Tensor gdnStates[2], candidateStates;        // Persistent GDN banks and temporary speculative states
-  Scratch workspace;                          // Grow-only reusable forward-pass scratch
+  Scratch workspace;                          // Fixed reusable forward-pass scratch
 
   Tensor inputIds, batchKvValid;               // Packed input tokens and starting positions
   Tensor queryStartLoc, draftPositions;        // Packed-query boundaries and MTP positions
@@ -489,22 +489,15 @@ full-attention    8
 
 ## Appendix D: reusable and temporary buffers
 
-`Engine.workspace` is one grow-only `Scratch` arena. It expands when a pass needs more packed rows, then its tensor views are reused by later passes.
+`Engine.workspace` is one `Scratch` arena sized once for the 128-token batch limit. Every pass reuses its tensor views.
 
 ```cpp
 struct Scratch {
-  bool decodeMode = false;                    // Selects decode or prefill linear kernels
-  Tensor hidden[2], inputNorm, postNorm;       // Ping-pong hidden states and normalization outputs
-  Tensor padInput, mlpGate, mlpUp, mlpMixed;   // Padded input and MLP intermediates
-  Tensor attnQG, attnK, attnV, attnQRope;      // Attention projections and rotated queries
-  Tensor attnKRope, attnOut, attnGated;        // Rotated keys and attention outputs
-  Tensor attnPartials;                         // Partial attention reductions
-  Tensor gdnMixed, gdnZ, gdnB, gdnG;           // GDN projections and scalar parameters
-  Tensor gdnConvolved, gdnQ, gdnK, gdnV;       // GDN convolution and Q/K/V intermediates
-  Tensor gdnDelta, mid;                        // Delta-rule output and layer residual
-  Tensor targetHidden, dflashFeatures;         // Drafter inputs captured from the target
-  Tensor targetLogits;                         // Reusable logits storage
-  void ensure(Device&, uint32_t rows, Drafter); // Grows and partitions the arena when necessary
+  Tensor hidden[2], norm, temporary, mlpGate, mlpUp;
+  Tensor mixed, q, k, v, attnQRope, attnKRope, attnPartials;
+  Tensor gdnB, gdnG, gdnConvolved;
+  Tensor mid, targetHidden, dflashFeatures, targetLogits;
+  void allocate(Device&, Drafter);             // Allocates and partitions the arena once
 };
 ```
 

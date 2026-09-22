@@ -218,7 +218,7 @@ bool Engine::execute(Batch& batch) {
     return false;
   if (batch.candidateRows)
     draft(*this, batch);
-  forward(*this, batch, batch.candidateRows);
+  forward(*this, batch);
   auto *sampled = outputTokens.contents<int32_t>(), *proposed = draftTokens.contents<int32_t>();
   Device* copies = batch.candidateRows ? &device.command() : nullptr;
   std::lock_guard lock(mutex);
@@ -244,8 +244,7 @@ bool Engine::execute(Batch& batch) {
       }
       copyState(*copies,
                 {candidateStates, query.state + accepted,
-                 drafter == Drafter::mtp ? workspace.targetHidden.view(uint64_t(queryStartLoc.contents<uint32_t>()[row] + accepted) * 8192, 8192)
-                                         : Tensor{}},
+                 drafter == Drafter::mtp ? workspace.targetHidden.view(uint64_t(query.start + accepted) * 8192, 8192) : Tensor{}},
                 {gdnStates[1 - sequence.bank], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, 1 - sequence.bank) : Tensor{}});
     }
     if (sequence.temperature > 0 && query.logit != unbound)

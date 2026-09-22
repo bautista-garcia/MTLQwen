@@ -56,6 +56,7 @@ Engine::Engine(const std::filesystem::path& path, const std::filesystem::path& k
   auto draft = draftPath.empty() ? nullptr : std::make_unique<GGUF>(*this, draftPath);
   drafter = !draft ? Drafter::none : draft->contains("blk.32.attn_norm.weight") ? Drafter::mtp : Drafter::dflash;
   draftWidth = drafter == Drafter::mtp ? 2 : drafter == Drafter::dflash ? maxDraftTokens : 0;
+  workspace.allocate(device, drafter);
   auto target = drafter == Drafter::mtp ? std::move(draft) : std::make_unique<GGUF>(*this, path);
   GGUF* g = target.get();
   std::string r;
