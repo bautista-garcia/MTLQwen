@@ -1,13 +1,23 @@
 #include "model/qwen35/qwen35.hpp"
 #include <chrono>
 #include <gguf.h>
-#include <tuple>
 
 namespace infeng::qwen35 {
 namespace {
 constexpr const char* quantNames[]{"q8_0", "q4_k", "q5_k", "q6_k", "iq4_xs"};
 constexpr uint8_t quantOutputs[]{2, 4, 4, 8, 4};
-using Weight = std::tuple<Tensor, uint32_t, uint32_t, QuantType>;
+
+struct Weight {
+  Tensor data;
+  uint32_t n, k;
+  ggml_type type;
+};
+
+Kernel kernel(Device& device, const std::string& name, uint32_t groups) {
+  Pipeline* pipeline = device.pipeline(name);
+  uint32_t group = pipeline->maxTotalThreadsPerThreadgroup();
+  return {pipeline, groups * group, group};
+}
 
 struct GGUF {
   Tensor file;
@@ -33,24 +43,11 @@ struct GGUF {
       throw std::runtime_error("missing weight " + name);
     const int64_t* shape = gguf_get_tensor_ne(context.get(), id);
     uint64_t offset = data + gguf_get_tensor_offset(context.get(), id);
-    return {file.view(offset, gguf_get_tensor_size(context.get(), id)), uint32_t(shape[1]), shape[1] == 1 ? 0 : uint32_t(shape[0]),
-            QuantType(gguf_get_tensor_type(context.get(), id))};
+    return {file.view(offset, gguf_get_tensor_size(context.get(), id)), uint32_t(shape[1]), uint32_t(shape[0]),
+            gguf_get_tensor_type(context.get(), id)};
   }
 };
 
-Linear linear(Device& device, Weight weight) {
-  auto [data, n, k, type] = weight;
-  uint32_t quant = type == QuantType::Q8_0 ? 0 : type == QuantType::IQ4_XS ? 4 : uint32_t(type) - 11;
-  std::string root = "linear_" + std::string(quantNames[quant]) + "_k" + std::to_string(k) + "_n" + std::to_string(n);
-  Pipeline* decode = type == QuantType::IQ4_XS ? nullptr : device.pipeline(root + "_decode");
-  uint8_t outputs = type == QuantType::Q4_K && ((k == 4096 && n == 4096) || k == 32768) ? 2 : quantOutputs[quant];
-  return {data,
-          {decode, n == 4096 ? device.pipeline(root + "_decode_add") : nullptr, device.pipeline(root + "_prefill"),
-           device.pipeline(root + "_prefill_small")},
-          k,
-          n,
-          outputs};
-}
 } // namespace
 
 Engine::Engine(const std::filesystem::path& path, const std::filesystem::path& kernels, uint32_t context, const std::filesystem::path& draftPath)
@@ -62,28 +59,31 @@ Engine::Engine(const std::filesystem::path& path, const std::filesystem::path& k
   auto target = drafter == Drafter::mtp ? std::move(draft) : std::make_unique<GGUF>(*this, path);
   GGUF* g = target.get();
   std::string r;
-  auto w = [&](const char* name) { return (*g)(r + name); };
-  auto t = [&](const char* name) { return std::get<0>(w(name)); };
-  auto p = [&](const char* name) { return linear(device, w(name)); };
+  auto t = [&](const char* name) { return (*g)(r + name).data; };
+  auto p = [&](const char* name, bool add = false, Kernel* fused = nullptr) -> Linear {
+    auto [data, n, k, type] = (*g)(r + name);
+    uint32_t quant = type == GGML_TYPE_Q8_0 ? 0 : type == GGML_TYPE_IQ4_XS ? 4 : uint32_t(type) - 11;
+    std::string root = "linear_" + std::string(quantNames[quant]) + "_k" + std::to_string(k) + "_n" + std::to_string(n);
+    uint32_t outputs = type == GGML_TYPE_Q4_K && ((k == 4096 && n == 4096) || k == 32768) ? 2 : quantOutputs[quant];
+    if (fused)
+      *fused = kernel(device, "mlp_gate_up_" + std::string(quantNames[quant]) + "_decode", 12288 / (type == GGML_TYPE_Q5_K ? 4 : 8));
+    // Gate/up projections use the fused MLP kernel during decode.
+    return {data, n == 12288 ? Kernel{} : kernel(device, root + (add ? "_decode_add" : "_decode"), n / outputs),
+            kernel(device, root + "_prefill", n / 32), kernel(device, root + "_prefill_small", n / 8)};
+  };
   auto build = [&](Layer& layer, bool full, bool draft) {
-    Weight gate = w("ffn_gate.weight");
-    QuantType type = std::get<3>(gate);
-    uint32_t quant = type == QuantType::Q8_0 ? 0 : type == QuantType::IQ4_XS ? 4 : uint32_t(type) - 11;
-    layer = {t("attn_norm.weight"),
-             t(draft ? "ffn_norm.weight" : "post_attention_norm.weight"),
-             {linear(device, gate), p("ffn_up.weight"), p("ffn_down.weight")},
-             {},
-             {}};
-    layer.mlp.fusedDecode = device.pipeline("mlp_gate_up_" + std::string(quantNames[quant]) + "_decode");
-    layer.mlp.outputsPerGroup = type == QuantType::Q5_K ? 4 : 8;
+    layer.inputNorm = t("attn_norm.weight");
+    layer.postNorm = t(draft ? "ffn_norm.weight" : "post_attention_norm.weight");
+    layer.mlp.gate = p("ffn_gate.weight", false, &layer.mlp.fusedDecode);
+    layer.mlp.up = p("ffn_up.weight");
+    layer.mlp.down = p("ffn_down.weight", true);
     if (full)
-      layer.attention = {p("attn_q.weight"),      p("attn_k.weight"),      p("attn_v.weight"),
-                         p("attn_output.weight"), t("attn_q_norm.weight"), t("attn_k_norm.weight")};
-    else {
-      Weight b = w("ssm_beta.weight"), a = w("ssm_alpha.weight");
-      layer.gdn = {p("attn_qkv.weight"),   p("attn_gate.weight"), p("ssm_out.weight"), std::get<0>(b), std::get<0>(a),
-                   t("ssm_conv1d.weight"), t("ssm_norm.weight"),  t("ssm_dt.bias"),    t("ssm_a")};
-    }
+      layer.attention = {p("attn_q.weight"),      p("attn_k.weight"),     p("attn_v.weight"), p("attn_output.weight", true),
+                         t("attn_q_norm.weight"), t("attn_k_norm.weight")};
+    else
+      layer.gdn = {p("attn_qkv.weight"), p("attn_gate.weight"), p("ssm_out.weight", true),
+                   t("ssm_beta.weight"), t("ssm_alpha.weight"), t("ssm_conv1d.weight"),
+                   t("ssm_norm.weight"), t("ssm_dt.bias"),      t("ssm_a")};
   };
   embedding = t("token_embd.weight");
   norm = t("output_norm.weight");

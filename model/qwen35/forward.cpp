@@ -17,39 +17,18 @@ struct Ops {
   bool decode;
 
   Tensor linear(const Tensor& x, const Linear& weight, uint32_t rows, Tensor output, const Tensor& residual = {}) {
-    if (decode) {
-      uint32_t group = weight.pipeline[linearDecode]->maxTotalThreadsPerThreadgroup();
-      MTL::Size threads = size((weight.n + weight.outputsPerGroup - 1) / weight.outputsPerGroup * group, rows);
-      if (residual.buffer)
-        commands.dispatch(weight.pipeline[linearDecodeAdd], threads, size(group), {output, x, weight.weight, residual});
-      else
-        commands.dispatch(weight.pipeline[linearDecode], threads, size(group), {output, x, weight.weight});
-      return output;
-    }
-    bool small = rows <= 8;
-    bool add = bool(residual.buffer);
-    Pipeline* pipeline = weight.pipeline[small ? linearPrefillSmall : linearPrefill];
-    MTL::Size group = size(small ? 64 : 512);
-    MTL::Size threads = size(group.width * (weight.n / (small ? 8 : 32)), (rows + 127) / 128);
-    commands.dispatch(pipeline, threads, group, {output, x, weight.weight, add ? residual : output}, int64_t(rows), uint32_t(add));
+    const Kernel& kernel = decode ? weight.decode : rows <= 8 ? weight.smallPrefill : weight.prefill;
+    auto buffers = {output, x, weight.weight, residual.buffer ? residual : output};
+    if (decode)
+      commands.dispatch(kernel.pipeline, size(kernel.threads, rows), size(kernel.group), buffers);
+    else
+      commands.dispatch(kernel.pipeline, size(kernel.threads), size(kernel.group), buffers, int64_t(rows), uint32_t(bool(residual.buffer)));
     return output;
   }
 
   Tensor logits(const Tensor& x, const Tensor& norm, uint32_t rows) {
     commands.dispatch("rms_norm", size(256, rows), size(256), {scratch.temporary, x, norm});
     return linear(scratch.temporary, engine.head, rows, scratch.targetLogits);
-  }
-
-  Tensor mlp(const Tensor& x, const MlpWeights& weights, const Tensor& residual, Tensor output, uint32_t rows) {
-    if (decode)
-      commands.dispatch(weights.fusedDecode, size(12288 / weights.outputsPerGroup * weights.fusedDecode->maxTotalThreadsPerThreadgroup(), rows),
-                        size(weights.fusedDecode->maxTotalThreadsPerThreadgroup()), {scratch.mlpGate, x, weights.gate.weight, weights.up.weight},
-                        int64_t(rows));
-    else {
-      Tensor gate = linear(x, weights.gate, rows, scratch.mlpGate), up = linear(x, weights.up, rows, scratch.mlpUp);
-      commands.dispatch("silu_and_mul", size(uint64_t(rows) * 12288), size(256), {scratch.mlpGate, gate, up});
-    }
-    return linear(scratch.mlpGate, weights.down, rows, output, residual);
   }
 
   Tensor attention(const Layer& layer, const Tensor& x, const Tensor& residual, Tensor output, uint32_t batch, uint32_t rows, uint32_t kvLayer,
@@ -120,7 +99,15 @@ struct Ops {
     Tensor mid = layer.attention.q.weight.buffer ? attention(layer, scratch.norm, hidden, scratch.mid, batch, rows, kvLayer, positions, dflash)
                                                  : gdn(layer, scratch.norm, hidden, scratch.mid, rows, *layout);
     commands.dispatch("rms_norm", size(256, rows), size(256), {scratch.norm, mid, layer.postNorm});
-    return mlp(scratch.norm, layer.mlp, mid, output, rows);
+    const MlpWeights& mlp = layer.mlp;
+    if (decode)
+      commands.dispatch(mlp.fusedDecode.pipeline, size(mlp.fusedDecode.threads, rows), size(mlp.fusedDecode.group),
+                        {scratch.mlpGate, scratch.norm, mlp.gate.weight, mlp.up.weight}, int64_t(rows));
+    else {
+      Tensor gate = linear(scratch.norm, mlp.gate, rows, scratch.mlpGate), up = linear(scratch.norm, mlp.up, rows, scratch.mlpUp);
+      commands.dispatch("silu_and_mul", size(uint64_t(rows) * 12288), size(256), {scratch.mlpGate, gate, up});
+    }
+    return linear(scratch.mlpGate, mlp.down, rows, output, mid);
   }
 
   Tensor mtpInput(const Tensor& ids, const Tensor& hidden, uint32_t rows, uint32_t batch, uint32_t mode) {
@@ -134,16 +121,6 @@ struct Ops {
 
   void argmax(const Tensor& token, const Tensor& logits, uint32_t rows = 1, uint32_t group = 1, uint32_t stride = 1) {
     commands.dispatch("argmax_logits", size(256, rows), size(256), {token, logits}, group, stride);
-  }
-
-  void sample(const Sequence& sequence, const Tensor& logits, const Tensor& tokens, uint32_t count) {
-    if (sequence.temperature <= 0)
-      argmax(tokens, logits, count);
-    else
-      commands.dispatch("sample_logits", size(count), size(1),
-                        {tokens, engine.rng.view(uint64_t(sequence.slot) * 8, 8),
-                         engine.sampledRng.view((tokens.offset - engine.outputTokens.offset) * 2, uint64_t(count) * 8), logits},
-                        sequence.temperature, sequence.topP, sequence.topK);
   }
 };
 
@@ -160,10 +137,9 @@ void encodeDrafter(Ops& ops, const Batch& batch, uint32_t rows) {
                        : ops.linear(scratch.dflashFeatures, engine.draftModel.fusion, rows, scratch.hidden[0]);
   commands.dispatch("rms_norm", size(256, rows), size(256),
                     {scratch.norm, context, mtp ? engine.draftModel.layers[0].inputNorm : engine.draftModel.hiddenNorm});
-  context = scratch.norm;
   for (uint32_t index = 0; index < (mtp ? 1 : dflashLayers); ++index) {
     const AttentionWeights& attention = engine.draftModel.layers[index].attention;
-    Tensor k = ops.linear(context, attention.k, rows, scratch.k), v = ops.linear(context, attention.v, rows, scratch.v);
+    Tensor k = ops.linear(scratch.norm, attention.k, rows, scratch.k), v = ops.linear(scratch.norm, attention.v, rows, scratch.v);
     commands.dispatch(mtp ? "mtp_store_kv" : "dflash_store_kv", size(uint64_t(rows) * 1024), size(mtp ? 256 : 128),
                       {engine.kv->key(targetKvLayers + index), engine.kv->value(targetKvLayers + index), k, v, engine.sequenceSlots,
                        engine.batchKvValid, engine.queryStartLoc, attention.kNorm, mtp ? engine.rope : engine.dflashRope},
@@ -306,9 +282,17 @@ void forward(Engine& engine, Batch& batch) {
     for (uint32_t row = 0; row < batch.size; ++row)
       if (batch.queries[row].logit != unbound) {
         Query& query = batch.queries[row];
+        const Sequence& sequence = *query.sequence;
         uint32_t count = query.state != unbound ? query.count : 1;
-        ops.sample(*query.sequence, logits.view(uint64_t(query.logit) * vocabSize * 2, uint64_t(count) * vocabSize * 2),
-                   engine.outputTokens.view(uint64_t(query.logit) * 4, uint64_t(count) * 4), count);
+        Tensor scores = logits.view(uint64_t(query.logit) * vocabSize * 2, uint64_t(count) * vocabSize * 2);
+        Tensor output = engine.outputTokens.view(uint64_t(query.logit) * 4, uint64_t(count) * 4);
+        if (sequence.temperature <= 0)
+          ops.argmax(output, scores, count);
+        else
+          commands.dispatch("sample_logits", size(count), size(1),
+                            {output, engine.rng.view(uint64_t(sequence.slot) * 8, 8),
+                             engine.sampledRng.view(uint64_t(query.logit) * 8, uint64_t(count) * 8), scores},
+                            sequence.temperature, sequence.topP, sequence.topK);
       }
   }
   if (engine.drafter != Drafter::none)

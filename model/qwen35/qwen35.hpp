@@ -26,22 +26,21 @@ inline constexpr uint64_t gdnCheckpointBytes = (targetLayers - targetKvLayers) *
 inline constexpr uint64_t gdnOffset(uint32_t layer) {
   return uint64_t(layer - layer / fullAttentionInterval) * (recurrentStateBytes + convStateBytes);
 }
-enum class QuantType : uint32_t { F32 = 0, F16 = 1, Q8_0 = 8, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ4_XS = 23 };
 enum class Drafter : uint8_t { none, mtp, dflash };
 
-enum LinearKernel : uint8_t { linearDecode, linearDecodeAdd, linearPrefill, linearPrefillSmall };
+struct Kernel {
+  Pipeline* pipeline = nullptr;
+  uint32_t threads = 0, group = 0;
+};
 
 struct Linear {
   Tensor weight;
-  Pipeline* pipeline[4]{};
-  uint32_t k = 0, n = 0;
-  uint8_t outputsPerGroup = 0;
+  Kernel decode, prefill, smallPrefill;
 };
 
 struct MlpWeights {
   Linear gate, up, down;
-  Pipeline* fusedDecode = nullptr;
-  uint8_t outputsPerGroup = 0;
+  Kernel fusedDecode;
 };
 
 struct AttentionWeights {

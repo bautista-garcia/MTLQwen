@@ -178,6 +178,26 @@ def test_invalid_drafter_weights():
     InferenceEngine(WEIGHTS, draft_weights=WEIGHTS, max_context=128)
 
 
+@pytest.mark.parametrize("draft_weights", [None, MTP_WEIGHTS, DFLASH_WEIGHTS], ids=["target", "mtp", "dflash"])
+def test_mixed_batch_sampling_matches_greedy(draft_weights):
+  if draft_weights is not None and not draft_weights.exists(): pytest.skip("drafter GGUF is unavailable")
+  model = InferenceEngine(WEIGHTS, draft_weights=draft_weights, max_context=1024)
+  sequences = [model.sequence()]
+  try:
+    expected = complete(sequences[0], DFLASH_MATH_PROMPT, 12)
+    sequences[0].close()
+    # Top-k=1 exercises sampling and its packed RNG outputs with deterministic tokens.
+    sequences = [model.sequence(temperature=1.0, top_k=1, speculative=bool(row % 2)) for row in range(8)]
+    observed = parallel([lambda sequence=sequence: complete(sequence, DFLASH_MATH_PROMPT, 12) for sequence in sequences])
+    assert observed == [expected] * len(sequences)
+    if draft_weights is not None:
+      assert all(sequence.speculative_counters()["drafted_tokens"] for sequence in sequences[1::2])
+  finally:
+    for sequence in sequences:
+      sequence.close()
+    model.close()
+
+
 def test_allocator_failure_is_atomic():
   model = InferenceEngine(WEIGHTS, max_context=16)
   owner, waiting = model.sequence(), model.sequence()

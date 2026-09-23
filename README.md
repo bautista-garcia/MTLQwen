@@ -19,6 +19,8 @@ Python creates one native `Engine`. During construction, C++:
 
 An optional drafter GGUF is identified from its tensors: a combined MTP model replaces the target weights, while DFlash supplements them.
 
+The loader resolves each projection's residual variant and launch geometry once. The forward pass selects decode, small prefill, or prefill; gate/up decoding uses a fused MLP kernel instead of separate projections.
+
 The state-bearing fields of the real `Engine` are:
 
 ```cpp
