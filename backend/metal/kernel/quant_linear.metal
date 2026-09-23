@@ -242,35 +242,37 @@ static inline __attribute__((always_inline)) void linear_decode_store(device hal
   dst[row] = result;
 }
 
-template <bool ADD, uint K, uint N, ushort ROWS>
+template <bool ADD, uint K, uint N, ushort ROWS, ushort LANES>
 static inline __attribute__((always_inline)) void linear_decode_q4_k_impl(device half* dst, device const half* src, device const uchar* weights,
                                                                           device const half* residual, ushort lane, ushort simd_group, uint3 group) {
   dst += group.y * N;
   src += group.y * K;
   residual += group.y * N;
   constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
-  ushort ix = lane / 8, it = lane % 8, iq = it / 4, ir = it % 4;
+  // Two teams retain (G1,G2,G5,G6) / (G3,G4,G7,G8); only each lane's contiguous slice changes.
+  constexpr ushort TEAM = LANES / 2, SLICE = 32 / TEAM, BLOCKS = 32 / LANES;
+  ushort ix = lane / LANES, it = lane % LANES, iq = it / TEAM, ir = it % TEAM;
   uint nb = K / 256, first_row = (group.x * 2 + simd_group) * ROWS;
-  float yl[16], yh[16], sumf[ROWS] = {0.0f};
-  device const half* src4 = src + ix * 256 + 64 * iq + 8 * ir;
+  float yl[2 * SLICE], yh[2 * SLICE], sumf[ROWS] = {0.0f};
+  device const half* src4 = src + ix * 256 + 64 * iq + SLICE * ir;
 
-  for (uint ib = ix; ib < nb; ib += 4) {
+  for (uint ib = ix; ib < nb; ib += BLOCKS) {
     float4 sumy = 0.0f;
-    for (ushort i = 0; i < 8; ++i) {
+    for (ushort i = 0; i < SLICE; ++i) {
       // load(x_i) -> sum(x_i)
       yl[i] = float(src4[i]);
       sumy[0] += yl[i];
-      yl[i + 8] = float(src4[i + 32]);
-      sumy[1] += yl[i + 8];
+      yl[i + SLICE] = float(src4[i + 32]);
+      sumy[1] += yl[i + SLICE];
       yh[i] = float(src4[i + 128]);
       sumy[2] += yh[i];
-      yh[i + 8] = float(src4[i + 160]);
-      sumy[3] += yh[i + 8];
+      yh[i + SLICE] = float(src4[i + 160]);
+      sumy[3] += yh[i + SLICE];
     }
     for (ushort row = 0; row < ROWS; ++row) { // one iter per column of w^t owned by SIMD
       long o = long(first_row + row) * nb * 144 + ib * 144;
       device const ushort* sc = reinterpret_cast<device const ushort*>(weights + o + 4) + iq;
-      device const ushort* q1 = reinterpret_cast<device const ushort*>(weights + o + 16) + 16 * iq + 4 * ir;
+      device const ushort* q1 = reinterpret_cast<device const ushort*>(weights + o + 16) + 16 * iq + (SLICE / 2) * ir;
       device const ushort* q2 = q1 + 32;
       device const half* dh = reinterpret_cast<device const half*>(weights + o);
       ushort sc16[4];
@@ -282,24 +284,24 @@ static inline __attribute__((always_inline)) void linear_decode_q4_k_impl(device
       sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
 
       float4 acc1 = 0.0f, acc2 = 0.0f;
-      // 4(loop) * 2(q1,q2) * 2(2byte LOADS) = 16 bytes loaded per lane * 8 (threads_per_cohort) = 128 bytes (256 weight block)
-      for (ushort i = 0; i < 4; ++i) {
+      // Two packed regions, SLICE bytes each: 2 * SLICE * LANES = 128 bytes per weight block.
+      for (ushort i = 0; i < SLICE / 2; ++i) {
         // sum(xi . qi) unshifted (only mask to isolate the rest 12b)
         acc1[0] += yl[2 * i] * float(q1[i] & 0x000f);
         acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0f00);
-        acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00f0);
-        acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xf000);
+        acc1[2] += yl[2 * i + SLICE] * float(q1[i] & 0x00f0);
+        acc1[3] += yl[2 * i + SLICE + 1] * float(q1[i] & 0xf000);
         acc2[0] += yh[2 * i] * float(q2[i] & 0x000f);
         acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0f00);
-        acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00f0);
-        acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xf000);
+        acc2[2] += yh[2 * i + SLICE] * float(q2[i] & 0x00f0);
+        acc2[3] += yh[2 * i + SLICE + 1] * float(q2[i] & 0xf000);
       }
       // remove the shifts + apply group scales and mins + global scales and mins
       sumf[row] += float(dh[0]) * ((acc1[0] + acc1[1] / 256.0f) * sc8[0] + (acc1[2] + acc1[3] / 256.0f) * sc8[1] / 16.0f +
                                    (acc2[0] + acc2[1] / 256.0f) * sc8[4] + (acc2[2] + acc2[3] / 256.0f) * sc8[5] / 16.0f) -
                    float(dh[1]) * dot(sumy, float4(sc8[2], sc8[3], sc8[6], sc8[7]));
     }
-    src4 += 4 * 256;
+    src4 += BLOCKS * 256;
   }
   for (ushort row = 0; row < ROWS; ++row) {
     float sum = simd_sum(sumf[row]);
@@ -308,20 +310,20 @@ static inline __attribute__((always_inline)) void linear_decode_q4_k_impl(device
   }
 }
 
-template <uint K, uint N, ushort ROWS = 2>
+template <uint K, uint N, ushort ROWS = 2, ushort LANES = 8>
 [[max_total_threads_per_threadgroup(64)]]
 kernel void linear_decode_q4_k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
                                ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
                                uint3 group [[threadgroup_position_in_grid]]) {
-  linear_decode_q4_k_impl<false, K, N, ROWS>(dst, src, weights, dst, lane, simd_group, group);
+  linear_decode_q4_k_impl<false, K, N, ROWS, LANES>(dst, src, weights, dst, lane, simd_group, group);
 }
 
-template <uint K, uint N, ushort ROWS = 2>
+template <uint K, uint N, ushort ROWS = 2, ushort LANES = 8>
 [[max_total_threads_per_threadgroup(64)]]
 kernel void linear_decode_q4_k_add(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
                                    device const half* residual [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
                                    ushort simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
-  linear_decode_q4_k_impl<true, K, N, ROWS>(dst, src, weights, residual, lane, simd_group, group);
+  linear_decode_q4_k_impl<true, K, N, ROWS, LANES>(dst, src, weights, residual, lane, simd_group, group);
 }
 
 template <bool ADD, uint K, uint N>

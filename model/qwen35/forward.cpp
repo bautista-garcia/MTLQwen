@@ -52,31 +52,25 @@ struct Ops {
       commands.dispatch(kernel, threads, group, tensors, args...);
   }
 
-  Kernel& kernel(Weight& w, uint32_t phase, bool add = false) {
-    Kernel& result = w.kernels[phase];
-    if (!result.pipeline) {
+  // A gated projection uses up weights in decode, or precomputed gate activations in prefill.
+  Tensor linear(const Tensor& x, Weight& w, uint32_t count, Tensor output, const Tensor& auxiliary = {}, bool gated = false) {
+    uint32_t phase = decode ? (gated ? 3 : 0) : count <= 8 ? 2 : 1;
+    Kernel& k = w.kernels[phase];
+    if (!k.pipeline) {
       uint32_t quant = w.type == GGML_TYPE_Q8_0 ? 0 : w.type == GGML_TYPE_IQ4_XS ? 4 : w.type - 11;
       const char* names[]{"q8_0", "q4_k", "q5_k", "q6_k", "iq4_xs"};
       uint32_t outputs[]{2, w.k == 32768 || (w.k == 4096 && w.n == 4096) ? 2u : 4u, 4, 8, 4};
       const char* suffix[]{"_decode", "_prefill", "_prefill_small"};
       std::string name = phase == 3 ? "mlp_gate_up_" + std::string(names[quant]) + "_decode"
                                     : "linear_" + std::string(names[quant]) + "_k" + std::to_string(w.k) + "_n" + std::to_string(w.n) +
-                                          suffix[phase] + (phase == 0 && add ? "_add" : "");
-      Pipeline* pipeline = commands.pipeline(name);
+                                          suffix[phase] + (phase == 0 && auxiliary.buffer ? "_add" : "");
+      Pipeline* pipeline = engine.device.pipeline(name);
       uint32_t group = pipeline->maxTotalThreadsPerThreadgroup();
       uint32_t width = phase == 3 ? (w.type == GGML_TYPE_Q5_K ? 4 : 8) : phase == 0 ? outputs[quant] : phase == 1 ? 32 : 8;
-      result = {pipeline, w.n / width * group, group};
+      k = {pipeline, w.n / width * group, group};
     }
-    return result;
-  }
-
-  Tensor linear(const Tensor& x, Weight& weight, uint32_t count, Tensor output, const Tensor& residual = {}) {
-    const Kernel& k = kernel(weight, decode ? 0 : count <= 8 ? 2 : 1, bool(residual.buffer));
-    auto buffers = {output, x, weight.tensor, residual.buffer ? residual : output};
-    if (decode)
-      dispatch(k.pipeline, size(k.threads, count), size(k.group), buffers);
-    else
-      dispatch(k.pipeline, size(k.threads), size(k.group), buffers, int64_t(count), uint32_t(bool(residual.buffer)));
+    dispatch(k.pipeline, size(k.threads, decode ? count : 1), size(k.group), {output, x, w, auxiliary.buffer ? auxiliary : output}, int64_t(count),
+             gated ? 2u : uint32_t(bool(auxiliary.buffer)));
     return output;
   }
 
