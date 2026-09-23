@@ -117,7 +117,7 @@ static inline __attribute__((always_inline)) void dequant_tile(iq4_xs_tag, threa
 template <typename Q, uint K, uint N>
 [[max_total_threads_per_threadgroup(64)]]
 kernel void linear_prefill_small(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const uchar* w [[buffer(2)]],
-                                 device const half* residual [[buffer(3)]], constant long& M [[buffer(4)]], constant uint& add [[buffer(5)]],
+                                 device const half* residual [[buffer(3)]], constant long& M [[buffer(4)]], constant uint& post [[buffer(5)]],
                                  uint3 lane3 [[thread_position_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
                                  uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x;
@@ -143,20 +143,22 @@ kernel void linear_prefill_small(device half* y [[buffer(0)]], device const half
     uint r = idx >> 3, n = idx & 7, offset = r * 8 + n;
     uint output = r * N + n0 + n;
     half value = half(scratch[offset] + scratch[offset + 64]);
-    y[output] = add ? value + residual[output] : value;
+    float gate = post == 2 ? float(residual[output]) : 0.0f;
+    y[output] = post == 2 ? half((gate / (1.0f + exp(-gate))) * float(value)) : post ? value + residual[output] : value;
   }
 }
 
 template <typename Q, uint K, uint N>
 [[max_total_threads_per_threadgroup(512)]]
 kernel void linear_prefill(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const uchar* w [[buffer(2)]],
-                           device const half* residual [[buffer(3)]], constant long& M [[buffer(4)]], constant uint& add [[buffer(5)]],
+                           device const half* residual [[buffer(3)]], constant long& M [[buffer(4)]], constant uint& post [[buffer(5)]],
                            uint3 lane3 [[thread_position_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
                            uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x, rb = simd_group * 8;
   long n0 = long(group.x) * 32, m0 = long(group.y) * 128;
   bool active = m0 + rb < M;
   threadgroup half b_tile[256 * 33];
+  // Retained for Metal code generation: removing this branch regressed short-prefill latency in paired runs.
   if (M <= 8) {
     simdgroup_matrix<float, 8, 8> c = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     for (long k0 = 0, kb = 0; k0 < K; k0 += 256, ++kb) {
@@ -180,7 +182,8 @@ kernel void linear_prefill(device half* y [[buffer(0)]], device const half* x [[
       uint r = idx >> 5, n = idx & 31, tile = n >> 3;
       uint output = r * N + n0 + n;
       half value = half(scratch[tile * 64 + r * 8 + (n & 7)]);
-      y[output] = add ? value + residual[output] : value;
+      float gate = post == 2 ? float(residual[output]) : 0.0f;
+      y[output] = post == 2 ? half((gate / (1.0f + exp(-gate))) * float(value)) : post ? value + residual[output] : value;
     }
     return;
   }
@@ -222,7 +225,10 @@ kernel void linear_prefill(device half* y [[buffer(0)]], device const half* x [[
     uint r = idx >> 4, cp = idx & 15, e = (r & 7) * 32 + (cp << 1);
     uint output = ((m0 + r) * N + n0 + (cp << 1)) >> 1;
     half2 value = half2(half(scratch[(r >> 3) * 256 + e]), half(scratch[(r >> 3) * 256 + e + 1]));
-    y2[output] = add ? value + reinterpret_cast<device const half2*>(residual)[output] : value;
+    float2 gate = post == 2 ? float2(reinterpret_cast<device const half2*>(residual)[output]) : 0.0f;
+    y2[output] = post == 2 ? half2((gate / (1.0f + exp(-gate))) * float2(value))
+                 : post    ? value + reinterpret_cast<device const half2*>(residual)[output]
+                           : value;
   }
 }
 
@@ -563,9 +569,18 @@ kernel void linear_decode_q8_0_add(device half* dst [[buffer(0)]], device const 
 
 [[max_total_threads_per_threadgroup(256)]]
 kernel void embedding_q4_k(device half* y [[buffer(0)]], device const int* ids [[buffer(1)]], device const uchar* w [[buffer(2)]],
-                           uint3 lane3 [[thread_position_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+                           device const GpuQuery* queries [[buffer(3)]], device const int* proposals [[buffer(4)]], constant uint& mode [[buffer(5)]],
+                           constant uint& capacity [[buffer(6)]], uint3 lane3 [[thread_position_in_threadgroup]],
+                           uint3 group [[threadgroup_position_in_grid]]) {
   uint col = group.x * 256 + lane3.x, t = group.y;
-  long row = ids[t], nb = 4096 / 256, o = row * nb * 144 + (col >> 8) * 144;
+  device const GpuQuery& info = queryRow(queries, t);
+  uint position = t - info.start;
+  // Embedding input: target/request (0), DFlash masks (1), or previous MTP proposal (2).
+  long row = mode == 2                                            ? proposals[t]
+             : mode == 1 && position                              ? 248077
+             : mode == 0 && info.state != 0xffffffffu && position ? proposals[position * 8 + info.state / info.count]
+                                                                  : ids[info.slot * capacity + info.position + position];
+  long nb = 4096 / 256, o = row * nb * 144 + (col >> 8) * 144;
   uint r = col & 255, j = r >> 5, qj = (r >> 6) * 32 + (r & 31);
   uchar sc, mn;
   scale_min_k4(j, w + o + 4, sc, mn);
