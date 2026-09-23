@@ -1,6 +1,8 @@
 #include "model/qwen35/qwen35.hpp"
 #include <algorithm>
 #include <cstring>
+#include <chrono>
+#include <numeric>
 #include <stdexcept>
 
 namespace infeng::qwen35 {
@@ -130,6 +132,41 @@ void Engine::publishPrefix(Sequence& sequence) {
   copies.commit();
 }
 
+Engine::Engine(const std::filesystem::path& path, const std::filesystem::path& kernels, uint32_t context, const std::filesystem::path& draftPath)
+    : device(kernels), maxContext(context), blocks((context + blockTokens - 1) / blockTokens) {
+  loadModel(path, draftPath);
+  Tensor* controls[]{&inputIds,     &batchKvValid, &queryStartLoc, &draftPositions, &sequenceSlots, &stateBanks, &draftTokens,
+                     &outputTokens, &sampledRng,   &rng,           &logitRows};
+  Tensor control = device.empty(sizeof(controls) / sizeof(*controls) * 512, true);
+  for (uint32_t i = 0; i < sizeof(controls) / sizeof(*controls); ++i)
+    *controls[i] = control.view(uint64_t(i) * 512, 512);
+  auto* seeds = rng.contents<uint64_t>();
+  uint64_t seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+  for (uint32_t i = 0; i < maxBatchSequences; ++i)
+    seeds[i] = ++seed;
+  if (drafter == Drafter::mtp)
+    mtpSeeds = device.empty(2 * maxBatchSequences * 4096 * 2);
+  for (Tensor& state : gdnStates)
+    state = device.empty(gdnCheckpointBytes * maxBatchSequences);
+  kv = std::make_unique<SparseKV>(device, maxBatchSequences * blocks.size(), blocks.size(), targetKvLayers,
+                                  drafter == Drafter::mtp      ? mtpLayers
+                                  : drafter == Drafter::dflash ? dflashLayers
+                                                               : 0);
+  Batch prepared;
+  prepared.packed = 1;
+  // Resolve weights and cache each kernel variant through the model definition, without dispatching.
+  for (uint32_t rows : {1u, 8u, maxBatchTokens}) {
+    prepared.rows = prepared.maxQuery = rows;
+    prepared.logits = std::min(rows, maxLogitRows);
+    forward(*this, prepared, false, true);
+  }
+  if (drafter != Drafter::none) {
+    prepared.rows = prepared.maxQuery = drafter == Drafter::dflash ? draftWidth + 1 : 1;
+    forward(*this, prepared, true, true);
+  }
+  worker = std::thread(&Engine::schedule, this);
+}
+
 Sequence::Sequence(Engine& owner, const int32_t* stopTokens, uint32_t stopCount, float samplingTemperature, float samplingTopP, int32_t samplingTopK,
                    bool useSpeculation)
     : engine(owner), temperature(samplingTemperature), topP(samplingTopP), topK(samplingTopK), speculative(useSpeculation) {
@@ -212,12 +249,54 @@ void Engine::schedule() {
   }
 }
 
+void Batch::pack(Engine& engine, bool drafting) {
+  rows = packed = logits = maxQuery = 0;
+  bool dflash = engine.drafter == Drafter::dflash;
+  auto* tokens = (drafting ? engine.draftTokens : engine.inputIds).contents<int32_t>();
+  auto* proposed = engine.draftTokens.contents<int32_t>();
+  auto* logitRows = engine.logitRows.contents<uint32_t>();
+  for (uint32_t row = 0; row < size; ++row) {
+    Query& query = queries[row];
+    bool speculative = query.state != unbound;
+    if (drafting && !speculative)
+      continue;
+    const Sequence& sequence = *query.sequence;
+    uint32_t count = drafting ? (dflash ? query.count : 1) : query.count;
+    engine.batchKvValid.contents<uint32_t>()[packed] = sequence.kvValid;
+    engine.sequenceSlots.contents<uint32_t>()[packed] = sequence.slot;
+    engine.stateBanks.contents<uint32_t>()[packed] = sequence.bank;
+    engine.queryStartLoc.contents<uint32_t>()[packed++] = rows;
+    for (uint32_t i = 0; i < count; ++i)
+      tokens[rows + i] = drafting           ? (i ? dflashMaskToken : sequence.request[sequence.kvValid])
+                         : speculative && i ? proposed[i * maxBatchSequences + query.state / query.count]
+                                            : sequence.request[sequence.kvValid + i];
+    if (drafting && !dflash)
+      for (uint32_t step = 0; step < engine.draftWidth; ++step)
+        engine.draftPositions.contents<uint32_t>()[step * maxBatchSequences + packed - 1] = sequence.kvValid + step;
+    uint32_t samples = drafting ? (dflash ? engine.draftWidth : 0) : query.logit == unbound ? 0 : speculative ? count : 1;
+    if (!drafting) {
+      query.start = rows;
+      query.logit = samples ? logits : unbound;
+    }
+    std::iota(logitRows + logits, logitRows + logits + samples, rows + count - samples);
+    logits += samples;
+    rows += count;
+    maxQuery = std::max(maxQuery, count);
+  }
+  engine.queryStartLoc.contents<uint32_t>()[packed] = rows;
+}
+
 bool Engine::execute(Batch& batch) {
   // allocate KV capacity
   if (!reserve(batch))
     return false;
-  if (batch.candidateRows)
-    draft(*this, batch);
+  if (batch.candidateRows) {
+    if (gdnCheckpointBytes * batch.candidateRows > candidateStates.bytes)
+      candidateStates = device.empty(gdnCheckpointBytes * batch.candidateRows);
+    batch.pack(*this, true);
+    forward(*this, batch, true);
+  }
+  batch.pack(*this, false);
   forward(*this, batch);
   auto *sampled = outputTokens.contents<int32_t>(), *proposed = draftTokens.contents<int32_t>();
   Device* copies = batch.candidateRows ? &device.command() : nullptr;
@@ -244,7 +323,7 @@ bool Engine::execute(Batch& batch) {
       }
       copyState(*copies,
                 {candidateStates, query.state + accepted,
-                 drafter == Drafter::mtp ? workspace.targetHidden.view(uint64_t(query.start + accepted) * 8192, 8192) : Tensor{}},
+                 drafter == Drafter::mtp ? workspace.draftContext.view(uint64_t(query.start + accepted) * 8192, 8192) : Tensor{}},
                 {gdnStates[1 - sequence.bank], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, 1 - sequence.bank) : Tensor{}});
     }
     if (sequence.temperature > 0 && query.logit != unbound)

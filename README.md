@@ -19,7 +19,7 @@ Python creates one native `Engine`. During construction, C++:
 
 An optional drafter GGUF is identified from its tensors: a combined MTP model replaces the target weights, while DFlash supplements them.
 
-The loader resolves each projection's residual variant and launch geometry once. The forward pass selects decode, small prefill, or prefill; gate/up decoding uses a fused MLP kernel instead of separate projections.
+GGUF tensors are indexed by name once; the forward definition references that index directly, without a separate set of layer-weight structs. Construction walks the same definition without GPU dispatches to resolve required weights and cache decode, small-prefill, and prefill pipelines and launch geometry. Gate/up decoding uses a fused MLP kernel instead of separate projections.
 
 The state-bearing fields of the real `Engine` are:
 
@@ -29,10 +29,8 @@ struct Engine {
   uint32_t maxContext;                        // Maximum computed tokens in one sequence
   std::unique_ptr<SparseKV> kv;               // Model-wide sparse K/V address space and physical heaps
 
-  Tensor embedding, norm, rope, dflashRope;   // Target embeddings, final norm, and RoPE tables
-  Linear head;                                // Shared language-model head
-  std::array<Layer, targetLayers> layers;      // 32 target-model layers
-  DrafterWeights draftModel;                  // MTP or DFlash weights when enabled
+  Weights weights[2];                         // GGUF tensor views and cached kernels: target/MTP, then DFlash
+  Tensor rope, dflashRope;                    // Target/MTP and DFlash RoPE tables
   Drafter drafter = Drafter::none;            // Active drafting strategy
   uint32_t draftWidth = 0;                     // Engine-wide proposal width
 
@@ -144,6 +142,9 @@ struct Batch {
   std::array<Query, maxBatchSequences> queries{}; // One query per selected sequence
   uint32_t size = 0;                              // Number of selected sequences
   uint32_t candidateRows = 0;                     // Temporary states required by speculative queries
+  uint32_t rows = 0, packed = 0, logits = 0;       // Current pass's token, query, and sampled-row counts
+  uint32_t maxQuery = 0;                          // Largest query; selects decode or prefill kernels
+  void pack(Engine&, bool drafting);              // Packs target or drafter inputs and metadata
 };
 ```
 
@@ -238,7 +239,7 @@ All required mappings exist before any model kernel runs.
 
 ### 8. Pack inputs and kernel metadata
 
-C++ packs all query tokens into `Engine.inputIds` and builds one prefix sum:
+`Batch::pack()` packs target tokens into `Engine.inputIds`, or speculative queries into `Engine.draftTokens` for the drafter, and builds one prefix sum:
 
 ```text
 queryStartLoc[0] = 0
@@ -491,15 +492,15 @@ full-attention    8
 
 ## Appendix D: reusable and temporary buffers
 
-`Engine.workspace` is one `Scratch` arena sized once for the 128-token batch limit. Every pass reuses its tensor views.
+`Engine.workspace` holds fixed `Scratch` buffers sized once for the 128-token batch limit. Every pass reuses them; there is no arena-offset bookkeeping. `draftContext` stores either MTP's target hidden states or DFlash's eight captured features, depending on the engine's drafter.
 
 ```cpp
 struct Scratch {
   Tensor hidden[2], norm, temporary, mlpGate, mlpUp;
   Tensor mixed, q, k, v, attnQRope, attnKRope, attnPartials;
   Tensor gdnB, gdnG, gdnConvolved;
-  Tensor mid, targetHidden, dflashFeatures, targetLogits;
-  void allocate(Device&, Drafter);             // Allocates and partitions the arena once
+  Tensor mid, draftContext, targetLogits;
+  void allocate(Device&, Drafter);             // Allocates fixed buffers once
 };
 ```
 
@@ -532,10 +533,9 @@ The frontend owns one tokenizer and performs chat templating, encoding, and deco
 
 ```text
 runtime/inference.py          Python API and C ABI bindings
-runtime/engine.cpp            scheduler, query sizing, cache, commit, and C API
+runtime/engine.cpp            engine lifecycle, scheduler, input packing, cache, commit, and C API
 model/qwen35/qwen35.hpp       engine, sequence, batch, and model state
-model/qwen35/model.cpp        weight loading, pipelines, and engine construction
-model/qwen35/forward.cpp      draft and target forward passes
+model/qwen35/forward.cpp      GGUF weight index, cached pipelines, and unified target/MTP/DFlash forward definition
 backend/metal/device.cpp      Metal commands and sparse allocation
 backend/metal/kernel/*.metal  GPU kernels
 ```

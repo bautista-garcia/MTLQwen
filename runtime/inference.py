@@ -4,7 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LIB, KERNELS = ROOT / ".build/libinfeng.dylib", ROOT / "backend/metal/kernel"
-SOURCES = [ROOT / path for path in ("backend/metal/device.cpp", "model/qwen35/model.cpp", "model/qwen35/forward.cpp", "runtime/engine.cpp")]
+SOURCES = [ROOT / path for path in ("backend/metal/device.cpp", "model/qwen35/forward.cpp", "runtime/engine.cpp")]
 MAX_BATCH, VOCAB = 8, 248320
 
 

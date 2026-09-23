@@ -33,44 +33,19 @@ struct Kernel {
   uint32_t threads = 0, group = 0;
 };
 
-struct Linear {
-  Tensor weight;
-  Kernel decode, prefill, smallPrefill;
+struct Weight {
+  Tensor tensor;
+  uint32_t n, k, type;
+  Kernel kernels[4]{};
 };
 
-struct MlpWeights {
-  Linear gate, up, down;
-  Kernel fusedDecode;
-};
-
-struct AttentionWeights {
-  Linear q, k, v, out;
-  Tensor qNorm, kNorm;
-};
-
-struct GdnWeights {
-  Linear qkv, z, out;
-  Tensor b, a, conv, norm, dt, A;
-};
-
-struct Layer {
-  Tensor inputNorm, postNorm;
-  MlpWeights mlp;
-  AttentionWeights attention;
-  GdnWeights gdn;
-};
-
-struct DrafterWeights {
-  Linear fusion;
-  std::array<Layer, dflashLayers> layers;
-  Tensor embeddingNorm, hiddenNorm, outputNorm;
-};
+using Weights = std::unordered_map<std::string, Weight>;
 
 struct Scratch {
   Tensor hidden[2], norm, temporary, mlpGate, mlpUp;
   Tensor mixed, q, k, v, attnQRope, attnKRope, attnPartials;
   Tensor gdnB, gdnG, gdnConvolved;
-  Tensor mid, targetHidden, dflashFeatures, targetLogits;
+  Tensor mid, draftContext, targetLogits;
   void allocate(Device& device, Drafter drafter);
 };
 
@@ -94,6 +69,7 @@ struct HybridCheckpoint {
   std::vector<uint32_t> bindings;
 };
 struct Sequence;
+struct Engine;
 
 struct Query {
   Sequence* sequence = nullptr;
@@ -102,17 +78,16 @@ struct Query {
 
 struct Batch {
   std::array<Query, maxBatchSequences> queries{};
-  uint32_t size = 0, candidateRows = 0;
+  uint32_t size = 0, candidateRows = 0, rows = 0, packed = 0, logits = 0, maxQuery = 0;
+  void pack(Engine& engine, bool drafting);
 };
 
 struct Engine {
   Device device;
   uint32_t maxContext, draftWidth = 0;
   std::unique_ptr<SparseKV> kv;
-  Tensor embedding, norm, rope, dflashRope;
-  Linear head;
-  std::array<Layer, targetLayers> layers;
-  DrafterWeights draftModel;
+  Weights weights[2];
+  Tensor rope, dflashRope;
   Drafter drafter = Drafter::none;
   Tensor gdnStates[2], candidateStates;
   Scratch workspace;
@@ -130,6 +105,7 @@ struct Engine {
   uint64_t parameterCount = 0, modelBytes = 0;
   Engine(const std::filesystem::path& weights, const std::filesystem::path& kernels, uint32_t maxContext, const std::filesystem::path& draftWeights);
   ~Engine();
+  void loadModel(const std::filesystem::path& weights, const std::filesystem::path& draftWeights);
 
   bool reserve(const Batch& batch);
   void bind(Sequence& sequence, uint32_t physical);
@@ -156,6 +132,5 @@ struct Sequence {
 };
 
 Tensor mtpSeed(Engine& engine, const Sequence& sequence, uint32_t bank);
-void draft(Engine& engine, Batch& batch);
-void forward(Engine& engine, Batch& batch);
+void forward(Engine& engine, Batch& batch, bool drafting = false, bool prepare = false);
 } // namespace infeng::qwen35
