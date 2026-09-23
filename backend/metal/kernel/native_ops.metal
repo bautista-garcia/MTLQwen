@@ -4,9 +4,9 @@ constant uint MAX_SEQUENCES = 8;
 constant uint HIDDEN = 4096;
 constant uint VOCAB = 248320;
 
-kernel void rmsnorm(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const float* w [[buffer(2)]],
-                    uint lane [[thread_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
-                    uint simd_group [[simdgroup_index_in_threadgroup]], uint2 pos [[threadgroup_position_in_grid]]) {
+kernel void rms_norm(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const float* w [[buffer(2)]],
+                     uint lane [[thread_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
+                     uint simd_group [[simdgroup_index_in_threadgroup]], uint2 pos [[threadgroup_position_in_grid]]) {
   uint row = pos.y;
   threadgroup float sums[9];
   float sum = 0.0f;
@@ -82,8 +82,8 @@ kernel void gather_rows(device half* y [[buffer(0)]], device const half* x [[buf
   y[i] = x[rows[i / HIDDEN] * HIDDEN + i % HIDDEN];
 }
 
-kernel void silu_mul(device half* y [[buffer(0)]], device const half* gate [[buffer(1)]], device const half* up [[buffer(2)]],
-                     uint i [[thread_position_in_grid]]) {
+kernel void silu_and_mul(device half* y [[buffer(0)]], device const half* gate [[buffer(1)]], device const half* up [[buffer(2)]],
+                         uint i [[thread_position_in_grid]]) {
   float g = float(gate[i]);
   y[i] = half((g / (1.0f + exp(-g))) * float(up[i]));
 }

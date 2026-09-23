@@ -41,8 +41,8 @@ struct GGUF {
 Linear linear(Device& device, Weight weight) {
   auto [data, n, k, type] = weight;
   uint32_t quant = type == QuantType::Q8_0 ? 0 : type == QuantType::IQ4_XS ? 4 : uint32_t(type) - 11;
-  std::string root = std::string(quantNames[quant]) + "_k" + std::to_string(k) + "_n" + std::to_string(n);
-  Pipeline* decode = device.pipeline(root + "_decode");
+  std::string root = "linear_" + std::string(quantNames[quant]) + "_k" + std::to_string(k) + "_n" + std::to_string(n);
+  Pipeline* decode = type == QuantType::IQ4_XS ? nullptr : device.pipeline(root + "_decode");
   uint8_t outputs = type == QuantType::Q4_K && ((k == 4096 && n == 4096) || k == 32768) ? 2 : quantOutputs[quant];
   return {data,
           {decode, n == 4096 ? device.pipeline(root + "_decode_add") : nullptr, device.pipeline(root + "_prefill"),

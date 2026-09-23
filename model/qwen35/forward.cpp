@@ -36,7 +36,7 @@ struct Ops {
   }
 
   Tensor logits(const Tensor& x, const Tensor& norm, uint32_t rows) {
-    commands.dispatch("rmsnorm", size(256, rows), size(256), {scratch.temporary, x, norm});
+    commands.dispatch("rms_norm", size(256, rows), size(256), {scratch.temporary, x, norm});
     return linear(scratch.temporary, engine.head, rows, scratch.targetLogits);
   }
 
@@ -47,7 +47,7 @@ struct Ops {
                         int64_t(rows));
     else {
       Tensor gate = linear(x, weights.gate, rows, scratch.mlpGate), up = linear(x, weights.up, rows, scratch.mlpUp);
-      commands.dispatch("silu_mul", size(uint64_t(rows) * 12288), size(256), {scratch.mlpGate, gate, up});
+      commands.dispatch("silu_and_mul", size(uint64_t(rows) * 12288), size(256), {scratch.mlpGate, gate, up});
     }
     return linear(scratch.mlpGate, weights.down, rows, output, residual);
   }
@@ -110,21 +110,21 @@ struct Ops {
                         {destination, bank0.recurrent, bank1.recurrent, candidate, q, k, v, g, beta}, sequence.slot, sequence.bank,
                         uint32_t(sequence.kvValid != 0), int64_t(query.count));
     }
-    commands.dispatch("rmsnorm_gated_128", size(128, uint64_t(rows) * 32), size(128), {scratch.q, scratch.mixed, z, weight.norm});
+    commands.dispatch("gated_rms_norm_128", size(128, uint64_t(rows) * 32), size(128), {scratch.q, scratch.mixed, z, weight.norm});
     return linear(scratch.q, weight.out, rows, output, residual);
   }
 
   Tensor decoder(const Layer& layer, const Tensor& hidden, Tensor output, uint32_t rows, uint32_t batch, uint32_t kvLayer, const Tensor& positions,
                  const Batch* layout = nullptr, uint32_t dflash = unbound) {
-    commands.dispatch("rmsnorm", size(256, rows), size(256), {scratch.norm, hidden, layer.inputNorm});
+    commands.dispatch("rms_norm", size(256, rows), size(256), {scratch.norm, hidden, layer.inputNorm});
     Tensor mid = layer.attention.q.weight.buffer ? attention(layer, scratch.norm, hidden, scratch.mid, batch, rows, kvLayer, positions, dflash)
                                                  : gdn(layer, scratch.norm, hidden, scratch.mid, rows, *layout);
-    commands.dispatch("rmsnorm", size(256, rows), size(256), {scratch.norm, mid, layer.postNorm});
+    commands.dispatch("rms_norm", size(256, rows), size(256), {scratch.norm, mid, layer.postNorm});
     return mlp(scratch.norm, layer.mlp, mid, output, rows);
   }
 
   Tensor mtpInput(const Tensor& ids, const Tensor& hidden, uint32_t rows, uint32_t batch, uint32_t mode) {
-    commands.dispatch("q4_k_embed", size(4096, rows), size(256), {scratch.norm, ids, engine.embedding});
+    commands.dispatch("embedding_q4_k", size(4096, rows), size(256), {scratch.norm, ids, engine.embedding});
     commands.dispatch("mtp_fuse", size(256, rows), size(256),
                       {scratch.mixed, scratch.norm, hidden, engine.mtpSeeds, engine.sequenceSlots, engine.stateBanks, engine.batchKvValid,
                        engine.queryStartLoc, engine.draftModel.embeddingNorm, engine.draftModel.hiddenNorm},
@@ -158,7 +158,7 @@ void encodeDrafter(Ops& ops, const Batch& batch, uint32_t rows) {
   bool mtp = engine.drafter == Drafter::mtp;
   Tensor context = mtp ? ops.mtpInput(engine.inputIds, scratch.targetHidden, rows, batch.size, 1)
                        : ops.linear(scratch.dflashFeatures, engine.draftModel.fusion, rows, scratch.hidden[0]);
-  commands.dispatch("rmsnorm", size(256, rows), size(256),
+  commands.dispatch("rms_norm", size(256, rows), size(256),
                     {scratch.norm, context, mtp ? engine.draftModel.layers[0].inputNorm : engine.draftModel.hiddenNorm});
   context = scratch.norm;
   for (uint32_t index = 0; index < (mtp ? 1 : dflashLayers); ++index) {
@@ -233,7 +233,7 @@ void draft(Engine& engine, Batch& batch) {
   Ops ops{commands, engine, scratch, !dflash};
   if (dflash) {
     Tensor hidden = scratch.hidden[0];
-    commands.dispatch("q4_k_embed", size(4096, packedRows), size(256), {hidden, engine.draftTokens, engine.embedding});
+    commands.dispatch("embedding_q4_k", size(4096, packedRows), size(256), {hidden, engine.draftTokens, engine.embedding});
     for (uint32_t index = 0; index < dflashLayers; ++index)
       hidden = ops.decoder(engine.draftModel.layers[index], hidden, scratch.hidden[(index + 1) & 1], packedRows, draftSequences,
                            targetKvLayers + index, engine.batchKvValid, nullptr, index);
@@ -290,7 +290,7 @@ void forward(Engine& engine, Batch& batch) {
   Device& commands = engine.device.command();
   Ops ops{commands, engine, scratch, maxQuery <= maxDecodeRows};
   Tensor hidden = scratch.hidden[0];
-  commands.dispatch("q4_k_embed", size(4096, rows), size(256), {hidden, engine.inputIds, engine.embedding});
+  commands.dispatch("embedding_q4_k", size(4096, rows), size(256), {hidden, engine.inputIds, engine.embedding});
   for (uint32_t i = 0; i < engine.layers.size(); ++i) {
     hidden =
         ops.decoder(engine.layers[i], hidden, scratch.hidden[(i + 1) & 1], rows, batch.size, i / fullAttentionInterval, engine.batchKvValid, &batch);

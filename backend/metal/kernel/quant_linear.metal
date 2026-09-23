@@ -19,14 +19,18 @@ static inline void scale_min_k4(uint j, device const uchar* q, thread uchar& d, 
   }
 }
 
-struct q4k_tag {};
-struct q5k_tag {};
-struct q6k_tag {};
+struct q4_k_tag {};
+
+struct q5_k_tag {};
+
+struct q6_k_tag {};
+
 struct q8_0_tag {};
-struct iq4xs_tag {};
+
+struct iq4_xs_tag {};
 
 template <uint K, uint COLUMNS = 2, uint STRIDE = 33>
-static inline __attribute__((always_inline)) void dequant_tile(q4k_tag, threadgroup half* b_tile, device const uchar* w, long n0, long kb,
+static inline __attribute__((always_inline)) void dequant_tile(q4_k_tag, threadgroup half* b_tile, device const uchar* w, long n0, long kb,
                                                                uint simd_lane, uint simd_group) {
   for (uint p = 0; p < COLUMNS; ++p) {
     uint n = simd_group * COLUMNS + p;
@@ -44,7 +48,7 @@ static inline __attribute__((always_inline)) void dequant_tile(q4k_tag, threadgr
 }
 
 template <uint K, uint COLUMNS = 2, uint STRIDE = 33>
-static inline __attribute__((always_inline)) void dequant_tile(q5k_tag, threadgroup half* b_tile, device const uchar* w, long n0, long kb,
+static inline __attribute__((always_inline)) void dequant_tile(q5_k_tag, threadgroup half* b_tile, device const uchar* w, long n0, long kb,
                                                                uint simd_lane, uint simd_group) {
   for (uint p = 0; p < COLUMNS; ++p) {
     uint n = simd_group * COLUMNS + p;
@@ -63,7 +67,7 @@ static inline __attribute__((always_inline)) void dequant_tile(q5k_tag, threadgr
 }
 
 template <uint K, uint COLUMNS = 2, uint STRIDE = 33>
-static inline __attribute__((always_inline)) void dequant_tile(q6k_tag, threadgroup half* b_tile, device const uchar* w, long n0, long kb,
+static inline __attribute__((always_inline)) void dequant_tile(q6_k_tag, threadgroup half* b_tile, device const uchar* w, long n0, long kb,
                                                                uint simd_lane, uint simd_group) {
   for (uint p = 0; p < COLUMNS; ++p) {
     uint n = simd_group * COLUMNS + p, l = simd_lane;
@@ -94,7 +98,7 @@ static inline __attribute__((always_inline)) void dequant_tile(q8_0_tag, threadg
 }
 
 template <uint K, uint COLUMNS = 2, uint STRIDE = 33>
-static inline __attribute__((always_inline)) void dequant_tile(iq4xs_tag, threadgroup half* b_tile, device const uchar* w, long n0, long kb,
+static inline __attribute__((always_inline)) void dequant_tile(iq4_xs_tag, threadgroup half* b_tile, device const uchar* w, long n0, long kb,
                                                                uint simd_lane, uint simd_group) {
   for (uint p = 0; p < COLUMNS; ++p) {
     uint n = simd_group * COLUMNS + p;
@@ -112,10 +116,10 @@ static inline __attribute__((always_inline)) void dequant_tile(iq4xs_tag, thread
 
 template <typename Q, uint K, uint N>
 [[max_total_threads_per_threadgroup(64)]]
-kernel void prefill_qk_small(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const uchar* w [[buffer(2)]],
-                             device const half* residual [[buffer(3)]], constant long& M [[buffer(4)]], constant uint& add [[buffer(5)]],
-                             uint3 lane3 [[thread_position_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
-                             uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+kernel void linear_prefill_small(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const uchar* w [[buffer(2)]],
+                                 device const half* residual [[buffer(3)]], constant long& M [[buffer(4)]], constant uint& add [[buffer(5)]],
+                                 uint3 lane3 [[thread_position_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
+                                 uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x;
   long n0 = long(group.x) * 8;
   threadgroup half b_tile[256 * 9];
@@ -145,10 +149,10 @@ kernel void prefill_qk_small(device half* y [[buffer(0)]], device const half* x 
 
 template <typename Q, uint K, uint N>
 [[max_total_threads_per_threadgroup(512)]]
-kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const uchar* w [[buffer(2)]],
-                       device const half* residual [[buffer(3)]], constant long& M [[buffer(4)]], constant uint& add [[buffer(5)]],
-                       uint3 lane3 [[thread_position_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
-                       uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+kernel void linear_prefill(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const uchar* w [[buffer(2)]],
+                           device const half* residual [[buffer(3)]], constant long& M [[buffer(4)]], constant uint& add [[buffer(5)]],
+                           uint3 lane3 [[thread_position_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
+                           uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x, rb = simd_group * 8;
   long n0 = long(group.x) * 32, m0 = long(group.y) * 128;
   bool active = m0 + rb < M;
@@ -225,7 +229,7 @@ kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buff
 // DECODE KERNELS
 
 template <bool ADD>
-static inline __attribute__((always_inline)) void decode_store(device half* dst, device const half* residual, float value, uint row) {
+static inline __attribute__((always_inline)) void linear_decode_store(device half* dst, device const half* residual, float value, uint row) {
   half result = half(value);
   if (ADD)
     result += residual[row];
@@ -233,8 +237,8 @@ static inline __attribute__((always_inline)) void decode_store(device half* dst,
 }
 
 template <bool ADD, uint K, uint N, ushort ROWS>
-static inline __attribute__((always_inline)) void decode_q4k_impl(device half* dst, device const half* src, device const uchar* weights,
-                                                                  device const half* residual, ushort lane, ushort simd_group, uint3 group) {
+static inline __attribute__((always_inline)) void linear_decode_q4_k_impl(device half* dst, device const half* src, device const uchar* weights,
+                                                                          device const half* residual, ushort lane, ushort simd_group, uint3 group) {
   dst += group.y * N;
   src += group.y * K;
   residual += group.y * N;
@@ -294,29 +298,29 @@ static inline __attribute__((always_inline)) void decode_q4k_impl(device half* d
   for (ushort row = 0; row < ROWS; ++row) {
     float sum = simd_sum(sumf[row]);
     if (lane == 0 && first_row + row < N)
-      decode_store<ADD>(dst, residual, sum, first_row + row);
+      linear_decode_store<ADD>(dst, residual, sum, first_row + row);
   }
 }
 
 template <uint K, uint N, ushort ROWS = 2>
 [[max_total_threads_per_threadgroup(64)]]
-kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
-                       ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
-                       uint3 group [[threadgroup_position_in_grid]]) {
-  decode_q4k_impl<false, K, N, ROWS>(dst, src, weights, dst, lane, simd_group, group);
+kernel void linear_decode_q4_k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
+                               ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
+                               uint3 group [[threadgroup_position_in_grid]]) {
+  linear_decode_q4_k_impl<false, K, N, ROWS>(dst, src, weights, dst, lane, simd_group, group);
 }
 
 template <uint K, uint N, ushort ROWS = 2>
 [[max_total_threads_per_threadgroup(64)]]
-kernel void decode_q4k_add(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
-                           device const half* residual [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
-                           ushort simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
-  decode_q4k_impl<true, K, N, ROWS>(dst, src, weights, residual, lane, simd_group, group);
+kernel void linear_decode_q4_k_add(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
+                                   device const half* residual [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
+                                   ushort simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+  linear_decode_q4_k_impl<true, K, N, ROWS>(dst, src, weights, residual, lane, simd_group, group);
 }
 
 template <bool ADD, uint K, uint N>
-static inline __attribute__((always_inline)) void decode_q5k_impl(device half* dst, device const half* src, device const uchar* weights,
-                                                                  device const half* residual, ushort lane, ushort simd_group, uint3 group) {
+static inline __attribute__((always_inline)) void linear_decode_q5_k_impl(device half* dst, device const half* src, device const uchar* weights,
+                                                                          device const half* residual, ushort lane, ushort simd_group, uint3 group) {
   dst += group.y * N;
   src += group.y * K;
   residual += group.y * N;
@@ -402,28 +406,28 @@ static inline __attribute__((always_inline)) void decode_q5k_impl(device half* d
   }
   float sum = simd_sum(sumf);
   if (lane == 0 && row < N)
-    decode_store<ADD>(dst, residual, sum, row);
+    linear_decode_store<ADD>(dst, residual, sum, row);
 }
 
 template <uint K, uint N>
 [[max_total_threads_per_threadgroup(128)]]
-kernel void decode_q5k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
-                       ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
-                       uint3 group [[threadgroup_position_in_grid]]) {
-  decode_q5k_impl<false, K, N>(dst, src, weights, dst, lane, simd_group, group);
+kernel void linear_decode_q5_k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
+                               ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
+                               uint3 group [[threadgroup_position_in_grid]]) {
+  linear_decode_q5_k_impl<false, K, N>(dst, src, weights, dst, lane, simd_group, group);
 }
 
 template <uint K, uint N>
 [[max_total_threads_per_threadgroup(128)]]
-kernel void decode_q5k_add(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
-                           device const half* residual [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
-                           ushort simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
-  decode_q5k_impl<true, K, N>(dst, src, weights, residual, lane, simd_group, group);
+kernel void linear_decode_q5_k_add(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
+                                   device const half* residual [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
+                                   ushort simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+  linear_decode_q5_k_impl<true, K, N>(dst, src, weights, residual, lane, simd_group, group);
 }
 
 template <bool ADD, uint K, uint N>
-static inline __attribute__((always_inline)) void decode_q6k_impl(device half* dst, device const half* src, device const uchar* weights,
-                                                                  device const half* residual, ushort lane, ushort simd_group, uint3 group) {
+static inline __attribute__((always_inline)) void linear_decode_q6_k_impl(device half* dst, device const half* src, device const uchar* weights,
+                                                                          device const half* residual, ushort lane, ushort simd_group, uint3 group) {
   dst += group.y * N;
   src += group.y * K;
   residual += group.y * N;
@@ -479,30 +483,30 @@ static inline __attribute__((always_inline)) void decode_q6k_impl(device half* d
   for (ushort row = 0; row < 2; ++row) {
     const float sum = simd_sum(sumf[row]);
     if (lane == 0 && first_row + row < N)
-      decode_store<ADD>(dst, residual, sum, first_row + row);
+      linear_decode_store<ADD>(dst, residual, sum, first_row + row);
   }
 }
 
 template <uint K, uint N>
 [[max_total_threads_per_threadgroup(128)]]
-kernel void decode_q6k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
-                       ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
-                       uint3 group [[threadgroup_position_in_grid]]) {
-  decode_q6k_impl<false, K, N>(dst, src, weights, dst, lane, simd_group, group);
+kernel void linear_decode_q6_k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
+                               ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
+                               uint3 group [[threadgroup_position_in_grid]]) {
+  linear_decode_q6_k_impl<false, K, N>(dst, src, weights, dst, lane, simd_group, group);
 }
 
 template <uint K, uint N>
 [[max_total_threads_per_threadgroup(128)]]
-kernel void decode_q6k_add(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
-                           device const half* residual [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
-                           ushort simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
-  decode_q6k_impl<true, K, N>(dst, src, weights, residual, lane, simd_group, group);
+kernel void linear_decode_q6_k_add(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
+                                   device const half* residual [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
+                                   ushort simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+  linear_decode_q6_k_impl<true, K, N>(dst, src, weights, residual, lane, simd_group, group);
 }
 
 template <bool ADD, uint K, uint N>
-static inline __attribute__((always_inline)) void decode_q8_0_impl(device half* dst, device const half* src, device const uchar* weights,
-                                                                   device const half* residual, threadgroup float* partial, ushort lane,
-                                                                   ushort simd_group, uint3 group) {
+static inline __attribute__((always_inline)) void linear_decode_q8_0_impl(device half* dst, device const half* src, device const uchar* weights,
+                                                                          device const half* residual, threadgroup float* partial, ushort lane,
+                                                                          ushort simd_group, uint3 group) {
   dst += group.y * N;
   src += group.y * K;
   residual += group.y * N;
@@ -534,40 +538,32 @@ static inline __attribute__((always_inline)) void decode_q8_0_impl(device half* 
     for (ushort row = 0; row < 2; ++row) {
       float sum = partial[row] + partial[2 + row] + partial[4 + row] + partial[6 + row];
       if (first_row + row < N)
-        decode_store<ADD>(dst, residual, sum, first_row + row);
+        linear_decode_store<ADD>(dst, residual, sum, first_row + row);
     }
   }
 }
 
 template <uint K, uint N>
 [[max_total_threads_per_threadgroup(128)]]
-kernel void decode_q8_0(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
-                        ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
-                        uint3 group [[threadgroup_position_in_grid]]) {
+kernel void linear_decode_q8_0(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
+                               ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
+                               uint3 group [[threadgroup_position_in_grid]]) {
   threadgroup float partial[8];
-  decode_q8_0_impl<false, K, N>(dst, src, weights, dst, partial, lane, simd_group, group);
+  linear_decode_q8_0_impl<false, K, N>(dst, src, weights, dst, partial, lane, simd_group, group);
 }
 
 template <uint K, uint N>
 [[max_total_threads_per_threadgroup(128)]]
-kernel void decode_q8_0_add(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
-                            device const half* residual [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
-                            ushort simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+kernel void linear_decode_q8_0_add(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
+                                   device const half* residual [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
+                                   ushort simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
   threadgroup float partial[8];
-  decode_q8_0_impl<true, K, N>(dst, src, weights, residual, partial, lane, simd_group, group);
-}
-
-template <uint K, uint N>
-[[max_total_threads_per_threadgroup(64)]]
-kernel void decode_iq4xs(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]], device const uchar* weights [[buffer(2)]],
-                         ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]],
-                         uint3 group [[threadgroup_position_in_grid]]) {
-  // Qwen 3.5 IQ4_XS tensors are MLP gate/up weights; decode always uses the fused two-weight kernel.
+  linear_decode_q8_0_impl<true, K, N>(dst, src, weights, residual, partial, lane, simd_group, group);
 }
 
 [[max_total_threads_per_threadgroup(256)]]
-kernel void q4_k_embed(device half* y [[buffer(0)]], device const int* ids [[buffer(1)]], device const uchar* w [[buffer(2)]],
-                       uint3 lane3 [[thread_position_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+kernel void embedding_q4_k(device half* y [[buffer(0)]], device const int* ids [[buffer(1)]], device const uchar* w [[buffer(2)]],
+                           uint3 lane3 [[thread_position_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
   uint col = group.x * 256 + lane3.x, t = group.y;
   long row = ids[t], nb = 4096 / 256, o = row * nb * 144 + (col >> 8) * 144;
   uint r = col & 255, j = r >> 5, qj = (r >> 6) * 32 + (r & 31);
@@ -579,72 +575,71 @@ kernel void q4_k_embed(device half* y [[buffer(0)]], device const int* ids [[buf
 
 #define PREFILL_ARGS                                                                                                                                 \
   device half*, device const half*, device const uchar*, device const half*, constant long&, constant uint&, uint3, uint, uint, uint3
-template [[host_name("q4_k_k4096_n1024_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 1024>(PREFILL_ARGS);
-template [[host_name("q4_k_k4096_n1024_prefill_small")]] kernel void prefill_qk_small<q4k_tag, 4096, 1024>(PREFILL_ARGS);
-template [[host_name("q4_k_k4096_n4096_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 4096>(PREFILL_ARGS);
-template [[host_name("q4_k_k4096_n4096_prefill_small")]] kernel void prefill_qk_small<q4k_tag, 4096, 4096>(PREFILL_ARGS);
-template [[host_name("q4_k_k12288_n4096_prefill")]] kernel void prefill_qk<q4k_tag, 12288, 4096>(PREFILL_ARGS);
-template [[host_name("q4_k_k12288_n4096_prefill_small")]] kernel void prefill_qk_small<q4k_tag, 12288, 4096>(PREFILL_ARGS);
-template [[host_name("q4_k_k32768_n4096_prefill")]] kernel void prefill_qk<q4k_tag, 32768, 4096>(PREFILL_ARGS);
-template [[host_name("q4_k_k32768_n4096_prefill_small")]] kernel void prefill_qk_small<q4k_tag, 32768, 4096>(PREFILL_ARGS);
-template [[host_name("q4_k_k4096_n8192_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 8192>(PREFILL_ARGS);
-template [[host_name("q4_k_k4096_n8192_prefill_small")]] kernel void prefill_qk_small<q4k_tag, 4096, 8192>(PREFILL_ARGS);
-template [[host_name("q4_k_k4096_n12288_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 12288>(PREFILL_ARGS);
-template [[host_name("q4_k_k4096_n12288_prefill_small")]] kernel void prefill_qk_small<q4k_tag, 4096, 12288>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k4096_n1024_prefill")]] kernel void linear_prefill<q4_k_tag, 4096, 1024>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k4096_n1024_prefill_small")]] kernel void linear_prefill_small<q4_k_tag, 4096, 1024>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k4096_n4096_prefill")]] kernel void linear_prefill<q4_k_tag, 4096, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k4096_n4096_prefill_small")]] kernel void linear_prefill_small<q4_k_tag, 4096, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k12288_n4096_prefill")]] kernel void linear_prefill<q4_k_tag, 12288, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k12288_n4096_prefill_small")]] kernel void linear_prefill_small<q4_k_tag, 12288, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k32768_n4096_prefill")]] kernel void linear_prefill<q4_k_tag, 32768, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k32768_n4096_prefill_small")]] kernel void linear_prefill_small<q4_k_tag, 32768, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k4096_n8192_prefill")]] kernel void linear_prefill<q4_k_tag, 4096, 8192>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k4096_n8192_prefill_small")]] kernel void linear_prefill_small<q4_k_tag, 4096, 8192>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k4096_n12288_prefill")]] kernel void linear_prefill<q4_k_tag, 4096, 12288>(PREFILL_ARGS);
+template [[host_name("linear_q4_k_k4096_n12288_prefill_small")]] kernel void linear_prefill_small<q4_k_tag, 4096, 12288>(PREFILL_ARGS);
 #define DECODE_ARGS device half*, device const half*, device const uchar*, ushort, ushort, uint3
 #define DECODE_ADD_ARGS device half*, device const half*, device const uchar*, device const half*, ushort, ushort, uint3
 
-template [[host_name("q4_k_k4096_n1024_decode")]] kernel void decode_q4k<4096, 1024>(DECODE_ARGS);
-template [[host_name("q4_k_k4096_n4096_decode")]] kernel void decode_q4k<4096, 4096, 1>(DECODE_ARGS);
-template [[host_name("q4_k_k4096_n4096_decode_add")]] kernel void decode_q4k_add<4096, 4096, 1>(DECODE_ADD_ARGS);
-template [[host_name("q4_k_k12288_n4096_decode")]] kernel void decode_q4k<12288, 4096>(DECODE_ARGS);
-template [[host_name("q4_k_k12288_n4096_decode_add")]] kernel void decode_q4k_add<12288, 4096>(DECODE_ADD_ARGS);
-template [[host_name("q4_k_k32768_n4096_decode")]] kernel void decode_q4k<32768, 4096, 1>(DECODE_ARGS);
-template [[host_name("q4_k_k32768_n4096_decode_add")]] kernel void decode_q4k_add<32768, 4096, 1>(DECODE_ADD_ARGS);
-template [[host_name("q4_k_k4096_n8192_decode")]] kernel void decode_q4k<4096, 8192>(DECODE_ARGS);
-template [[host_name("q4_k_k4096_n12288_decode")]] kernel void decode_q4k<4096, 12288>(DECODE_ARGS);
+template [[host_name("linear_q4_k_k4096_n1024_decode")]] kernel void linear_decode_q4_k<4096, 1024>(DECODE_ARGS);
+template [[host_name("linear_q4_k_k4096_n4096_decode")]] kernel void linear_decode_q4_k<4096, 4096, 1>(DECODE_ARGS);
+template [[host_name("linear_q4_k_k4096_n4096_decode_add")]] kernel void linear_decode_q4_k_add<4096, 4096, 1>(DECODE_ADD_ARGS);
+template [[host_name("linear_q4_k_k12288_n4096_decode")]] kernel void linear_decode_q4_k<12288, 4096>(DECODE_ARGS);
+template [[host_name("linear_q4_k_k12288_n4096_decode_add")]] kernel void linear_decode_q4_k_add<12288, 4096>(DECODE_ADD_ARGS);
+template [[host_name("linear_q4_k_k32768_n4096_decode")]] kernel void linear_decode_q4_k<32768, 4096, 1>(DECODE_ARGS);
+template [[host_name("linear_q4_k_k32768_n4096_decode_add")]] kernel void linear_decode_q4_k_add<32768, 4096, 1>(DECODE_ADD_ARGS);
+template [[host_name("linear_q4_k_k4096_n8192_decode")]] kernel void linear_decode_q4_k<4096, 8192>(DECODE_ARGS);
+template [[host_name("linear_q4_k_k4096_n12288_decode")]] kernel void linear_decode_q4_k<4096, 12288>(DECODE_ARGS);
 
-template [[host_name("q5_k_k4096_n1024_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 1024>(PREFILL_ARGS);
-template [[host_name("q5_k_k4096_n1024_prefill_small")]] kernel void prefill_qk_small<q5k_tag, 4096, 1024>(PREFILL_ARGS);
-template [[host_name("q5_k_k4096_n4096_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 4096>(PREFILL_ARGS);
-template [[host_name("q5_k_k4096_n4096_prefill_small")]] kernel void prefill_qk_small<q5k_tag, 4096, 4096>(PREFILL_ARGS);
-template [[host_name("q5_k_k12288_n4096_prefill")]] kernel void prefill_qk<q5k_tag, 12288, 4096>(PREFILL_ARGS);
-template [[host_name("q5_k_k12288_n4096_prefill_small")]] kernel void prefill_qk_small<q5k_tag, 12288, 4096>(PREFILL_ARGS);
-template [[host_name("q5_k_k4096_n8192_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 8192>(PREFILL_ARGS);
-template [[host_name("q5_k_k4096_n8192_prefill_small")]] kernel void prefill_qk_small<q5k_tag, 4096, 8192>(PREFILL_ARGS);
-template [[host_name("q5_k_k4096_n12288_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 12288>(PREFILL_ARGS);
-template [[host_name("q5_k_k4096_n12288_prefill_small")]] kernel void prefill_qk_small<q5k_tag, 4096, 12288>(PREFILL_ARGS);
-template [[host_name("q5_k_k4096_n1024_decode")]] kernel void decode_q5k<4096, 1024>(DECODE_ARGS);
-template [[host_name("q5_k_k4096_n4096_decode")]] kernel void decode_q5k<4096, 4096>(DECODE_ARGS);
-template [[host_name("q5_k_k4096_n4096_decode_add")]] kernel void decode_q5k_add<4096, 4096>(DECODE_ADD_ARGS);
-template [[host_name("q5_k_k12288_n4096_decode")]] kernel void decode_q5k<12288, 4096>(DECODE_ARGS);
-template [[host_name("q5_k_k12288_n4096_decode_add")]] kernel void decode_q5k_add<12288, 4096>(DECODE_ADD_ARGS);
-template [[host_name("q5_k_k4096_n8192_decode")]] kernel void decode_q5k<4096, 8192>(DECODE_ARGS);
-template [[host_name("q5_k_k4096_n12288_decode")]] kernel void decode_q5k<4096, 12288>(DECODE_ARGS);
+template [[host_name("linear_q5_k_k4096_n1024_prefill")]] kernel void linear_prefill<q5_k_tag, 4096, 1024>(PREFILL_ARGS);
+template [[host_name("linear_q5_k_k4096_n1024_prefill_small")]] kernel void linear_prefill_small<q5_k_tag, 4096, 1024>(PREFILL_ARGS);
+template [[host_name("linear_q5_k_k4096_n4096_prefill")]] kernel void linear_prefill<q5_k_tag, 4096, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q5_k_k4096_n4096_prefill_small")]] kernel void linear_prefill_small<q5_k_tag, 4096, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q5_k_k12288_n4096_prefill")]] kernel void linear_prefill<q5_k_tag, 12288, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q5_k_k12288_n4096_prefill_small")]] kernel void linear_prefill_small<q5_k_tag, 12288, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q5_k_k4096_n8192_prefill")]] kernel void linear_prefill<q5_k_tag, 4096, 8192>(PREFILL_ARGS);
+template [[host_name("linear_q5_k_k4096_n8192_prefill_small")]] kernel void linear_prefill_small<q5_k_tag, 4096, 8192>(PREFILL_ARGS);
+template [[host_name("linear_q5_k_k4096_n12288_prefill")]] kernel void linear_prefill<q5_k_tag, 4096, 12288>(PREFILL_ARGS);
+template [[host_name("linear_q5_k_k4096_n12288_prefill_small")]] kernel void linear_prefill_small<q5_k_tag, 4096, 12288>(PREFILL_ARGS);
+template [[host_name("linear_q5_k_k4096_n1024_decode")]] kernel void linear_decode_q5_k<4096, 1024>(DECODE_ARGS);
+template [[host_name("linear_q5_k_k4096_n4096_decode")]] kernel void linear_decode_q5_k<4096, 4096>(DECODE_ARGS);
+template [[host_name("linear_q5_k_k4096_n4096_decode_add")]] kernel void linear_decode_q5_k_add<4096, 4096>(DECODE_ADD_ARGS);
+template [[host_name("linear_q5_k_k12288_n4096_decode")]] kernel void linear_decode_q5_k<12288, 4096>(DECODE_ARGS);
+template [[host_name("linear_q5_k_k12288_n4096_decode_add")]] kernel void linear_decode_q5_k_add<12288, 4096>(DECODE_ADD_ARGS);
+template [[host_name("linear_q5_k_k4096_n8192_decode")]] kernel void linear_decode_q5_k<4096, 8192>(DECODE_ARGS);
+template [[host_name("linear_q5_k_k4096_n12288_decode")]] kernel void linear_decode_q5_k<4096, 12288>(DECODE_ARGS);
 
-template [[host_name("q6_k_k4096_n1024_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 1024>(PREFILL_ARGS);
-template [[host_name("q6_k_k4096_n1024_prefill_small")]] kernel void prefill_qk_small<q6k_tag, 4096, 1024>(PREFILL_ARGS);
-template [[host_name("q6_k_k4096_n8192_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 8192>(PREFILL_ARGS);
-template [[host_name("q6_k_k4096_n8192_prefill_small")]] kernel void prefill_qk_small<q6k_tag, 4096, 8192>(PREFILL_ARGS);
-template [[host_name("q6_k_k12288_n4096_prefill")]] kernel void prefill_qk<q6k_tag, 12288, 4096>(PREFILL_ARGS);
-template [[host_name("q6_k_k12288_n4096_prefill_small")]] kernel void prefill_qk_small<q6k_tag, 12288, 4096>(PREFILL_ARGS);
-template [[host_name("q6_k_k4096_n248320_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 248320>(PREFILL_ARGS);
-template [[host_name("q6_k_k4096_n248320_prefill_small")]] kernel void prefill_qk_small<q6k_tag, 4096, 248320>(PREFILL_ARGS);
-template [[host_name("q6_k_k4096_n1024_decode")]] kernel void decode_q6k<4096, 1024>(DECODE_ARGS);
-template [[host_name("q6_k_k4096_n8192_decode")]] kernel void decode_q6k<4096, 8192>(DECODE_ARGS);
-template [[host_name("q6_k_k12288_n4096_decode")]] kernel void decode_q6k<12288, 4096>(DECODE_ARGS);
-template [[host_name("q6_k_k12288_n4096_decode_add")]] kernel void decode_q6k_add<12288, 4096>(DECODE_ADD_ARGS);
-template [[host_name("q6_k_k4096_n248320_decode")]] kernel void decode_q6k<4096, 248320>(DECODE_ARGS);
+template [[host_name("linear_q6_k_k4096_n1024_prefill")]] kernel void linear_prefill<q6_k_tag, 4096, 1024>(PREFILL_ARGS);
+template [[host_name("linear_q6_k_k4096_n1024_prefill_small")]] kernel void linear_prefill_small<q6_k_tag, 4096, 1024>(PREFILL_ARGS);
+template [[host_name("linear_q6_k_k4096_n8192_prefill")]] kernel void linear_prefill<q6_k_tag, 4096, 8192>(PREFILL_ARGS);
+template [[host_name("linear_q6_k_k4096_n8192_prefill_small")]] kernel void linear_prefill_small<q6_k_tag, 4096, 8192>(PREFILL_ARGS);
+template [[host_name("linear_q6_k_k12288_n4096_prefill")]] kernel void linear_prefill<q6_k_tag, 12288, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q6_k_k12288_n4096_prefill_small")]] kernel void linear_prefill_small<q6_k_tag, 12288, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q6_k_k4096_n248320_prefill")]] kernel void linear_prefill<q6_k_tag, 4096, 248320>(PREFILL_ARGS);
+template [[host_name("linear_q6_k_k4096_n248320_prefill_small")]] kernel void linear_prefill_small<q6_k_tag, 4096, 248320>(PREFILL_ARGS);
+template [[host_name("linear_q6_k_k4096_n1024_decode")]] kernel void linear_decode_q6_k<4096, 1024>(DECODE_ARGS);
+template [[host_name("linear_q6_k_k4096_n8192_decode")]] kernel void linear_decode_q6_k<4096, 8192>(DECODE_ARGS);
+template [[host_name("linear_q6_k_k12288_n4096_decode")]] kernel void linear_decode_q6_k<12288, 4096>(DECODE_ARGS);
+template [[host_name("linear_q6_k_k12288_n4096_decode_add")]] kernel void linear_decode_q6_k_add<12288, 4096>(DECODE_ADD_ARGS);
+template [[host_name("linear_q6_k_k4096_n248320_decode")]] kernel void linear_decode_q6_k<4096, 248320>(DECODE_ARGS);
 
-template [[host_name("q8_0_k4096_n4096_prefill")]] kernel void prefill_qk<q8_0_tag, 4096, 4096>(PREFILL_ARGS);
-template [[host_name("q8_0_k4096_n4096_prefill_small")]] kernel void prefill_qk_small<q8_0_tag, 4096, 4096>(PREFILL_ARGS);
-template [[host_name("q8_0_k4096_n4096_decode")]] kernel void decode_q8_0<4096, 4096>(DECODE_ARGS);
-template [[host_name("q8_0_k4096_n4096_decode_add")]] kernel void decode_q8_0_add<4096, 4096>(DECODE_ADD_ARGS);
-template [[host_name("q8_0_k8192_n4096_prefill")]] kernel void prefill_qk<q8_0_tag, 8192, 4096>(PREFILL_ARGS);
-template [[host_name("q8_0_k8192_n4096_prefill_small")]] kernel void prefill_qk_small<q8_0_tag, 8192, 4096>(PREFILL_ARGS);
-template [[host_name("q8_0_k8192_n4096_decode")]] kernel void decode_q8_0<8192, 4096>(DECODE_ARGS);
-template [[host_name("q8_0_k8192_n4096_decode_add")]] kernel void decode_q8_0_add<8192, 4096>(DECODE_ADD_ARGS);
+template [[host_name("linear_q8_0_k4096_n4096_prefill")]] kernel void linear_prefill<q8_0_tag, 4096, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q8_0_k4096_n4096_prefill_small")]] kernel void linear_prefill_small<q8_0_tag, 4096, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q8_0_k4096_n4096_decode")]] kernel void linear_decode_q8_0<4096, 4096>(DECODE_ARGS);
+template [[host_name("linear_q8_0_k4096_n4096_decode_add")]] kernel void linear_decode_q8_0_add<4096, 4096>(DECODE_ADD_ARGS);
+template [[host_name("linear_q8_0_k8192_n4096_prefill")]] kernel void linear_prefill<q8_0_tag, 8192, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q8_0_k8192_n4096_prefill_small")]] kernel void linear_prefill_small<q8_0_tag, 8192, 4096>(PREFILL_ARGS);
+template [[host_name("linear_q8_0_k8192_n4096_decode")]] kernel void linear_decode_q8_0<8192, 4096>(DECODE_ARGS);
+template [[host_name("linear_q8_0_k8192_n4096_decode_add")]] kernel void linear_decode_q8_0_add<8192, 4096>(DECODE_ADD_ARGS);
 
-template [[host_name("iq4_xs_k4096_n12288_prefill")]] kernel void prefill_qk<iq4xs_tag, 4096, 12288>(PREFILL_ARGS);
-template [[host_name("iq4_xs_k4096_n12288_prefill_small")]] kernel void prefill_qk_small<iq4xs_tag, 4096, 12288>(PREFILL_ARGS);
-template [[host_name("iq4_xs_k4096_n12288_decode")]] kernel void decode_iq4xs<4096, 12288>(DECODE_ARGS);
+template [[host_name("linear_iq4_xs_k4096_n12288_prefill")]] kernel void linear_prefill<iq4_xs_tag, 4096, 12288>(PREFILL_ARGS);
+template [[host_name("linear_iq4_xs_k4096_n12288_prefill_small")]] kernel void linear_prefill_small<iq4_xs_tag, 4096, 12288>(PREFILL_ARGS);

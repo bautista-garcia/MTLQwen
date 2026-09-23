@@ -8,8 +8,8 @@ constant uint MLP_N = 12288;
 
 constant float iq4nl[16] = {-127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f, 1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f};
 
-static inline __attribute__((always_inline)) void q4k_accumulate(device const uchar* weights, uint nb, uint ib, uint first_row, ushort iq, ushort ir,
-                                                                 thread const float* yl, thread const float* yh, float4 sumy, thread float* sumf) {
+static inline __attribute__((always_inline)) void q4_k_accumulate(device const uchar* weights, uint nb, uint ib, uint first_row, ushort iq, ushort ir,
+                                                                  thread const float* yl, thread const float* yh, float4 sumy, thread float* sumf) {
   constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
   for (ushort row = 0; row < 2; ++row) {
     long o = long(first_row + row) * nb * 144 + ib * 144;
@@ -63,8 +63,8 @@ kernel void mlp_gate_up_q4_k_decode(device half* y [[buffer(0)]], device const h
       yh[i + 8] = float(src4[i + 160]);
       sumy[3] += yh[i + 8];
     }
-    q4k_accumulate(wg, nb, ib, first_row, iq, ir, yl, yh, sumy, gate);
-    q4k_accumulate(wu, nb, ib, first_row, iq, ir, yl, yh, sumy, up);
+    q4_k_accumulate(wg, nb, ib, first_row, iq, ir, yl, yh, sumy, gate);
+    q4_k_accumulate(wu, nb, ib, first_row, iq, ir, yl, yh, sumy, up);
     src4 += 4 * 256;
   }
 
@@ -77,9 +77,9 @@ kernel void mlp_gate_up_q4_k_decode(device half* y [[buffer(0)]], device const h
   }
 }
 
-static inline __attribute__((always_inline)) void q5k_accumulate(device const uchar* weights, uint nb, uint ib, uint row, ushort q_offset, ushort l0,
-                                                                 ushort iq, uchar hm1, uchar hm2, uchar hm3, uchar hm4, thread const float* yl,
-                                                                 thread const float* yh, float4 sumy, thread float& sumf) {
+static inline __attribute__((always_inline)) void q5_k_accumulate(device const uchar* weights, uint nb, uint ib, uint row, ushort q_offset, ushort l0,
+                                                                  ushort iq, uchar hm1, uchar hm2, uchar hm3, uchar hm4, thread const float* yl,
+                                                                  thread const float* yh, float4 sumy, thread float& sumf) {
   constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
   long o = long(row) * nb * 176 + ib * 176;
   device const uchar* q1 = weights + o + 48 + q_offset;
@@ -131,8 +131,8 @@ kernel void mlp_gate_up_q5_k_decode(device half* y [[buffer(0)]], device const h
       yh[l + 8] = float(src2[l + 32]);
       sumy += float4(yl[l], yl[l + 8], yh[l], yh[l + 8]);
     }
-    q5k_accumulate(wg, nb, ib, row, q_offset, l0, iq, hm1, hm2, hm3, hm4, yl, yh, sumy, gate);
-    q5k_accumulate(wu, nb, ib, row, q_offset, l0, iq, hm1, hm2, hm3, hm4, yl, yh, sumy, up);
+    q5_k_accumulate(wg, nb, ib, row, q_offset, l0, iq, hm1, hm2, hm3, hm4, yl, yh, sumy, gate);
+    q5_k_accumulate(wu, nb, ib, row, q_offset, l0, iq, hm1, hm2, hm3, hm4, yl, yh, sumy, up);
     src1 += 4 * 256;
   }
   float gate_sum = simd_sum(gate), up_sum = simd_sum(up);
@@ -142,9 +142,9 @@ kernel void mlp_gate_up_q5_k_decode(device half* y [[buffer(0)]], device const h
   }
 }
 
-static inline __attribute__((always_inline)) void iq4xs_accumulate(device const uchar* weights, uint nb, uint ib, uint first_row, ushort part,
-                                                                   ushort il, threadgroup const float* lookup, thread const float4* yl,
-                                                                   thread float* sumf) {
+static inline __attribute__((always_inline)) void iq4_xs_accumulate(device const uchar* weights, uint nb, uint ib, uint first_row, ushort part,
+                                                                    ushort il, threadgroup const float* lookup, thread const float4* yl,
+                                                                    thread float* sumf) {
   for (ushort row = 0; row < 2; ++row) {
     long o = long(first_row + row) * nb * 136 + ib * 136;
     device const uint* q4 = reinterpret_cast<device const uint*>(weights + o + 8 + 16 * part + 8 * il);
@@ -186,8 +186,8 @@ kernel void mlp_gate_up_iq4_xs_decode(device half* y [[buffer(0)]], device const
     yl[1] = float4(float(src[16]), float(src[17]), float(src[18]), float(src[19]));
     yl[2] = float4(float(src[4]), float(src[5]), float(src[6]), float(src[7]));
     yl[3] = float4(float(src[20]), float(src[21]), float(src[22]), float(src[23]));
-    iq4xs_accumulate(wg, nb, ib, first_row, part, il, lookup, yl, gate);
-    iq4xs_accumulate(wu, nb, ib, first_row, part, il, lookup, yl, up);
+    iq4_xs_accumulate(wg, nb, ib, first_row, part, il, lookup, yl, gate);
+    iq4_xs_accumulate(wu, nb, ib, first_row, part, il, lookup, yl, up);
     src += 2 * 256;
   }
   for (ushort row = 0; row < 2; ++row) {
@@ -254,10 +254,10 @@ kernel void gdn_causal_conv_candidates(device half* y [[buffer(0)]], device cons
 }
 
 [[max_total_threads_per_threadgroup(128)]]
-kernel void rmsnorm_gated_128(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const half* gate [[buffer(2)]],
-                              device const float* w [[buffer(3)]], uint3 lane3 [[thread_position_in_threadgroup]],
-                              uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
-                              uint3 group [[threadgroup_position_in_grid]]) {
+kernel void gated_rms_norm_128(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], device const half* gate [[buffer(2)]],
+                               device const float* w [[buffer(3)]], uint3 lane3 [[thread_position_in_threadgroup]],
+                               uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
+                               uint3 group [[threadgroup_position_in_grid]]) {
   uint d = lane3.x, row = group.y;
   threadgroup float scratch[5];
   float xv = float(x[row * GDN_D + d]), ss = simd_sum(xv * xv);
