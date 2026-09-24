@@ -18,8 +18,8 @@ struct Tensor {
   std::shared_ptr<MTL::Buffer> buffer;
   uint64_t offset = 0, bytes = 0;
 
-  Tensor view(uint64_t byteOffset, uint64_t byteCount) const {
-    return {buffer, offset + byteOffset, byteCount};
+  Tensor view(uint64_t start, uint64_t count, uint64_t stride = 1) const {
+    return {buffer, offset + start * stride, count * stride};
   }
 
   MTL::GPUAddress address() const {

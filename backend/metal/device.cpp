@@ -33,12 +33,15 @@ Device::Device(const std::filesystem::path& kernels) {
   residency = NS::TransferPtr(require(metalDevice->newResidencySet(descriptor.get(), &error), message(error)));
   event = NS::TransferPtr(require(metalDevice->newSharedEvent(), "shared event creation failed"));
   queue->addResidencySet(residency.get());
+  std::ifstream layout(kernels / "batch.hpp");
+  std::stringstream declarations;
+  declarations << layout.rdbuf();
   for (const auto& entry : std::filesystem::directory_iterator(kernels)) {
     if (entry.path().extension() != ".metal")
       continue;
     std::ifstream file(entry.path());
     std::stringstream stream;
-    stream << file.rdbuf();
+    stream << "#define INFENG_METAL\n" << declarations.str() << file.rdbuf();
     auto source = NS::String::string(stream.str().c_str(), NS::UTF8StringEncoding);
     libraries.push_back(
         NS::TransferPtr(require(metalDevice->newLibrary(source, nullptr, &error), entry.path().filename().string() + ": " + message(error))));
@@ -172,13 +175,13 @@ void SparseKV::ensure(uint32_t blocks) {
 }
 
 void SparseKV::map(uint32_t virtualBlock, uint32_t physicalBlock) {
-  MTL::Heap* heap = physicalBlock == UINT32_MAX ? nullptr : heaps[physicalBlock / blocksPerHeap].get();
-  uint32_t heapOffset = physicalBlock == UINT32_MAX ? 0 : physicalBlock % blocksPerHeap * tilesPerBlock;
-  auto mode = heap ? MTL::SparseTextureMappingModeMap : MTL::SparseTextureMappingModeUnmap;
+  MTL::Heap* heap = heaps[physicalBlock / blocksPerHeap].get();
+  uint32_t heapOffset = physicalBlock % blocksPerHeap * tilesPerBlock;
   using Operation = MTL4::UpdateSparseBufferMappingOperation;
   for (uint32_t resource = 0; resource < 2; ++resource) {
     auto operation = [&](uint32_t layer) {
-      return Operation{mode, NS::Range::Make(uint64_t(layer) * virtualBlocks + virtualBlock, 1), heap ? heapOffset + resource * layers + layer : 0};
+      return Operation{MTL::SparseTextureMappingModeMap, NS::Range::Make(uint64_t(layer) * virtualBlocks + virtualBlock, 1),
+                       heapOffset + resource * layers + layer};
     };
     Operation operations[]{operation(0), operation(1), operation(2), operation(3),  operation(4),  operation(5),  operation(6),
                            operation(7), operation(8), operation(9), operation(10), operation(11), operation(12), operation(13)};
