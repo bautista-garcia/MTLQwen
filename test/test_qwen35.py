@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import os
 import sys
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -145,10 +147,11 @@ def test_continuous_mixed_batch_and_prefix_restore():
     model.close()
 
 
-@pytest.mark.skipif(not DFLASH_WEIGHTS.exists(), reason="reference DFlash GGUF is unavailable")
-def test_dflash_greedy_contract_and_configuration():
-  model = InferenceEngine(WEIGHTS, draft_weights=DFLASH_WEIGHTS, max_context=1024)
-  assert model.drafter == "dflash"
+@pytest.mark.parametrize("draft_weights,drafter,mapped_mib", [(MTP_WEIGHTS, "mtp", 36), (DFLASH_WEIGHTS, "dflash", 56)])
+def test_speculative_greedy_contract_and_configuration(draft_weights, drafter, mapped_mib):
+  if not draft_weights.exists(): pytest.skip("reference drafter GGUF is unavailable")
+  model = InferenceEngine(WEIGHTS, draft_weights=draft_weights, max_context=1024)
+  assert model.drafter == drafter
   reference, actual = model.sequence(), model.sequence(speculative=True)
   extra = []
   try:
@@ -157,7 +160,7 @@ def test_dflash_greedy_contract_and_configuration():
     assert observed == expected
     counters = actual.speculative_counters()
     assert counters["drafted_tokens"] and counters["acceptance_rate"] >= 0.45
-    assert model.mapped_bytes == 56 << 20
+    assert model.mapped_bytes == mapped_mib << 20
 
     checkpoint, restored = model.sequence(speculative=True), model.sequence(speculative=True)
     extra += [checkpoint, restored]
@@ -171,6 +174,29 @@ def test_dflash_greedy_contract_and_configuration():
     for sequence in extra:
       sequence.close()
     model.close()
+
+
+def test_engine_lifetime_follows_sequences():
+  model = InferenceEngine(WEIGHTS, max_context=128)
+  sequence = model.sequence()
+  try:
+    cursor = sequence.append(DFLASH_MATH_PROMPT)
+    model.close()
+    assert sequence.read(cursor) == 8160
+  finally:
+    sequence.close()
+    model.close()
+
+
+def test_cyclic_gc_teardown():
+  model = InferenceEngine(WEIGHTS, max_context=128)
+  sequence = model.sequence()
+  references = weakref.ref(model), weakref.ref(sequence)
+  cycle = [model, sequence]
+  cycle.append(cycle)
+  del model, sequence, cycle
+  gc.collect()
+  assert all(reference() is None for reference in references)
 
 
 def test_invalid_drafter_weights():
@@ -187,11 +213,17 @@ def test_mixed_batch_sampling_matches_greedy(draft_weights):
     expected = complete(sequences[0], DFLASH_MATH_PROMPT, 12)
     sequences[0].close()
     # Top-k=1 exercises sampling and its packed RNG outputs with deterministic tokens.
-    sequences = [model.sequence(temperature=1.0, top_k=1, speculative=bool(row % 2)) for row in range(8)]
-    observed = parallel([lambda sequence=sequence: complete(sequence, DFLASH_MATH_PROMPT, 12) for sequence in sequences])
-    assert observed == [expected] * len(sequences)
-    if draft_weights is not None:
-      assert all(sequence.speculative_counters()["drafted_tokens"] for sequence in sequences[1::2])
+    for temperatures in ([1.0] * 8, [0.0, 1.0] * 4):
+      sequences = [model.sequence(temperature=temperature, top_k=1, speculative=bool(row % 3)) for row, temperature in enumerate(temperatures)]
+      observed = parallel([lambda sequence=sequence: complete(sequence, DFLASH_MATH_PROMPT, 12) for sequence in sequences])
+      assert observed == [expected] * len(sequences)
+      if draft_weights is not None:
+        assert all(sequence.speculative_counters()["drafted_tokens"] for row, sequence in enumerate(sequences) if row % 3)
+      for sequence in sequences:
+        sequence.close()
+    sequences = [model.sequence(temperature=1.0, top_k=1, stop_token_ids=[expected[0]], speculative=True)]
+    assert complete(sequences[0], DFLASH_MATH_PROMPT) == []
+    assert sequences[0].length == len(DFLASH_MATH_PROMPT)
   finally:
     for sequence in sequences:
       sequence.close()
@@ -214,22 +246,23 @@ def test_allocator_failure_is_atomic():
     model.close()
 
 
-def test_prefix_cache_sparse_aliases():
+@pytest.mark.parametrize("prompt_length", [520, 1032])
+def test_prefix_cache_sparse_aliases(prompt_length):
   model = InferenceEngine(WEIGHTS, max_context=4096)
   source = model.sequence()
   aliases = [model.sequence() for _ in range(4)]
-  prompt = list(range(1, 521))
+  prompt = list(range(1, prompt_length + 1))
   try:
     expected = one(source, prompt)
     mapped = model.mapped_bytes
     assert parallel([lambda sequence=sequence: one(sequence, prompt) for sequence in aliases]) == [expected] * len(aliases)
-    assert all(sequence.length == 520 for sequence in aliases) and model.mapped_bytes == mapped
+    assert all(sequence.length == prompt_length for sequence in aliases) and model.mapped_bytes == mapped
     source.close()
     for sequence in aliases:
       sequence.close()
     reused = model.sequence()
     try:
-      assert one(reused, prompt) == expected and reused.length >= 520
+      assert one(reused, prompt) == expected and reused.length >= prompt_length
     finally:
       reused.close()
   finally:
@@ -256,4 +289,47 @@ def test_sparse_pool_and_all_slots():
   finally:
     for sequence in sequences:
       sequence.close()
+    model.close()
+
+
+def test_evicted_prefix_is_recomputed():
+  model = InferenceEngine(WEIGHTS, max_context=1024)
+  sequence = model.sequence()
+  prompt = list(range(1, 521))
+  try:
+    expected = one(sequence, prompt)
+    sequence.close()
+    sequence = model.sequence()
+    one(sequence, list(range(2001, 2521)))
+    sequence.close()
+    sequence = model.sequence()
+    assert one(sequence, prompt) == expected and sequence.length == len(prompt)
+  finally:
+    sequence.close()
+    model.close()
+
+
+@pytest.mark.parametrize("draft_weights", [None, MTP_WEIGHTS, DFLASH_WEIGHTS], ids=["target", "mtp", "dflash"])
+def test_slot_reuse_during_generation(draft_weights):
+  model = InferenceEngine(WEIGHTS, draft_weights=draft_weights, max_context=1024)
+  prompts = [[row * 32 + token + 1 for token in range(16)] for row in range(4)]
+  expected = []
+  try:
+    for prompt in prompts:
+      sequence = model.sequence(speculative=True)
+      try:
+        expected.append(complete(sequence, prompt, 4))
+      finally:
+        sequence.close()
+
+    def cycle(row):
+      for _ in range(4):
+        sequence = model.sequence(speculative=True)
+        try:
+          assert complete(sequence, prompts[row], 4) == expected[row]
+        finally:
+          sequence.close()
+
+    parallel([lambda row=row: cycle(row) for row in range(4)])
+  finally:
     model.close()

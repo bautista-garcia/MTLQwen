@@ -14,12 +14,16 @@ Python creates one native `Engine`. During construction, C++:
 
 1. Maps the GGUF weights.
 2. Compiles the Metal source libraries and builds the required pipelines.
-3. Allocates model-wide control buffers, GDN state, RNG state, RoPE tables, and sparse virtual K/V buffers.
+3. Allocates model-wide control buffers, RNG state, RoPE tables, sparse virtual K/V buffers, and two state buffers per sequence slot.
 4. Starts the scheduler thread.
 
 An optional drafter GGUF is identified from its tensors: a combined MTP model replaces the target weights, while DFlash supplements them.
 
-GGUF tensors are indexed by name once; the forward definition references that index directly, without a separate set of layer-weight structs. Construction walks the same definition without GPU dispatches to resolve required weights and cache decode, small-prefill, and prefill pipelines and launch geometry. Gate/up decoding uses a fused MLP kernel instead of separate projections.
+GGUF tensors are indexed by name once; the forward definition references that index directly, without a separate set of layer-weight structs. Construction walks the same definition without GPU dispatches to resolve required weights and cache decode, small-prefill, and prefill pipelines and launch geometry. Gate/up decoding uses a fused MLP kernel. Prefill computes the gate first, then the up projection applies SiLU and multiplication while storing back into the gate buffer; it needs no separate up buffer or activation dispatch.
+
+A `Weight` is a `Tensor` with GGUF shape/type metadata and cached launch configurations. The same `weight()` lookup supplies both projections and ordinary kernel arguments; no separate tensor accessor is needed. `linear()` selects and caches the ordinary or gated projection kernel, so the decoder needs no separate fused-kernel dispatch path.
+
+`decoder()` contains the complete layer: normalization, attention or GDN, a shared output projection/residual addition, then normalization and the MLP/residual addition. Its attention/GDN branches no longer require separate single-use helpers.
 
 The state-bearing fields of the real `Engine` are:
 
@@ -34,25 +38,23 @@ struct Engine {
   Drafter drafter = Drafter::none;            // Active drafting strategy
   uint32_t draftWidth = 0;                     // Engine-wide proposal width
 
-  Tensor gdnStates[2], candidateStates;        // Persistent GDN banks and temporary speculative states
+  Tensor candidateStates;                     // Temporary speculative states
   Scratch workspace;                          // Fixed reusable forward-pass scratch
 
-  Tensor inputIds, batchKvValid;               // Packed input tokens and starting positions
-  Tensor queryStartLoc, draftPositions;        // Packed-query boundaries and MTP positions
-  Tensor sequenceSlots, stateBanks;            // Slot and current-bank metadata sent to kernels
-  Tensor draftTokens, outputTokens;            // Drafter input/proposals and target samples
-  Tensor rng, mtpSeeds, logitRows;              // Per-slot RNG, banked MTP seeds, and sampled row indices
+  Tensor requestData, queryData;                // Persistent requests and shared CPU/Metal query records
+  Tensor draftTokens, outputTokens;            // Drafter proposals and target samples
+  Tensor rng, sampledRng;                       // Committed RNG and candidate RNG
 
   std::vector<PhysicalBlock> blocks;            // Physical bundle reference and LRU metadata
-  std::vector<HybridCheckpoint> checkpointCache; // LRU-ordered prefix checkpoints with reusable state arenas
+  std::list<HybridCheckpoint> checkpointCache; // LRU-ordered prefix checkpoints with reusable state arenas
   std::array<Sequence*, maxBatchSequences> sequences{};            // Eight live-sequence slots
+  std::array<std::pair<Tensor, Tensor>, maxBatchSequences> statePool; // Each slot's committed state and reusable output
 
   std::mutex mutex;                             // Protects sequence and scheduler state
   std::condition_variable condition;            // Wakes the scheduler and blocked readers
   std::thread worker;                            // Continuous scheduler thread
-  bool closing = false, running = false;         // Engine shutdown and in-flight-pass state
+  bool closing = false;                         // Shutdown flag protected by mutex; Sequence.busy tracks in-flight work
   uint64_t clock = 0;                            // LRU clock for blocks and checkpoints
-  uint32_t physicalBlocks = 0;                   // Physical bundle IDs introduced so far
   uint64_t parameterCount = 0, modelBytes = 0;   // Model information exposed to Python
 };
 ```
@@ -78,18 +80,18 @@ The real `Sequence` is:
 ```cpp
 struct Sequence {
   Engine& engine;                    // Engine that owns the slot and executes this sequence
-  std::vector<int32_t> request;      // Prompt and generated tokens in exact model order
+  int32_t* request;                 // This slot's region of Engine.requestData
+  uint32_t requested = 0;            // Number of stored prompt and generated tokens
   std::vector<uint32_t> bindings;    // Logical K/V block -> physical bundle ID
   std::vector<int32_t> stops;        // Token IDs that end generation
-  std::exception_ptr error;          // Failure observed by Python on its next read
+  bool error = false;                // Capacity failure observed by Python on its next read
 
   uint64_t drafted = 0;              // Total proposals generated
   uint64_t accepted = 0;             // Total proposals accepted by the target
   uint64_t prefixHash = 0;            // Chained hash through the last committed checkpoint
   uint32_t kvValid = 0;               // Number of tokens committed to target K/V and GDN state
 
-  uint32_t slot;                      // Index in Engine.sequences and all per-slot GPU state
-  uint32_t bank = 0;                  // GDN bank containing the current committed state
+  uint32_t slot;                      // Index in Engine.sequences, statePool, sparse K/V, and RNG
   float temperature, topP;            // Fixed sampling configuration
   int32_t topK;                        // Fixed sampling candidate limit
   bool speculative;                   // Whether this sequence uses the engine's drafter
@@ -103,18 +105,18 @@ Creation allocates no physical K/V memory. `bindings` starts empty and grows wit
 
 The Python frontend tokenizes text and passes token IDs to `Sequence.append()`. C++:
 
-1. Appends the IDs to `Sequence.request`.
+1. Appends the IDs to `Sequence.request`, the slot's persistent CPU/GPU-shared token array.
 2. Sets `active = true`.
 3. Wakes the scheduler.
-4. Returns `request.size()` as Python's first output cursor.
+4. Returns `requested` as Python's first output cursor.
 
 The central invariant is:
 
 ```text
 request[0 : kvValid]  has completed the target pass
-request[kvValid : ]   still requires a target pass
+request[kvValid : requested]   still requires a target pass
 
-0 <= kvValid <= request.size()
+0 <= kvValid <= requested
 ```
 
 The sequence is ready for scheduling when:
@@ -139,14 +141,13 @@ The real `Batch` is:
 
 ```cpp
 struct Batch {
-  std::array<Query, maxBatchSequences> queries{}; // One query per selected sequence
+  GpuQuery* queries = nullptr;                   // Target records in the shared query buffer
   uint32_t size = 0;                              // Number of selected sequences
   uint32_t candidateRows = 0;                     // Temporary states required by speculative queries
-  uint32_t rows = 0, packed = 0, logits = 0;       // Current pass's token, query, and sampled-row counts
-  uint32_t maxQuery = 0;                          // Largest query; selects decode or prefill kernels
-  void pack(Engine&, bool drafting);              // Packs target or drafter inputs and metadata
 };
 ```
+
+Token counts and kernel-selection flags belong to the current forward pass, not the scheduled batch. Each pass computes them while packing its queries.
 
 The same scan restores cached prefixes, finalizes generation queries, and records prompt queries in a local worklist for fair allocation.
 
@@ -154,15 +155,14 @@ The same scan restores cached prefixes, finalizes generation queries, and record
 
 Only a selected sequence with `kvValid == 0` performs prefix lookup.
 
-The engine hashes and queries consecutive 512-token checkpoints. A cache hit must leave at least one request token for a target pass.
+The engine incrementally hashes consecutive 512-token blocks and compares each prefix hash against its eight-entry checkpoint cache, selecting the deepest matching checkpoint. A cache hit must leave at least one request token for a target pass.
 
 For the deepest usable hit, C++:
 
-1. Copies the cached GDN state into bank 0.
-2. Restores the bank-0 MTP seed when MTP is active.
-3. Maps the cached physical K/V bundles into this sequence's slot.
-4. Records those bundle IDs in `Sequence.bindings`.
-5. Sets `bank = 0` and advances `kvValid` to the checkpoint boundary.
+1. Shares the cached immutable state, including its MTP seed when applicable.
+2. Maps the cached physical K/V bundles into this sequence's slot.
+3. Records those bundle IDs in `Sequence.bindings`.
+4. Restores `prefixHash` and advances `kvValid` to the checkpoint boundary.
 
 Without a hit, `kvValid` remains zero.
 
@@ -171,7 +171,7 @@ Without a hit, `kvValid` remains zero.
 After prefix restoration, the scheduler computes:
 
 ```text
-pending = request.size() - kvValid
+pending = requested - kvValid
 
 pending > 1  prompt processing
 pending == 1 ordinary decode or speculative verification
@@ -200,29 +200,24 @@ query end          <= next 512-token checkpoint boundary
 
 The engine owns one proposal width: 2 for MTP or 7 for DFlash. A generation query uses it only when its sequence enables speculation and the full verification query fits before the next checkpoint.
 
-The real `Query` is:
+The scheduler writes the target `GpuQuery` records directly. The scheduling fields are:
 
-```cpp
-struct Query {
-  Sequence* sequence = nullptr; // Persistent state advanced by this query
-  uint32_t pending = 1;         // Request tokens not yet processed by the target
-  uint32_t room = 1;            // Rows available before the next checkpoint
-  uint32_t count = 1;           // Target rows: prompt chunk, one anchor, or anchor + proposals
-  uint32_t logit = unbound;     // Offset in sampled results; unbound for an intermediate prompt chunk
-  uint32_t state = unbound;     // First row in candidateStates; unbound when not speculative
-};
+```text
+slot   identifies the owning Sequence
+count  target rows: prompt chunk, one anchor, or anchor + proposals
+state  first candidate row, or unbound for non-speculative work
 ```
 
-`Query` and `Batch` exist only for this pass. Tokens, K/V bindings, GDN state, and sampling configuration remain owned by `Sequence` and `Engine`.
+The records are reused each pass. Pending-token count and checkpoint room are scheduler locals, not stored query state. Packing fills row offsets and sample counts; an intermediate prompt chunk has zero samples. Tokens, K/V bindings, GDN state, and sampling configuration remain owned by `Sequence` and `Engine`.
 
 ### 7. Reserve and bind sparse K/V memory
 
-Now that every `Query.count` is known, `Engine::reserve()` calculates the 128-token logical blocks touched by the batch.
+Now that every `GpuQuery.count` is known, `Engine::reserve()` calculates the 128-token logical blocks touched by the batch.
 
 For each unbound logical block, C++:
 
-1. Adds physical heap capacity if required.
-2. Acquires a free or evictable physical K/V bundle.
+1. Selects the least recently used unreferenced bundle; untouched bundles have timestamp zero and are selected first.
+2. Adds physical heap capacity if required and invalidates cached prefixes that reference the selected bundle.
 3. Installs the Metal sparse mappings for every K/V layer.
 4. Stores the bundle ID in `Sequence.bindings[logicalBlock]`.
 
@@ -235,39 +230,46 @@ bindings[logicalBlock] = physicalBundleId
 
 `bindings` does not contain addresses. It is CPU metadata describing which physical bundle backs each logical block. `SparseKV::map()` installs the actual virtual-tile-to-physical-tile mappings used by Metal's MMU.
 
-All required mappings exist before any model kernel runs.
+All required mappings exist before any model kernel runs. Reservation runs under the scheduler mutex, which also protects sequence destruction and block reference counts. The scheduler releases that lock before executing the model; an allocation failure skips execution and is reported to every sequence in the batch.
 
-### 8. Pack inputs and kernel metadata
+After GPU execution, one locked pass commits results, handles cancellation/errors, publishes checkpoints, and clears busy flags. Candidate copies finish before that lock is released and waiting callers are notified.
 
-`Batch::pack()` packs target tokens into `Engine.inputIds`, or speculative queries into `Engine.draftTokens` for the drafter, and builds one prefix sum:
+### 8. Describe packed rows
+
+At the start of `forward()`, C++ writes one `GpuQuery` record per packed query, using the layout shared with Metal in `backend/metal/kernel/batch.hpp`. Embedding reads prompt tokens and anchors directly from the slot's region of `Engine.requestData`; speculative proposals come from the GPU-written draft buffer. There is no per-pass token copy.
 
 ```text
-queryStartLoc[0] = 0
-queryStartLoc[i + 1] = queryStartLoc[i] + query[i].count
+previous  GPU address of committed state, or zero for a fresh sequence
+next      GPU address of output state or the first candidate
+start     first packed row
+count     number of packed rows
+position  absolute starting token position
+slot      sparse K/V and RNG slot
+state     first speculative candidate row, or unbound
+logit     first sampled output row
+samples   sampled output count
+temperature, topP, topK   per-sequence sampling settings
 ```
 
 For example:
 
 ```text
-queryStartLoc = [0, 3, 4]
+queries = [{slot: 2, start: 0, count: 3}, {slot: 5, start: 3, count: 1}]
 
-query 0 uses inputIds[0 : 3]
-query 1 uses inputIds[3 : 4]
+query 0 fills hidden rows [0 : 3] from slot 2's request
+query 1 fills hidden row  [3 : 4] from slot 5's request
 ```
 
-The complete per-pass metadata is:
+The shared input and metadata tensors are:
 
 ```text
-inputIds       packed input and proposal tokens
-queryStartLoc  start and end of every packed query
-batchKvValid   starting token position of every query
-sequenceSlots  slot containing each query's sparse K/V, GDN state, and RNG
-stateBanks     current Sequence.bank for every query
-logitRows      packed rows that require sampling
-draftPositions absolute positions used by MTP proposals
+requestData    eight persistent request regions, each maxContext + 1 tokens
+queryData      separate target and drafter GpuQuery records
 ```
 
-Kernels never receive a `Sequence*` or `Query*`. C++ translates their state into these flat buffers, tensor views, and scalar arguments.
+The scheduler and target kernels share the same records; `slot` identifies the CPU-owned sequence without exposing a `Sequence*` to Metal. Frame zero holds immutable target records and frame one holds drafter records. MTP sampling advances its drafter positions on the GPU for the next step, while keeping the committed-state address unchanged (zero means no previous state). It needs no per-step metadata copies. State buffers remain resident and owned throughout the pass. Kernels share the row-to-query lookup instead of implementing it independently.
+
+Every speculative query reserves the same `draftWidth + 1` candidate rows. Its candidate offset divided by that count already gives its packed drafter index; packing does not maintain a second counter.
 
 ### 9. Optionally produce draft proposals
 
@@ -283,16 +285,18 @@ MTP starts from the anchor and the committed MTP seed. Its single layer generate
 
 #### DFlash
 
-DFlash packs each speculative query as an anchor followed by mask tokens. Its six layers process that packed input once and write the greedy proposals into `Engine.draftTokens`.
+DFlash embedding reads the query's anchor and uses mask tokens for its remaining rows. Its six layers process that packed input once and write the greedy proposals into `Engine.draftTokens`.
 
 All three branches now join the same target pass.
+
+Drafting and target verification are encoded into one command buffer and submitted together. There is no CPU proposal-copy step or GPU wait between them. Separate target/drafter frames prevent MTP's position updates from changing target metadata; the existing dispatch barriers order consecutive draft steps. Sampling derives its output layout from the pass type and query sample counts, rather than receiving separate grouping and stride settings.
 
 ### 10. Run the target model
 
 The target input for each query is:
 
 ```text
-prompt query      next Query.count request tokens
+prompt query      next GpuQuery.count request tokens
 ordinary decode  one pending anchor
 speculative       anchor followed by draft proposals
 ```
@@ -302,27 +306,29 @@ C++ binds the packed metadata, model weights, reusable scratch, GDN buffers, and
 1. Embeds the packed rows.
 2. Runs 24 GDN layers and 8 full-attention layers.
 3. Writes target K/V through the sequence's sparse virtual addresses.
-4. Produces logits only for the rows marked by `logitRows`.
-5. Samples with greedy argmax or the sequence's fixed sampling configuration.
+4. Produces logits for each query's trailing `samples` rows. Output normalization reads those rows directly through the query records, without a separate gather copy.
+5. Uses one sampling dispatch, with each query choosing greedy argmax or its fixed sampling configuration. Draft proposals always use argmax.
 6. Updates persistent drafter K/V and MTP seed data when applicable.
 
-Attention uses `sequenceSlots` and token positions to address K/V. Metal's MMU follows the mappings installed in step 7.
+Attention uses the query record's slot and position to address K/V. Metal's MMU follows the mappings installed in step 7.
 
-GDN uses two persistent banks per slot:
+Persistent drafter K/V uses one kernel body specialized for MTP's 256-wide heads and DFlash's 128-wide heads. Each specialization keeps its original normalization and FP16 rounding behavior. The launch covers exactly the packed rows, so the store needs no separate row-count argument or bounds branch.
+
+GDN uses two engine-owned buffers for each sequence slot:
 
 ```text
-read bank  = Sequence.bank
-write bank = 1 - Sequence.bank
+read  = Engine.statePool[slot].first
+write = Engine.statePool[slot].second
 ```
 
 ### 11. Commit the result and select speculative candidates
 
-Every successful query switches banks, whether it processed a prompt, ordinary decode, or speculative verification.
+Every successful query swaps the current and next buffers within its slot, whether it processed a prompt, ordinary decode, or speculative verification. Before scheduling a write, the engine replaces the output buffer if a checkpoint or another slot still references it. This keeps shared prefixes immutable without copying their contents. The pool owns both buffers throughout: sequence creation and close neither transfer them nor allocate replacements. The scheduler is the only runtime writer of GPU-resource ownership; sequence lifetime changes only touch CPU bookkeeping.
 
 For non-speculative work, GDN kernels write the final state directly into:
 
 ```text
-Engine.gdnStates[1 - Sequence.bank]
+Engine.statePool[slot].second
 ```
 
 For speculative work, every verified position could become the accepted endpoint. GDN therefore writes one state after the anchor and one after each proposal into one engine-owned buffer shared by the speculative queries in that pass:
@@ -331,45 +337,45 @@ For speculative work, every verified position could become the accepted endpoint
 Engine.candidateStates
 ```
 
-Each candidate row contains the convolution and recurrent state of all 24 GDN layers. The buffer uses private GPU storage; “shared” here means that all queries use the same allocation.
+Each state row contains the convolution and recurrent state of all 24 GDN layers, stored contiguously in layer order, followed by an 8 KiB MTP seed. The seed space is unused without MTP (less than 0.02% overhead). Sequences, prefix checkpoints, and candidates use the same layout. Prefix save/restore shares ownership without a GPU copy. MTP fusion writes each candidate's seed alongside its state, so speculative commit is one complete-record copy. The buffers use private GPU storage; “shared” here refers to ownership, not CPU-accessible memory.
 
-The candidate location is carried by `Query.state`:
+The candidate location is carried by `GpuQuery.state`:
 
 ```text
-candidate selected for A accepted proposals = Query.state + A
+candidate selected for A accepted proposals = GpuQuery.state + A
 ```
 
-After target samples are compared with the proposals, C++ copies that candidate into `gdnStates[1 - bank]`. Rejected candidates are ignored.
+After target samples are compared with the proposals, C++ copies that candidate into the slot's output buffer. Rejected candidates are ignored. Each layer runs one batched convolution dispatch and at most one dispatch per recurrence algorithm. Convolution writes Q/K/V directly; no intermediate split/repeat buffer or kernel is needed. The sequential recurrence handles either one ordinary token or successive proposal states. Prefill keeps its matrix-based recurrence.
 
-`stateBanks` contains the current bank bit packed for GPU work. It does not contain candidate states or candidate offsets; those live in `candidateStates` and `Query.state` respectively.
+`GpuQuery.previous` and `next` locate the state buffers; `GpuQuery.state` identifies its speculative candidate range in `candidateStates`.
 
 C++ then commits each sequence:
 
 ```text
-prompt or ordinary  kvValid += Query.count
+prompt or ordinary  kvValid += GpuQuery.count
 speculative         kvValid += 1 anchor + accepted proposals
 
 append sampled or accepted tokens to request
-update RNG and speculative counters
-bank ^= 1
+commit the RNG state of the last emitted sample and update speculative counters
+swap(statePool[slot].first, statePool[slot].second)
 ```
 
-After the flip, `bank` names the newly committed GDN state. MTP seeds follow the same bank bit.
+After the swap, `state` owns the newly committed GDN state and MTP seed.
 
 The commit restores the invariant before readers are notified:
 
 ```text
 request[0 : kvValid]  has valid target K/V and GDN state
-request[kvValid : ]   is pending work
+request[kvValid : requested]   is pending work
 ```
 
-At an exact 512-token boundary, the engine extends the sequence's prefix hash and may publish a new prefix checkpoint.
+At an exact 512-token boundary, the engine extends `prefixHash` with the newly committed block and may publish a new prefix checkpoint.
 
 ### 12. Continue, stream, or stop
 
-If the sequence remains active and `request.size() > kvValid`, the scheduler discovers it in the next scan. This single rule drives prompt continuation, ordinary decoding, and speculative verification; no explicit requeue exists.
+If the sequence remains active and `requested > kvValid`, the scheduler discovers it in the next scan. This single rule drives prompt continuation, ordinary decoding, and speculative verification; no explicit requeue exists.
 
-Generated tokens are already appended to `Sequence.request`. Python calls:
+Generated tokens are already appended to `Sequence.request`, the slot's persistent CPU/GPU-shared token array. Python calls:
 
 ```python
 token = sequence.read(cursor)
@@ -395,11 +401,11 @@ Closing a sequence:
 
 1. Clears `active`.
 2. Waits for its in-flight batch, if any.
-3. Unmaps every bundle recorded in `Sequence.bindings`.
-4. Decrements the physical bundle reference counts.
-5. Clears `Engine.sequences[slot]`.
+3. Decrements the physical bundle reference counts recorded in `Sequence.bindings`.
+4. Clears `Engine.sequences[slot]`.
+5. Releases its native ownership reference to the engine; the slot's state buffers remain in the pool for reuse.
 
-The slot can then be reused by another sequence.
+The slot can then be reused by another sequence. Inactive K/V aliases remain mapped but are never read; reservation replaces each mapping before the new sequence uses it. Physical heaps remain owned by the engine, so unmapping at sequence close would not free their allocation. Native ownership consists of the engine API handle plus one reference per live sequence. Closing the engine handle does not destroy resources still owned by sequences; the last release stops the worker and destroys the engine. This also makes Python cyclic-GC finalizer order safe.
 
 ## Appendix A: sparse K/V memory
 
@@ -460,13 +466,13 @@ Attention K/V alone cannot restore Qwen3.5 because its GDN layers also carry rec
 
 ```cpp
 struct HybridCheckpoint {
-  uint64_t hash = 0;              // Chained token-prefix hash
-  Tensor arena;                   // Copied GDN state and optional MTP seed
+  uint64_t hash = 0;             // Chained hash of the entire prefix
+  Tensor arena;                   // Shared immutable GDN state and optional MTP seed
   std::vector<uint32_t> bindings; // Physical bundle IDs through the boundary
 };
 ```
 
-Hashes are chained from block zero, so a cache entry identifies the entire preceding token prefix. The cache is ordered from least to most recently used, retains up to eight checkpoints, and reuses the oldest entry's state arena.
+Hashes are chained from the first block, so each key represents the entire preceding prefix without storing its tokens. Lookup scans the eight-entry list; this is not an indexed hash map. As in the original implementation, matches rely on a 64-bit hash without token verification, so collisions are possible. A list keeps entries ordered from least to most recently used; promotion relinks the existing entry without moving its state reference. Evicting an entry releases its state reference; live sequences retain their own references. Hash lookup is independent of immutable buffer sharing: publishing and restoring a checkpoint still require no GPU state copy.
 
 ## Appendix C: weights and pipelines
 
@@ -492,19 +498,18 @@ full-attention    8
 
 ## Appendix D: reusable and temporary buffers
 
-`Engine.workspace` holds fixed `Scratch` buffers sized once for the 128-token batch limit. Every pass reuses them; there is no arena-offset bookkeeping. `draftContext` stores either MTP's target hidden states or DFlash's eight captured features, depending on the engine's drafter.
+`Engine.workspace` holds fixed `Scratch` buffers sized once for the 128-token batch limit. Every pass reuses them; there is no arena-offset bookkeeping. A decoder updates `hidden` in place for both residual additions: each projection reads its features from separate scratch and adds only the corresponding old hidden element to its output. Dispatch barriers order these stages, so neither an intermediate `mid` buffer nor alternating hidden buffers are needed. `draftContext` is allocated only for DFlash's eight captured features. MTP consumes the target's final hidden buffer directly after sampling: embedding and sampling do not overwrite it, and the fusion kernel finishes reading it before the next projection reuses the buffer.
 
 ```cpp
 struct Scratch {
-  Tensor hidden[2], norm, temporary, mlpGate, mlpUp;
+  Tensor hidden, norm, temporary, mlpGate;
   Tensor mixed, q, k, v, attnQRope, attnKRope, attnPartials;
-  Tensor gdnB, gdnG, gdnConvolved;
-  Tensor mid, draftContext, targetLogits;
-  void allocate(Device&, Drafter);             // Allocates fixed buffers once
+  Tensor gdnB, gdnG;
+  Tensor draftContext, targetLogits;
 };
 ```
 
-`Engine.candidateStates` is also grow-only, but contains meaningful data only during speculative verification. It is shared by every speculative query in the current pass; their `Query.state` offsets keep the ranges separate.
+`Engine.candidateStates` is also grow-only, but contains meaningful data only during speculative verification. It is shared by every speculative query in the current pass; their `GpuQuery.state` offsets keep the ranges separate.
 
 The control tensors are small shared-memory buffers written by C++ and read directly by Metal. Weights, GDN states, sparse K/V, candidates, and most scratch storage use private GPU memory.
 
@@ -533,9 +538,9 @@ The frontend owns one tokenizer and performs chat templating, encoding, and deco
 
 ```text
 runtime/inference.py          Python API and C ABI bindings
-runtime/engine.cpp            engine lifecycle, scheduler, input packing, cache, commit, and C API
+runtime/engine.cpp            engine lifecycle, scheduler, cache, commit, and C API
 model/qwen35/qwen35.hpp       engine, sequence, batch, and model state
-model/qwen35/forward.cpp      GGUF weight index, cached pipelines, and unified target/MTP/DFlash forward definition
+model/qwen35/forward.cpp      weights, scratch allocation, query metadata, and unified target/MTP/DFlash forward definition
 backend/metal/device.cpp      Metal commands and sparse allocation
 backend/metal/kernel/*.metal  GPU kernels
 ```
