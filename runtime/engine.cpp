@@ -311,32 +311,22 @@ bool Engine::execute(Batch& batch) {
     bool speculative = query.state != unbound;
     uint32_t accepted = 0;
     bool stopped = false;
-    auto isStop = [&](int32_t token) { return std::find(sequence.stops.begin(), sequence.stops.end(), token) != sequence.stops.end(); };
-    if (speculative) {
-      uint32_t draftRow = query.state / query.count;
-      while (accepted < draftWidth && sampled[query.logit + accepted] == proposed[(accepted + 1) * maxBatchSequences + draftRow]) {
-        int32_t token = proposed[(accepted + 1) * maxBatchSequences + draftRow];
-        sequence.request.push_back(token);
-        ++accepted;
-        if ((stopped = isStop(token)))
+      for (uint32_t i = 0; i < query.samples && !stopped; ++i) {
+        int32_t token = sampled[query.logit + i];
+        sequence.request[sequence.requested++] = token;
+        if (sequence.temperature > 0)
+          rng.contents<uint64_t>()[sequence.slot] = sampledRng.contents<uint64_t>()[query.logit + i];
+        stopped = std::find(sequence.stops.begin(), sequence.stops.end(), token) != sequence.stops.end();
+        if (!speculative || i == draftWidth || token != proposed[(i + 1) * maxBatchSequences + query.state / query.count])
           break;
+        ++accepted;
       }
-      copyState(*copies,
-                {candidateStates, query.state + accepted,
-                 drafter == Drafter::mtp ? workspace.draftContext.view(uint64_t(query.start + accepted) * 8192, 8192) : Tensor{}},
-                {gdnStates[1 - sequence.bank], sequence.slot, drafter == Drafter::mtp ? mtpSeed(*this, sequence, 1 - sequence.bank) : Tensor{}});
-    }
-    if (sequence.temperature > 0 && query.logit != unbound)
-      rng.contents<uint64_t>()[sequence.slot] = sampledRng.contents<uint64_t>()[query.logit + accepted - stopped];
-    if (query.logit != unbound && !stopped) {
-      int32_t token = sampled[query.logit + accepted];
-      sequence.request.push_back(token);
-      stopped = isStop(token);
-    }
+      if (speculative)
+        copies->copy(candidateStates.view(query.state + accepted, 1, stateBytes), statePool[query.slot].second);
     sequence.kvValid += speculative ? 1 + accepted : query.count;
     sequence.drafted += speculative ? draftWidth : 0;
     sequence.accepted += accepted;
-    sequence.bank ^= 1;
+      std::swap(statePool[query.slot].first, statePool[query.slot].second);
     sequence.active = sequence.kvValid < maxContext && !stopped;
   }
   if (copies)
