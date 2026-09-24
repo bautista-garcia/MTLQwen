@@ -31,7 +31,7 @@ struct Ops {
   uint32_t rows = batch.rows, source = 0;
   bool decode = batch.maxQuery <= maxDecodeRows;
   std::string prefix;
-  Tensor positions = engine.batchKvValid;
+  Tensor queries;
 
   Weight& weight(const std::string& name, uint32_t from = unbound) {
     std::string key = from == unbound ? prefix + name : name;
@@ -180,31 +180,37 @@ void Engine::loadModel(const std::filesystem::path& path, const std::filesystem:
   device.commit();
 }
 
-void Scratch::allocate(Device& device, Drafter drafter) {
-  uint64_t h = uint64_t(maxBatchTokens) * 8192;
-  auto allocate = [&](uint64_t bytes, std::initializer_list<Tensor*> buffers) {
-    for (Tensor* tensor : buffers)
-      *tensor = device.empty(bytes);
-  };
-  allocate(h, {&hidden[0], &hidden[1], &norm, &temporary, &q, &k, &v, &attnQRope, &mid});
-  allocate(3 * h, {&mlpGate, &mlpUp});
-  allocate(2 * h, {&mixed, &gdnConvolved});
-  attnKRope = device.empty(h / 4);
-  attnPartials = device.empty(uint64_t(maxBatchTokens) * 32 * 130 * 4);
-  gdnB = device.empty(maxBatchTokens * 64);
-  gdnG = device.empty(maxBatchTokens * 128);
-  if (drafter != Drafter::none)
-    draftContext = device.empty(h * (drafter == Drafter::mtp ? 1 : 8));
-  targetLogits = device.empty(uint64_t(maxLogitRows) * vocabSize * 2);
-}
-
-void forward(Engine& engine, Batch& batch, bool drafting, bool prepare) {
+void forward(Engine& engine, const Batch& batch, bool drafting, uint32_t prepareRows) {
   bool dflash = engine.drafter == Drafter::dflash;
-  uint32_t rows = batch.rows, width = engine.draftWidth, count = drafting ? batch.packed * (dflash ? width : 1) : batch.logits;
+  Ops ops{engine, batch, prepareRows};
+  uint32_t count = std::min(prepareRows, maxLogitRows);
+  if (!ops.preparing) {
+    for (uint32_t row = 0; row < batch.size; ++row) {
+      GpuQuery query = batch.queries[row];
+      bool speculative = query.state != unbound;
+      if (drafting && !speculative)
+        continue;
+      uint32_t packed = drafting ? query.state / query.count : row;
+      const Sequence& sequence = *engine.sequences[query.slot];
+      const auto& [state, nextState] = engine.statePool[query.slot];
+      query.start = ops.rows;
+      query.count = drafting && !dflash ? 1 : query.count;
+      query.samples = drafting ? (dflash ? engine.draftWidth : 1) : speculative ? query.count : query.position + query.count == sequence.requested;
+      ops.sequential |= speculative || query.count == 1;
+      ops.prefill |= !speculative && query.count > 1;
+      query.previous = query.position ? state.address() : 0;
+      query.next = speculative ? engine.candidateStates.address() + query.state * stateBytes : nextState.address();
+      query.logit = count;
+      batch.queries[drafting * maxBatchSequences + packed] = query;
+      count += query.samples;
+      ops.rows += query.count;
+      ops.decode &= query.count <= maxDecodeRows;
+    }
+  }
+  uint32_t rows = ops.rows, width = engine.draftWidth;
   Scratch& scratch = engine.workspace;
-  if (!prepare)
-    engine.device.command();
-  Ops ops{engine, batch, prepare};
+  ops.queries = engine.queryData.view(drafting, 1, maxBatchSequences * sizeof(GpuQuery));
+  const Tensor& hidden = scratch.hidden;
   for (uint32_t step = 0; step < (drafting && !dflash ? width : 1); ++step) {
     Tensor hidden = scratch.hidden[0];
     if (drafting && !dflash) {

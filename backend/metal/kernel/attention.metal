@@ -15,8 +15,7 @@ static inline ulong kv_offset(uint slot, uint slot_stride, uint token, uint head
 kernel void attention_prepare(device half* q [[buffer(0)]], device half* k [[buffer(1)]], device const half* qg [[buffer(2)]],
                               device const half* raw_k [[buffer(3)]], device const float* q_norm [[buffer(4)]],
                               device const float* k_norm [[buffer(5)]], device const half2* rope [[buffer(6)]],
-                              device const uint* positions [[buffer(7)]], device const uint* query_start_loc [[buffer(8)]],
-                              constant uint& batch_size [[buffer(9)]], uint3 lane3 [[thread_position_in_threadgroup]],
+                              device const GpuQuery* queries [[buffer(7)]], uint3 lane3 [[thread_position_in_threadgroup]],
                               uint simd_lane [[thread_index_in_simdgroup]], uint simd_index [[simdgroup_index_in_threadgroup]],
                               uint3 group [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x, head_row = group.y, row = head_row / 20, head = head_row % 20;
@@ -39,10 +38,8 @@ kernel void attention_prepare(device half* q [[buffer(0)]], device half* k [[buf
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   half normalized = half(value * scale * weight[lane]), result = normalized;
-  uint batch = 0;
-  while (batch + 1 < batch_size && row >= query_start_loc[batch + 1])
-    ++batch;
-  uint position = positions[batch] + row - query_start_loc[batch];
+  device const GpuQuery& info = queryRow(queries, row);
+  uint position = info.position + row - info.start;
   if (lane < 64) {
     uint other = lane < 32 ? lane + 32 : lane - 32, pair = lane & 31;
     half paired = half(float(source[source_base + other]) * scale * weight[other]);
@@ -94,19 +91,15 @@ kernel void mtp_store_kv(device half* cache_k [[buffer(0)]], device half* cache_
 [[max_total_threads_per_threadgroup(128)]]
 kernel void attention_scan(device float* partials [[buffer(0)]], device const half* q [[buffer(1)]], device const half* k [[buffer(2)]],
                            device const half* v [[buffer(3)]], device half* cache_k [[buffer(4)]], device half* cache_v [[buffer(5)]],
-                           device const uint* slots [[buffer(6)]], device const uint* query_positions [[buffer(7)]],
-                           device const uint* query_start_loc [[buffer(8)]], constant uint& batch_size [[buffer(9)]],
-                           constant uint& rows [[buffer(10)]], constant uint& slot_stride [[buffer(11)]], constant uint& splits [[buffer(12)]],
-                           constant uint& sliding [[buffer(13)]], uint simd_lane [[thread_index_in_simdgroup]],
+                           device const GpuQuery* queries [[buffer(6)]], constant uint& rows [[buffer(7)]], constant uint& slot_stride [[buffer(8)]],
+                           constant uint& splits [[buffer(9)]], constant uint& sliding [[buffer(10)]], uint simd_lane [[thread_index_in_simdgroup]],
                            uint simd_index [[simdgroup_index_in_threadgroup]], uint3 threadgroup_position [[threadgroup_position_in_grid]]) {
   uint item = threadgroup_position.x, split = item % splits, head_row = item / splits;
   uint q_head = head_row % Q_HEADS, row = head_row / Q_HEADS;
   if (row >= rows)
     return;
-  uint batch = 0;
-  while (batch + 1 < batch_size && row >= query_start_loc[batch + 1])
-    ++batch;
-  uint start = query_start_loc[batch], q_position = row - start, cached_tokens = query_positions[batch];
+  device const GpuQuery& info = queryRow(queries, row);
+  uint start = info.start, q_position = row - start, cached_tokens = info.position;
   uint kv_head = q_head / Q_HEADS_PER_KV_HEAD, attended_tokens = cached_tokens + q_position + 1;
   uint split_begin = attended_tokens * split / splits, split_end = attended_tokens * (split + 1) / splits;
   uint q_offset = (row * Q_HEADS + q_head) * HEAD_DIM;
@@ -119,7 +112,7 @@ kernel void attention_scan(device float* partials [[buffer(0)]], device const ha
     for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32)
       q_shared[dim] = q[q_offset + dim];
     if (!split && q_head % Q_HEADS_PER_KV_HEAD == 0) {
-      ulong cache_offset = kv_offset(slots[batch], slot_stride, cached_tokens + q_position, kv_head);
+      ulong cache_offset = kv_offset(info.slot, slot_stride, cached_tokens + q_position, kv_head);
       uint token_offset = (row * KV_HEADS + kv_head) * HEAD_DIM;
       for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32) {
         cache_k[cache_offset + dim] = k[token_offset + dim];
@@ -133,7 +126,7 @@ kernel void attention_scan(device float* partials [[buffer(0)]], device const ha
   for (uint token = split_begin + simd_index; token < split_end; token += SIMDGROUPS_PER_THREADGROUP) {
     bool current_chunk = token >= cached_tokens;
     ulong item_offset =
-        current_chunk ? ((start + token - cached_tokens) * KV_HEADS + kv_head) * HEAD_DIM : kv_offset(slots[batch], slot_stride, token, kv_head);
+        current_chunk ? ((start + token - cached_tokens) * KV_HEADS + kv_head) * HEAD_DIM : kv_offset(info.slot, slot_stride, token, kv_head);
     float score = 0.0f;
     for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32)
       score = fma(float(q_shared[dim]), float(current_chunk ? k[item_offset + dim] : cache_k[item_offset + dim]), score);
