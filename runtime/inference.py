@@ -10,7 +10,7 @@ MAX_BATCH, VOCAB = 8, 248320
 
 def _load():
   # rebuilds c++ engine (only if src has changed)
-  headers = [*ROOT.glob("backend/metal/*.hpp"), *(ROOT / "model").rglob("*.hpp"), *(ROOT / "third_party/metal-cpp").rglob("*.hpp")]
+  headers = [*(ROOT / "backend/metal").rglob("*.hpp"), *(ROOT / "model").rglob("*.hpp"), *(ROOT / "third_party/metal-cpp").rglob("*.hpp")]
   if not LIB.exists() or any(path.stat().st_mtime > LIB.stat().st_mtime for path in [*SOURCES, *headers]):
     LIB.parent.mkdir(parents=True, exist_ok=True)
     ggml = subprocess.check_output(["pkg-config", "--cflags", "--libs", "ggml"], text=True).split()
