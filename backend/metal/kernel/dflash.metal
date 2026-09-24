@@ -21,8 +21,7 @@ kernel void capture_hidden(device half* features [[buffer(0)]], device const hal
 kernel void dflash_attention_prepare(device half* q [[buffer(0)]], device half* k [[buffer(1)]], device const half* raw_q [[buffer(2)]],
                                      device const half* raw_k [[buffer(3)]], device const float* q_norm [[buffer(4)]],
                                      device const float* k_norm [[buffer(5)]], device const half2* rope [[buffer(6)]],
-                                     device const uint* positions [[buffer(7)]], device const uint* query_start_loc [[buffer(8)]],
-                                     constant uint& batch_size [[buffer(9)]], uint3 lane3 [[thread_position_in_threadgroup]],
+                                     device const GpuQuery* queries [[buffer(7)]], uint3 lane3 [[thread_position_in_threadgroup]],
                                      uint simd_lane [[thread_index_in_simdgroup]], uint simd_index [[simdgroup_index_in_threadgroup]],
                                      uint3 group [[threadgroup_position_in_grid]]) {
   uint lane = lane3.x;
@@ -45,10 +44,8 @@ kernel void dflash_attention_prepare(device half* q [[buffer(0)]], device half* 
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   half normalized = half(value * scale * weight[lane]);
-  uint batch = 0;
-  while (batch + 1 < batch_size && row >= query_start_loc[batch + 1])
-    ++batch;
-  uint position = positions[batch] + row - query_start_loc[batch], pair = lane & 63;
+  device const GpuQuery& info = queryRow(queries, row);
+  uint position = info.position + row - info.start, pair = lane & 63;
   uint other = lane < 64 ? lane + 64 : lane - 64;
   half2 cs = rope[position * 64 + pair];
   half paired = half(float(raw[source + other]) * scale * weight[other]);
@@ -56,62 +53,19 @@ kernel void dflash_attention_prepare(device half* q [[buffer(0)]], device half* 
 }
 
 [[max_total_threads_per_threadgroup(128)]]
-kernel void dflash_store_kv(device half* cache_k [[buffer(0)]], device half* cache_v [[buffer(1)]], device const half* raw_k [[buffer(2)]],
-                            device const half* v [[buffer(3)]], device const uint* slots [[buffer(4)]], device const uint* positions [[buffer(5)]],
-                            device const uint* query_start_loc [[buffer(6)]], device const float* norm [[buffer(7)]],
-                            device const half2* rope [[buffer(8)]], constant uint& batch_size [[buffer(9)]], constant uint& rows [[buffer(10)]],
-                            constant uint& slot_stride [[buffer(11)]], uint3 lane3 [[thread_position_in_threadgroup]],
-                            uint simd_lane [[thread_index_in_simdgroup]], uint simd_index [[simdgroup_index_in_threadgroup]],
-                            uint3 group [[threadgroup_position_in_grid]]) {
-  uint lane = lane3.x;
-  uint row = group.x / DFLASH_KV_HEADS, head = group.x % DFLASH_KV_HEADS;
-  if (row >= rows)
-    return;
-  uint source = (row * DFLASH_KV_HEADS + head) * DFLASH_HEAD_DIM;
-  float value = float(raw_k[source + lane]), sum = simd_sum(value * value);
-  threadgroup float partial[DFLASH_SIMDGROUPS], scale;
-  if (!simd_lane)
-    partial[simd_index] = sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (!lane) {
-    float total = 0.0f;
-    for (uint i = 0; i < DFLASH_SIMDGROUPS; ++i)
-      total += partial[i];
-    scale = rsqrt(total / float(DFLASH_HEAD_DIM) + 1.0e-6f);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint batch = 0;
-  while (batch + 1 < batch_size && row >= query_start_loc[batch + 1])
-    ++batch;
-  uint position = positions[batch] + row - query_start_loc[batch], pair = lane & 63;
-  uint other = lane < 64 ? lane + 64 : lane - 64;
-  half2 cs = rope[position * 64 + pair];
-  float key = float(half(value * scale * norm[lane]));
-  float paired = float(half(float(raw_k[source + other]) * scale * norm[other]));
-  key = key * float(cs.x) + (lane < 64 ? -paired : paired) * float(cs.y);
-  ulong destination = dflash_kv_offset(slots[batch], slot_stride, position, head, lane);
-  cache_k[destination] = half(key);
-  cache_v[destination] = v[source + lane];
-}
-
-[[max_total_threads_per_threadgroup(128)]]
 kernel void dflash_attention_scan(device float* partials [[buffer(0)]], device const half* q [[buffer(1)]], device const half* k [[buffer(2)]],
                                   device const half* v [[buffer(3)]], device const half* cache_k [[buffer(4)]],
-                                  device const half* cache_v [[buffer(5)]], device const uint* slots [[buffer(6)]],
-                                  device const uint* positions [[buffer(7)]], device const uint* query_start_loc [[buffer(8)]],
-                                  constant uint& batch_size [[buffer(9)]], constant uint& rows [[buffer(10)]],
-                                  constant uint& slot_stride [[buffer(11)]], constant uint& splits [[buffer(12)]],
-                                  constant uint& sliding [[buffer(13)]], uint simd_lane [[thread_index_in_simdgroup]],
+                                  device const half* cache_v [[buffer(5)]], device const GpuQuery* queries [[buffer(6)]],
+                                  constant uint& rows [[buffer(7)]], constant uint& slot_stride [[buffer(8)]], constant uint& splits [[buffer(9)]],
+                                  constant uint& sliding [[buffer(10)]], uint simd_lane [[thread_index_in_simdgroup]],
                                   uint simd_index [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
   uint item = group.x, split = item % splits, head_row = item / splits;
   uint q_head = head_row % DFLASH_Q_HEADS, row = head_row / DFLASH_Q_HEADS;
   if (row >= rows)
     return;
-  uint batch = 0;
-  while (batch + 1 < batch_size && row >= query_start_loc[batch + 1])
-    ++batch;
-  uint start = query_start_loc[batch], block = query_start_loc[batch + 1] - start, q_position = row - start;
-  uint cached = positions[batch], first = sliding && cached + q_position + 1 > DFLASH_WINDOW ? cached + q_position + 1 - DFLASH_WINDOW : 0;
+  device const GpuQuery& info = queryRow(queries, row);
+  uint start = info.start, block = info.count, q_position = row - start;
+  uint cached = info.position, first = sliding && cached + q_position + 1 > DFLASH_WINDOW ? cached + q_position + 1 - DFLASH_WINDOW : 0;
   uint context = cached - first, temporary = sliding ? q_position + 1 : block, attended = context + temporary;
   uint split_begin = attended * split / splits, split_end = attended * (split + 1) / splits;
   uint kv_head = q_head / 4, q_offset = (row * DFLASH_Q_HEADS + q_head) * DFLASH_HEAD_DIM;
@@ -127,7 +81,7 @@ kernel void dflash_attention_scan(device float* partials [[buffer(0)]], device c
     bool current = token >= context;
     uint position = current ? token - context : first + token;
     ulong offset = current ? ulong(start + position) * DFLASH_KV_HEADS * DFLASH_HEAD_DIM + kv_head * DFLASH_HEAD_DIM
-                           : dflash_kv_offset(slots[batch], slot_stride, position, kv_head);
+                           : dflash_kv_offset(info.slot, slot_stride, position, kv_head);
     float score = 0.0f;
     for (uint dim = simd_lane; dim < DFLASH_HEAD_DIM; dim += 32)
       score = fma(float(q_shared[dim]), float((current ? k : cache_k)[offset + dim]), score);

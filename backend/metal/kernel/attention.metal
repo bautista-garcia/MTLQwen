@@ -49,43 +49,55 @@ kernel void attention_prepare(device half* q [[buffer(0)]], device half* k [[buf
   (query ? q : k)[output_base + lane] = result;
 }
 
-// Verified target rows materialize persistent MTP K/V directly from the packed layout.
-[[max_total_threads_per_threadgroup(256)]]
-kernel void mtp_store_kv(device half* cache_k [[buffer(0)]], device half* cache_v [[buffer(1)]], device const half* raw_k [[buffer(2)]],
-                         device const half* v [[buffer(3)]], device const uint* slots [[buffer(4)]], device const uint* query_positions [[buffer(5)]],
-                         device const uint* query_start_loc [[buffer(6)]], device const float* norm_weight [[buffer(7)]],
-                         device const half2* rope [[buffer(8)]], constant uint& batch_size [[buffer(9)]], constant uint& rows [[buffer(10)]],
-                         constant uint& slot_stride [[buffer(11)]], uint3 lane3 [[thread_position_in_threadgroup]],
-                         uint simd_lane [[thread_index_in_simdgroup]], uint simd_index [[simdgroup_index_in_threadgroup]],
-                         uint3 group [[threadgroup_position_in_grid]]) {
-  uint lane = lane3.x, row = group.x / KV_HEADS, head = group.x % KV_HEADS;
-  if (row >= rows)
-    return;
-  uint batch = 0;
-  while (batch + 1 < batch_size && row >= query_start_loc[batch + 1])
-    ++batch;
-  uint source = (row * KV_HEADS + head) * HEAD_DIM;
-  uint position = query_positions[batch] + row - query_start_loc[batch];
+// Verified target rows populate MTP (256-d) or DFlash (128-d) K/V with the same normalization/store path.
+template <uint Dim>
+[[max_total_threads_per_threadgroup(Dim)]]
+kernel void drafter_store_kv(device half* cache_k [[buffer(0)]], device half* cache_v [[buffer(1)]], device const half* raw_k [[buffer(2)]],
+                             device const half* v [[buffer(3)]], device const GpuQuery* queries [[buffer(4)]],
+                             device const float* norm_weight [[buffer(5)]], device const half2* rope [[buffer(6)]],
+                             constant uint& slot_stride [[buffer(7)]], uint3 lane3 [[thread_position_in_threadgroup]],
+                             uint simd_lane [[thread_index_in_simdgroup]], uint simd_index [[simdgroup_index_in_threadgroup]],
+                             uint3 group [[threadgroup_position_in_grid]]) {
+  constexpr uint heads = 1024 / Dim, pairs = Dim == 128 ? 64 : 32;
+  uint lane = lane3.x, row = group.x / heads, head = group.x % heads;
+  device const GpuQuery& info = queryRow(queries, row);
+  uint source = (row * heads + head) * Dim;
+  uint position = info.position + row - info.start;
   float value = float(raw_k[source + lane]), sum = simd_sum(value * value);
-  threadgroup float partial[8];
+  threadgroup float partial[Dim / 32], scale;
   if (simd_lane == 0)
     partial[simd_index] = sum;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  float total = 0.0f;
-  for (uint i = 0; i < 8; ++i)
-    total += partial[i];
-  float inv_rms = rsqrt(total / float(HEAD_DIM) + 1.0e-6f);
-  float key = float(half(value * inv_rms * norm_weight[lane]));
-  if (lane < 64) {
-    uint other = lane < 32 ? lane + 32 : lane - 32, pair = lane & 31;
-    float paired = float(half(float(raw_k[source + other]) * inv_rms * norm_weight[other]));
-    half2 cs = rope[position * 32 + pair];
-    key = key * float(cs.x) + (lane < 32 ? -paired : paired) * float(cs.y);
+  float inv_rms = 0.0f;
+  if (Dim == 256 || !lane) {
+    float total = 0.0f;
+    for (uint i = 0; i < Dim / 32; ++i)
+      total += partial[i];
+    inv_rms = rsqrt(total / float(Dim) + 1.0e-6f);
+    if (Dim == 128)
+      scale = inv_rms;
   }
-  ulong offset = kv_offset(slots[batch], slot_stride, position, head, lane);
+  if (Dim == 128) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    inv_rms = scale;
+  }
+  float key = float(half(value * inv_rms * norm_weight[lane]));
+  if (lane < 2 * pairs) {
+    uint other = lane < pairs ? lane + pairs : lane - pairs, pair = lane % pairs;
+    float paired = float(half(float(raw_k[source + other]) * inv_rms * norm_weight[other]));
+    half2 cs = rope[position * pairs + pair];
+    key = key * float(cs.x) + (lane < pairs ? -paired : paired) * float(cs.y);
+  }
+  ulong offset = ((ulong(info.slot) * slot_stride + position) * heads + head) * Dim + lane;
   cache_k[offset] = half(key);
   cache_v[offset] = v[source + lane];
 }
+
+#define DRAFTER_KV_ARGS                                                                                                                              \
+  device half*, device half*, device const half*, device const half*, device const GpuQuery*, device const float*, device const half2*,              \
+      constant uint&, uint3, uint, uint, uint3
+template [[host_name("mtp_store_kv")]] kernel void drafter_store_kv<256>(DRAFTER_KV_ARGS);
+template [[host_name("dflash_store_kv")]] kernel void drafter_store_kv<128>(DRAFTER_KV_ARGS);
 
 // A fixed concurrency budget is divided across packed rows by the host: fewer rows receive more context splits.
 [[max_total_threads_per_threadgroup(128)]]
