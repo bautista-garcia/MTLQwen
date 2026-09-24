@@ -79,7 +79,13 @@ struct Ops {
     return linear(scratch.temporary, weight("output.weight", 0), rows, scratch.targetLogits);
   }
 
-  Tensor attention(uint32_t layer, const Tensor& x, const Tensor& residual) {
+  void decoder(uint32_t layer, const Tensor& hidden) {
+    source = layer >= targetLayers && engine.drafter == Drafter::dflash;
+    prefix = "blk." + std::to_string(source ? layer - targetLayers : layer) + ".";
+    bool fullAttention = layer >= targetLayers || (layer + 1) % fullAttentionInterval == 0;
+    const Tensor& x = scratch.norm;
+    dispatch("rms_norm", size(256, rows), size(256), {x, hidden, weight("attn_norm.weight")});
+    if (fullAttention) {
     bool draft = source == 1;
     uint32_t kvLayer = layer < targetLayers ? layer / fullAttentionInterval : targetKvLayers + layer - targetLayers;
     Tensor qg = linear(x, weight("attn_q.weight"), rows, scratch.mixed), k = linear(x, weight("attn_k.weight"), rows, scratch.k);
@@ -87,77 +93,35 @@ struct Ops {
     uint32_t heads = draft ? 32 : 16, group = draft ? 128 : 256;
     const Tensor& rope = draft ? engine.dflashRope : engine.rope;
     dispatch(draft ? "dflash_attention_prepare" : "attention_prepare", size(group, uint64_t(rows) * (draft ? 40 : 20)), size(group),
-             {scratch.attnQRope, scratch.attnKRope, qg, k, t("attn_q_norm.weight"), t("attn_k_norm.weight"), rope, positions, engine.queryStartLoc},
-             batch.packed);
+               {scratch.attnQRope, scratch.attnKRope, qg, k, weight("attn_q_norm.weight"), weight("attn_k_norm.weight"), rope, queries});
     uint32_t splits = std::max(1u, 8 / rows);
     dispatch(draft ? "dflash_attention_scan" : "attention_scan", size(uint64_t(rows) * heads * splits * 128), size(128),
-             {scratch.attnPartials, scratch.attnQRope, scratch.attnKRope, v, engine.kv->key(kvLayer), engine.kv->value(kvLayer), engine.sequenceSlots,
-              positions, engine.queryStartLoc},
-             batch.packed, rows, uint32_t(engine.blocks.size()) * blockTokens, splits, uint32_t(draft && layer + 1 < targetLayers + dflashLayers));
+               {scratch.attnPartials, scratch.attnQRope, scratch.attnKRope, v, engine.kv->key(kvLayer), engine.kv->value(kvLayer), queries}, rows,
+               uint32_t(engine.blocks.size()) * blockTokens, splits, uint32_t(draft && layer + 1 < targetLayers + dflashLayers));
     dispatch(draft ? "dflash_attention_reduce" : "attention_reduce", size(uint64_t(rows) * heads * 128), size(128),
              {scratch.temporary, scratch.attnPartials, qg}, rows, splits);
-    return linear(scratch.temporary, weight("attn_output.weight"), rows, scratch.mid, residual);
-  }
-
-  Tensor gdn(uint32_t layerIndex, const Tensor& x, const Tensor& residual) {
-    Tensor conv = t("ssm_conv1d.weight");
-    GdnState bank0 = gdnState(engine.gdnStates[0], maxBatchSequences, layerIndex);
-    GdnState bank1 = gdnState(engine.gdnStates[1], maxBatchSequences, layerIndex);
-    GdnState candidates = gdnState(engine.candidateStates, engine.candidateStates.bytes / gdnCheckpointBytes, layerIndex);
+    } else {
     Tensor mixed = linear(x, weight("attn_qkv.weight"), rows, scratch.mixed), z = linear(x, weight("attn_gate.weight"), rows, scratch.temporary);
     dispatch("gdn_ba_prepare_4096x32", size(32 * 64, rows), size(64),
-             {scratch.gdnB, scratch.gdnG, x, t("ssm_beta.weight"), t("ssm_alpha.weight"), t("ssm_a"), t("ssm_dt.bias")},
-             t("ssm_beta.weight").bytes == uint64_t(32) * 4096 * 4);
-    for (uint32_t row = 0; row < batch.size; ++row) {
-      const Query& query = batch.queries[row];
-      uint64_t offset = uint64_t(query.start) * 8192 * 2;
-      const Sequence& sequence = *query.sequence;
-      Tensor destination = scratch.gdnConvolved.view(offset, uint64_t(query.count) * 8192 * 2), source = mixed.view(offset, destination.bytes);
-      bool draft = query.state != unbound;
-      Tensor candidate = draft ? candidates.conv.view(uint64_t(query.state) * convStateBytes, uint64_t(query.count) * convStateBytes) : destination;
-      dispatch(draft ? "gdn_causal_conv_candidates" : "gdn_causal_conv_silu",
-               size(uint64_t(8192) * (draft ? query.count : std::max(query.count, 4u))), size(256),
-               {destination, bank0.conv, bank1.conv, candidate, source, conv}, sequence.slot, sequence.bank, uint32_t(sequence.kvValid != 0),
-               int64_t(query.count));
+               {scratch.gdnB, scratch.gdnG, x, weight("ssm_beta.weight"), weight("ssm_alpha.weight"), weight("ssm_a"), weight("ssm_dt.bias")},
+               weight("ssm_beta.weight").type == GGML_TYPE_F32);
+      uint64_t offset = (layer - layer / fullAttentionInterval) * (convStateBytes + recurrentStateBytes);
+      dispatch("gdn_causal_conv_silu", size(uint64_t(8192) * rows), size(256),
+               {scratch.q, scratch.k, scratch.v, mixed, weight("ssm_conv1d.weight"), queries}, offset);
+      for (uint32_t phase = 0; phase < 2; ++phase)
+        if (phase ? prefill : sequential)
+          dispatch(phase ? "delta_rule_prefill" : "delta_rule_decode", phase ? size(128, 32, batch.size) : size(32 * 512, batch.size),
+                   size(phase ? 128 : 512), {scratch.mixed, scratch.q, scratch.k, scratch.v, scratch.gdnG, scratch.gdnB, queries},
+                   offset + convStateBytes);
+      dispatch("gated_rms_norm_128", size(128, uint64_t(rows) * 32), size(128), {scratch.q, scratch.mixed, z, weight("ssm_norm.weight")});
     }
-    dispatch("split_repeat_qk", size(uint64_t(rows) * 4096), size(256), {scratch.q, scratch.k, scratch.v, scratch.gdnConvolved});
-    for (uint32_t row = 0; row < batch.size; ++row) {
-      const Query& query = batch.queries[row];
-      uint64_t offset = uint64_t(query.start) * 4096 * 2;
-      const Sequence& sequence = *query.sequence;
-      Tensor destination = scratch.mixed.view(offset, uint64_t(query.count) * 4096 * 2);
-      Tensor q = scratch.q.view(offset, uint64_t(query.count) * 4096 * 2), k = scratch.k.view(offset, uint64_t(query.count) * 4096 * 2),
-             v = scratch.v.view(offset, uint64_t(query.count) * 4096 * 2);
-      Tensor g = scratch.gdnG.view(query.start * 128ull, query.count * 128ull), beta = scratch.gdnB.view(query.start * 64ull, query.count * 64ull);
-      bool draft = query.state != unbound;
-      Tensor candidate =
-          draft ? candidates.recurrent.view(uint64_t(query.state) * recurrentStateBytes, uint64_t(query.count) * recurrentStateBytes) : destination;
-      const char* kernel = draft ? "delta_rule_candidates" : query.count == 1 ? "delta_rule_decode" : "delta_rule_prefill";
-      dispatch(kernel, draft || query.count == 1 ? size(32 * 512) : size(128, 32), size(draft || query.count == 1 ? 512 : 128),
-               {destination, bank0.recurrent, bank1.recurrent, candidate, q, k, v, g, beta}, sequence.slot, sequence.bank,
-               uint32_t(sequence.kvValid != 0), int64_t(query.count));
-    }
-    dispatch("gated_rms_norm_128", size(128, uint64_t(rows) * 32), size(128), {scratch.q, scratch.mixed, z, t("ssm_norm.weight")});
-    return linear(scratch.q, weight("ssm_out.weight"), rows, scratch.mid, residual);
-  }
-
-  Tensor decoder(uint32_t layer, const Tensor& hidden, Tensor output) {
-    source = layer >= targetLayers && engine.drafter == Drafter::dflash;
-    prefix = "blk." + std::to_string(source ? layer - targetLayers : layer) + ".";
-    dispatch("rms_norm", size(256, rows), size(256), {scratch.norm, hidden, t("attn_norm.weight")});
-    Tensor mid =
-        layer >= targetLayers || (layer + 1) % fullAttentionInterval == 0 ? attention(layer, scratch.norm, hidden) : gdn(layer, scratch.norm, hidden);
-    dispatch("rms_norm", size(256, rows), size(256), {scratch.norm, mid, t(source ? "ffn_norm.weight" : "post_attention_norm.weight")});
-    Kernel& fused = kernel(weight("ffn_gate.weight"), 3);
-    if (decode)
-      dispatch(fused.pipeline, size(fused.threads, rows), size(fused.group),
-               {scratch.mlpGate, scratch.norm, t("ffn_gate.weight"), t("ffn_up.weight")}, int64_t(rows));
-    else {
-      Tensor gate = linear(scratch.norm, weight("ffn_gate.weight"), rows, scratch.mlpGate),
-             up = linear(scratch.norm, weight("ffn_up.weight"), rows, scratch.mlpUp);
-      dispatch("silu_and_mul", size(uint64_t(rows) * 12288), size(256), {scratch.mlpGate, gate, up});
-    }
-    return linear(scratch.mlpGate, weight("ffn_down.weight"), rows, output, mid);
+    linear(fullAttention ? scratch.temporary : scratch.q, weight(fullAttention ? "attn_output.weight" : "ssm_out.weight"), rows, hidden, hidden);
+    dispatch("rms_norm", size(256, rows), size(256), {x, hidden, weight(source ? "ffn_norm.weight" : "post_attention_norm.weight")});
+    Weight &gate = weight("ffn_gate.weight"), &up = weight("ffn_up.weight");
+    if (!decode)
+      linear(x, gate, rows, scratch.mlpGate);
+    linear(x, decode ? gate : up, rows, scratch.mlpGate, decode ? up : scratch.mlpGate, true);
+    linear(scratch.mlpGate, weight("ffn_down.weight"), rows, hidden, hidden);
   }
 
   Tensor mtpInput(const Tensor& ids, const Tensor& hidden, uint32_t mode) {
