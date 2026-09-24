@@ -5,8 +5,8 @@
 namespace infeng::qwen35 {
 namespace {
 
-MTL::Size size(uint64_t x, uint64_t y = 1) {
-  return MTL::Size(x, y, 1);
+MTL::Size size(uint64_t x, uint64_t y = 1, uint64_t z = 1) {
+  return MTL::Size(x, y, z);
 }
 
 void loadWeights(Engine& engine, const std::filesystem::path& path, Weights& weights) {
@@ -24,12 +24,11 @@ void loadWeights(Engine& engine, const std::filesystem::path& path, Weights& wei
 
 struct Ops {
   Engine& engine;
-  Batch& batch;
-  bool preparing = false;
-  Device& commands = engine.device;
+  const Batch& batch;
+  uint32_t rows = 0, source = 0;
+  bool preparing = rows != 0, decode = rows <= maxDecodeRows;
+  bool sequential = false, prefill = false;
   Scratch& scratch = engine.workspace;
-  uint32_t rows = batch.rows, source = 0;
-  bool decode = batch.maxQuery <= maxDecodeRows;
   std::string prefix;
   Tensor queries;
 
@@ -42,14 +41,10 @@ struct Ops {
     return found->second;
   }
 
-  Tensor t(const char* name) {
-    return weight(name).tensor;
-  }
-
   template <class K, class... Args>
   void dispatch(K kernel, MTL::Size threads, MTL::Size group, std::initializer_list<Tensor> tensors, const Args&... args) {
     if (!preparing)
-      commands.dispatch(kernel, threads, group, tensors, args...);
+      engine.device.dispatch(kernel, threads, group, tensors, args...);
   }
 
   // A gated projection uses up weights in decode, or precomputed gate activations in prefill.
@@ -74,9 +69,9 @@ struct Ops {
     return output;
   }
 
-  Tensor logits(const Tensor& x, const Tensor& norm, uint32_t rows) {
-    dispatch("rms_norm", size(256, rows), size(256), {scratch.temporary, x, norm});
-    return linear(scratch.temporary, weight("output.weight", 0), rows, scratch.targetLogits);
+  Tensor logits(const Tensor& x, const Tensor& norm, uint32_t count) {
+    dispatch(count == rows ? "rms_norm" : "rms_norm_gather", size(256, count), size(256), {scratch.temporary, x, norm, queries});
+    return linear(scratch.temporary, weight("output.weight", 0), count, scratch.targetLogits);
   }
 
   void decoder(uint32_t layer, const Tensor& hidden) {
@@ -86,23 +81,23 @@ struct Ops {
     const Tensor& x = scratch.norm;
     dispatch("rms_norm", size(256, rows), size(256), {x, hidden, weight("attn_norm.weight")});
     if (fullAttention) {
-    bool draft = source == 1;
-    uint32_t kvLayer = layer < targetLayers ? layer / fullAttentionInterval : targetKvLayers + layer - targetLayers;
-    Tensor qg = linear(x, weight("attn_q.weight"), rows, scratch.mixed), k = linear(x, weight("attn_k.weight"), rows, scratch.k);
-    Tensor v = linear(x, weight("attn_v.weight"), rows, scratch.v);
-    uint32_t heads = draft ? 32 : 16, group = draft ? 128 : 256;
-    const Tensor& rope = draft ? engine.dflashRope : engine.rope;
-    dispatch(draft ? "dflash_attention_prepare" : "attention_prepare", size(group, uint64_t(rows) * (draft ? 40 : 20)), size(group),
+      bool draft = source == 1;
+      uint32_t kvLayer = layer < targetLayers ? layer / fullAttentionInterval : targetKvLayers + layer - targetLayers;
+      Tensor qg = linear(x, weight("attn_q.weight"), rows, scratch.mixed), k = linear(x, weight("attn_k.weight"), rows, scratch.k);
+      Tensor v = linear(x, weight("attn_v.weight"), rows, scratch.v);
+      uint32_t heads = draft ? 32 : 16, group = draft ? 128 : 256;
+      const Tensor& rope = draft ? engine.dflashRope : engine.rope;
+      dispatch(draft ? "dflash_attention_prepare" : "attention_prepare", size(group, uint64_t(rows) * (draft ? 40 : 20)), size(group),
                {scratch.attnQRope, scratch.attnKRope, qg, k, weight("attn_q_norm.weight"), weight("attn_k_norm.weight"), rope, queries});
-    uint32_t splits = std::max(1u, 8 / rows);
-    dispatch(draft ? "dflash_attention_scan" : "attention_scan", size(uint64_t(rows) * heads * splits * 128), size(128),
+      uint32_t splits = std::max(1u, 8 / rows);
+      dispatch(draft ? "dflash_attention_scan" : "attention_scan", size(uint64_t(rows) * heads * splits * 128), size(128),
                {scratch.attnPartials, scratch.attnQRope, scratch.attnKRope, v, engine.kv->key(kvLayer), engine.kv->value(kvLayer), queries}, rows,
                uint32_t(engine.blocks.size()) * blockTokens, splits, uint32_t(draft && layer + 1 < targetLayers + dflashLayers));
-    dispatch(draft ? "dflash_attention_reduce" : "attention_reduce", size(uint64_t(rows) * heads * 128), size(128),
-             {scratch.temporary, scratch.attnPartials, qg}, rows, splits);
+      dispatch(draft ? "dflash_attention_reduce" : "attention_reduce", size(uint64_t(rows) * heads * 128), size(128),
+               {scratch.temporary, scratch.attnPartials, qg}, rows, splits);
     } else {
-    Tensor mixed = linear(x, weight("attn_qkv.weight"), rows, scratch.mixed), z = linear(x, weight("attn_gate.weight"), rows, scratch.temporary);
-    dispatch("gdn_ba_prepare_4096x32", size(32 * 64, rows), size(64),
+      Tensor mixed = linear(x, weight("attn_qkv.weight"), rows, scratch.mixed), z = linear(x, weight("attn_gate.weight"), rows, scratch.temporary);
+      dispatch("gdn_ba_prepare_4096x32", size(32 * 64, rows), size(64),
                {scratch.gdnB, scratch.gdnG, x, weight("ssm_beta.weight"), weight("ssm_alpha.weight"), weight("ssm_a"), weight("ssm_dt.bias")},
                weight("ssm_beta.weight").type == GGML_TYPE_F32);
       uint64_t offset = (layer - layer / fullAttentionInterval) * (convStateBytes + recurrentStateBytes);
@@ -124,38 +119,14 @@ struct Ops {
     linear(scratch.mlpGate, weight("ffn_down.weight"), rows, hidden, hidden);
   }
 
-  Tensor mtpInput(const Tensor& ids, const Tensor& hidden, uint32_t mode) {
+  Tensor mtpInput(const Tensor& proposals, const Tensor& hidden, uint32_t mode) {
     source = 0;
     prefix = "blk.32.nextn.";
-    dispatch("embedding_q4_k", size(4096, rows), size(256), {scratch.norm, ids, weight("token_embd.weight", 0).tensor});
-    dispatch("mtp_fuse", size(256, rows), size(256),
-             {scratch.mixed, scratch.norm, hidden, engine.mtpSeeds, engine.sequenceSlots, engine.stateBanks, engine.batchKvValid,
-              engine.queryStartLoc, t("enorm.weight"), t("hnorm.weight")},
-             batch.packed, rows, mode);
-    return linear(scratch.mixed, weight("eh_proj.weight"), rows, scratch.hidden[0]);
-  }
-
-  void encodeDrafter() {
-    bool mtp = engine.drafter == Drafter::mtp;
-    source = !mtp;
-    prefix.clear();
-    Tensor context =
-        mtp ? mtpInput(engine.inputIds, scratch.draftContext, 1) : linear(scratch.draftContext, weight("fc.weight"), rows, scratch.hidden[0]);
-    dispatch("rms_norm", size(256, rows), size(256),
-             {scratch.norm, context, mtp ? weight("blk.32.attn_norm.weight", 0).tensor : t("enc.output_norm.weight")});
-    for (uint32_t index = 0; index < (mtp ? 1 : dflashLayers); ++index) {
-      prefix = "blk." + std::to_string(mtp ? 32 : index) + ".";
-      Tensor k = linear(scratch.norm, weight("attn_k.weight"), rows, scratch.k), v = linear(scratch.norm, weight("attn_v.weight"), rows, scratch.v);
-      dispatch(mtp ? "mtp_store_kv" : "dflash_store_kv", size(uint64_t(rows) * 1024), size(mtp ? 256 : 128),
-               {engine.kv->key(targetKvLayers + index), engine.kv->value(targetKvLayers + index), k, v, engine.sequenceSlots, engine.batchKvValid,
-                engine.queryStartLoc, t("attn_k_norm.weight"), mtp ? engine.rope : engine.dflashRope},
-               batch.size, rows, uint32_t(engine.blocks.size()) * blockTokens);
-    }
-    if (mtp && !preparing)
-      for (uint32_t row = 0; row < batch.size; ++row)
-        if (batch.queries[row].state == unbound)
-          commands.copy(scratch.draftContext.view(uint64_t(batch.queries[row].start + batch.queries[row].count - 1) * 8192, 8192),
-                        mtpSeed(engine, *batch.queries[row].sequence, 1 - batch.queries[row].sequence->bank));
+    dispatch("embedding_q4_k", size(4096, rows), size(256), {scratch.norm, engine.requestData, weight("token_embd.weight", 0), queries, proposals},
+             mode ? 0u : 2u, engine.maxContext + 1);
+    dispatch("mtp_fuse", size(256, rows), size(256), {scratch.mixed, scratch.norm, hidden, queries, weight("enorm.weight"), weight("hnorm.weight")},
+             rows, mode);
+    return linear(scratch.mixed, weight("eh_proj.weight"), rows, scratch.hidden);
   }
 };
 
@@ -170,7 +141,19 @@ void Engine::loadModel(const std::filesystem::path& path, const std::filesystem:
     weights[0] = std::move(weights[1]);
   else
     loadWeights(*this, path, weights[0]);
-  workspace.allocate(device, drafter);
+  Scratch& s = workspace;
+  uint64_t h = uint64_t(maxBatchTokens) * 8192;
+  for (Tensor* tensor : {&s.hidden, &s.norm, &s.temporary, &s.q, &s.k, &s.v, &s.attnQRope})
+    *tensor = device.empty(h);
+  s.mlpGate = device.empty(3 * h);
+  s.mixed = device.empty(2 * h);
+  s.attnKRope = device.empty(h / 4);
+  s.attnPartials = device.empty(uint64_t(maxBatchTokens) * 32 * 130 * 4);
+  s.gdnB = device.empty(maxBatchTokens * 64);
+  s.gdnG = device.empty(maxBatchTokens * 128);
+  if (drafter == Drafter::dflash)
+    s.draftContext = device.empty(8 * h);
+  s.targetLogits = device.empty(uint64_t(maxLogitRows) * vocabSize * 2);
   device.command();
   for (uint32_t pairs = 32; pairs <= (drafter == Drafter::dflash ? 64 : 32); pairs *= 2) {
     Tensor& table = pairs == 32 ? rope : dflashRope;
@@ -212,52 +195,41 @@ void forward(Engine& engine, const Batch& batch, bool drafting, uint32_t prepare
   ops.queries = engine.queryData.view(drafting, 1, maxBatchSequences * sizeof(GpuQuery));
   const Tensor& hidden = scratch.hidden;
   for (uint32_t step = 0; step < (drafting && !dflash ? width : 1); ++step) {
-    Tensor hidden = scratch.hidden[0];
-    if (drafting && !dflash) {
-      ops.positions = engine.draftPositions.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(rows) * 4);
-      hidden = ops.mtpInput(engine.draftTokens.view(uint64_t(step) * maxBatchSequences * 4, uint64_t(rows) * 4), scratch.norm, step ? 0 : 2);
-    } else
+    if (drafting && !dflash)
+      ops.mtpInput(engine.draftTokens.view(step * maxBatchSequences, rows, 4), scratch.norm, step ? 0 : 2);
+    else
       ops.dispatch("embedding_q4_k", size(4096, rows), size(256),
-                   {hidden, drafting ? engine.draftTokens : engine.inputIds, ops.weight("token_embd.weight", 0).tensor});
+                   {hidden, engine.requestData, ops.weight("token_embd.weight", 0), ops.queries, engine.draftTokens}, uint32_t(drafting),
+                   engine.maxContext + 1);
     for (uint32_t i = 0; i < (drafting ? (dflash ? dflashLayers : mtpLayers) : targetLayers); ++i) {
-      hidden = ops.decoder((drafting ? targetLayers : 0) + i, hidden, scratch.hidden[(i + 1) & 1]);
+      ops.decoder((drafting ? targetLayers : 0) + i, hidden);
       if (!drafting && dflash && i % 4 == 1)
         ops.dispatch("capture_hidden", size(uint64_t(rows) * 4096), size(256), {scratch.draftContext, hidden}, (i - 1) / 4);
     }
-    if (!drafting && engine.drafter == Drafter::mtp && !prepare)
-      engine.device.copy(hidden, scratch.draftContext.view(0, uint64_t(rows) * 4096 * 2));
     if (count) {
-      if (count != rows)
-        ops.dispatch("gather_rows", size(uint64_t(count) * 4096), size(256), {scratch.norm, hidden, engine.logitRows});
-      Tensor norm = ops.weight(drafting && !dflash ? "blk.32.nextn.shared_head_norm.weight" : "output_norm.weight", drafting && dflash).tensor;
-      Tensor logits = ops.logits(count == rows ? hidden : scratch.norm, norm, count);
-      if (drafting)
-        ops.dispatch(
-            "argmax_logits", size(256, count), size(256),
-            {engine.draftTokens.view(uint64_t(step + 1) * maxBatchSequences * 4, uint64_t(dflash ? width * maxBatchSequences : rows) * 4), logits},
-            dflash ? width : 1, dflash ? maxBatchSequences : 1);
-      else
-        for (uint32_t row = 0; row < batch.size; ++row) {
-          const Query& query = batch.queries[row];
-          if (query.logit == unbound)
-            continue;
-          const Sequence& sequence = *query.sequence;
-          uint32_t samples = query.state != unbound ? query.count : 1;
-          Tensor scores = logits.view(uint64_t(query.logit) * vocabSize * 2, uint64_t(samples) * vocabSize * 2);
-          Tensor output = engine.outputTokens.view(uint64_t(query.logit) * 4, uint64_t(samples) * 4);
-          if (sequence.temperature <= 0)
-            ops.dispatch("argmax_logits", size(256, samples), size(256), {output, scores}, 1u, 1u);
-          else
-            ops.dispatch("sample_logits", size(samples), size(1),
-                         {output, engine.rng.view(uint64_t(sequence.slot) * 8, 8),
-                          engine.sampledRng.view(uint64_t(query.logit) * 8, uint64_t(samples) * 8), scores},
-                         sequence.temperature, sequence.topP, sequence.topK);
-        }
+      Tensor norm = ops.weight(drafting && !dflash ? "blk.32.nextn.shared_head_norm.weight" : "output_norm.weight", drafting && dflash);
+      Tensor logits = ops.logits(hidden, norm, count);
+      Tensor output =
+          drafting ? engine.draftTokens.view((step + 1) * maxBatchSequences, dflash ? width * maxBatchSequences : rows, 4) : engine.outputTokens;
+      ops.dispatch("sample_logits", size(256, count), size(256), {output, engine.rng, engine.sampledRng, logits, ops.queries},
+                   uint32_t(drafting ? engine.drafter : Drafter::none));
     }
   }
-  if (!drafting && engine.drafter != Drafter::none)
-    ops.encodeDrafter();
-  if (!prepare)
-    engine.device.commit();
+  if (!drafting && engine.drafter != Drafter::none) {
+    Tensor context =
+        dflash ? ops.linear(scratch.draftContext, ops.weight("fc.weight", 1), rows, hidden) : ops.mtpInput(engine.draftTokens, hidden, 1);
+    ops.dispatch("rms_norm", size(256, rows), size(256),
+                 {scratch.norm, context, ops.weight(dflash ? "enc.output_norm.weight" : "blk.32.attn_norm.weight", dflash)});
+    ops.source = dflash;
+    for (uint32_t index = 0; index < (dflash ? dflashLayers : mtpLayers); ++index) {
+      ops.prefix = "blk." + std::to_string(dflash ? index : targetLayers) + ".";
+      Tensor k = ops.linear(scratch.norm, ops.weight("attn_k.weight"), rows, scratch.k),
+             v = ops.linear(scratch.norm, ops.weight("attn_v.weight"), rows, scratch.v);
+      ops.dispatch(dflash ? "dflash_store_kv" : "mtp_store_kv", size(uint64_t(rows) * 1024), size(dflash ? 128 : 256),
+                   {engine.kv->key(targetKvLayers + index), engine.kv->value(targetKvLayers + index), k, v, ops.queries,
+                    ops.weight("attn_k_norm.weight"), dflash ? engine.dflashRope : engine.rope},
+                   uint32_t(engine.blocks.size()) * blockTokens);
+    }
+  }
 }
 } // namespace infeng::qwen35
