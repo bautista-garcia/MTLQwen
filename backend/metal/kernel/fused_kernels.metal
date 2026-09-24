@@ -199,57 +199,35 @@ kernel void mlp_gate_up_iq4_xs_decode(device half* y [[buffer(0)]], device const
   }
 }
 
-static inline half gdn_load_context(device const half* x, device const half* prev, long b, long c, long L, long pos, bool has_prev) {
-  if (has_prev)
-    return pos < 4 ? prev[c * 4 + pos] : x[(b * L + pos - 4) * GDN_C + c];
-  return pos < 0 || pos >= L ? half(0.0) : x[(b * L + pos) * GDN_C + c];
-}
-
 [[max_total_threads_per_threadgroup(256)]]
-kernel void gdn_causal_conv_silu(device half* y [[buffer(0)]], device half* state0 [[buffer(1)]], device half* state1 [[buffer(2)]],
-                                 device half* candidates [[buffer(3)]], device const half* x [[buffer(4)]], device const float* w [[buffer(5)]],
-                                 constant uint& slot [[buffer(6)]], constant uint& bank [[buffer(7)]], constant uint& valid [[buffer(8)]],
-                                 constant long& L [[buffer(9)]], uint3 gid [[thread_position_in_grid]]) {
-  long span = L > 4 ? L : 4, rem = gid.x;
-  long p = rem / GDN_C, c = rem - p * GDN_C;
-  bool has_prev = valid;
-  device half* state = (bank ? state0 : state1) + slot * GDN_C * 4;
-  device const half* prev = (bank ? state1 : state0) + slot * GDN_C * 4;
-  if (p < L) {
-    float acc = 0.0f;
-    for (long r = 0; r < 4; ++r)
-      acc = fma(float(gdn_load_context(x, prev, 0, c, L, has_prev ? p + 1 + r : p + r - 3, has_prev)), float(half(w[c * 4 + r])), acc);
-    float hv = float(half(acc));
-    y[p * GDN_C + c] = half(hv / (1.0f + exp(-hv)));
-  }
-  if (p < 4) {
-    long pos = (has_prev ? L + p : L - 4 + p);
-    state[c * 4 + p] = gdn_load_context(x, prev, 0, c, L, pos, has_prev);
-  }
-}
-
-// Speculative verification writes one immutable convolution-state column per query token.
-[[max_total_threads_per_threadgroup(256)]]
-kernel void gdn_causal_conv_candidates(device half* y [[buffer(0)]], device const half* state0 [[buffer(1)]], device const half* state1 [[buffer(2)]],
-                                       device half* candidates [[buffer(3)]], device const half* x [[buffer(4)]], device const float* w [[buffer(5)]],
-                                       constant uint& slot [[buffer(6)]], constant uint& bank [[buffer(7)]], constant uint& valid [[buffer(8)]],
-                                       constant long& L [[buffer(9)]], uint3 gid [[thread_position_in_grid]]) {
-  long rem = gid.x;
-  long p = rem / GDN_C, c = rem - p * GDN_C;
-  bool has_prev = valid;
-  device const half* prev = (bank ? state1 : state0) + slot * GDN_C * 4;
+kernel void gdn_causal_conv_silu(device half* q [[buffer(0)]], device half* k [[buffer(1)]], device half* v [[buffer(2)]],
+                                 device const half* x [[buffer(3)]], device const float* w [[buffer(4)]],
+                                 device const GpuQuery* queries [[buffer(5)]], constant ulong& offset [[buffer(6)]],
+                                 uint tid [[thread_position_in_grid]]) {
+  long row = tid / GDN_C, c = tid % GDN_C;
+  device const GpuQuery& info = queryRow(queries, row);
+  long p = row - info.start;
+  bool speculative = info.state != 0xffffffffu;
+  device const half* prev = reinterpret_cast<device const half*>(info.previous + offset);
+  half context[4];
   float acc = 0.0f;
   for (long r = 0; r < 4; ++r) {
     long position = p - 3 + r;
-    half value = position >= 0 ? x[position * GDN_C + c] : has_prev ? prev[c * 4 + position + 4] : half(0.0f);
-    acc = fma(float(value), float(half(w[c * 4 + r])), acc);
+    context[r] = position >= 0 ? x[(info.start + position) * GDN_C + c] : info.previous ? prev[c * 4 + position + 4] : half(0.0f);
+    acc = fma(float(context[r]), float(half(w[c * 4 + r])), acc);
   }
   float hv = float(half(acc));
-  y[p * GDN_C + c] = half(hv / (1.0f + exp(-hv)));
-  device half* state = candidates + p * GDN_C * 4 + c * 4;
-  for (long r = 0; r < 4; ++r) {
-    long position = p - 3 + r;
-    state[r] = position >= 0 ? x[position * GDN_C + c] : has_prev ? prev[c * 4 + position + 4] : half(0.0f);
+  half value = half(hv / (1.0f + exp(-hv)));
+  if (c < 4096) {
+    device half* output = c < 2048 ? q : k;
+    output[row * 4096 + c % 2048] = value;
+    output[row * 4096 + 2048 + c % 2048] = value;
+  } else
+    v[row * 4096 + c - 4096] = value;
+  if (speculative || p + 1 == info.count) {
+    device half* state = reinterpret_cast<device half*>(info.next + offset + (speculative ? p * stateBytes : 0)) + c * 4;
+    for (long r = 0; r < 4; ++r)
+      state[r] = context[r];
   }
 }
 
